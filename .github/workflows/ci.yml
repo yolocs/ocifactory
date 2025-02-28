@@ -1,0 +1,15 @@
+name: 'ci'
+
+on:
+  pull_request:
+    branches:
+      - 'main'
+      - 'release/**/*'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    uses: 'abcxyz/pkg/.github/workflows/go-test.yml@main' # ratchet:exclude
