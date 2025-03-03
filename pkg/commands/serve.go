@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/abcxyz/pkg/cli"
 )
 
 type serveFlags struct {
-	port        string
-	repoType    string
-	registryURL string
-	logLevel    string
+	port           string
+	repoType       string
+	registryURLStr string
+	logLevel       string
+
+	registryURL *url.URL
 }
 
 func (f *serveFlags) Validate() error {
@@ -23,8 +27,18 @@ func (f *serveFlags) Validate() error {
 	if f.repoType == "" {
 		merr = errors.Join(merr, fmt.Errorf("repo-type is required"))
 	}
-	if f.registryURL == "" {
+	if f.registryURLStr == "" {
 		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
+	}
+	if !strings.HasPrefix(f.registryURLStr, "http://") && !strings.HasPrefix(f.registryURLStr, "https://") {
+		// Default to https.
+		f.registryURLStr = "https://" + f.registryURLStr
+		u, err := url.Parse(f.registryURLStr)
+		if err != nil {
+			merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
+		} else {
+			f.registryURL = u
+		}
 	}
 	if f.logLevel == "" {
 		merr = errors.Join(merr, fmt.Errorf("loglevel is required"))
@@ -72,7 +86,7 @@ func (c *ServeCommand) Flags() *cli.FlagSet {
 		Name:   "backend-registry",
 		Usage:  "The URL to the backend OCI registry.",
 		EnvVar: "OCIFACTORY_BACKEND_REGISTRY",
-		Target: &c.flags.registryURL,
+		Target: &c.flags.registryURLStr,
 	})
 
 	sec.StringVar(&cli.StringVar{
