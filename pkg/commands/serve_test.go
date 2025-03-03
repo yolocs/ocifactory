@@ -7,6 +7,7 @@ import (
 )
 
 func TestServeFlagsValidate(t *testing.T) {
+
 	cases := []struct {
 		name    string
 		flags   serveFlags
@@ -15,28 +16,28 @@ func TestServeFlagsValidate(t *testing.T) {
 		{
 			name: "all fields set",
 			flags: serveFlags{
-				port:        "8080",
-				repoType:    "type",
-				registryURL: "http://example.com",
-				logLevel:    "info",
+				port:           "8080",
+				repoType:       "type",
+				registryURLStr: "http://example.com",
+				logLevel:       "info",
 			},
 			wantErr: "",
 		},
 		{
 			name: "missing port",
 			flags: serveFlags{
-				repoType:    "type",
-				registryURL: "http://example.com",
-				logLevel:    "info",
+				repoType:       "type",
+				registryURLStr: "http://example.com",
+				logLevel:       "info",
 			},
 			wantErr: "port is required",
 		},
 		{
 			name: "missing repo type",
 			flags: serveFlags{
-				port:        "8080",
-				registryURL: "http://example.com",
-				logLevel:    "info",
+				port:           "8080",
+				registryURLStr: "http://example.com",
+				logLevel:       "info",
 			},
 			wantErr: "repo-type is required",
 		},
@@ -52,11 +53,21 @@ func TestServeFlagsValidate(t *testing.T) {
 		{
 			name: "missing log level",
 			flags: serveFlags{
-				port:        "8080",
-				repoType:    "type",
-				registryURL: "http://example.com",
+				port:           "8080",
+				repoType:       "type",
+				registryURLStr: "http://example.com",
 			},
 			wantErr: "loglevel is required",
+		},
+		{
+			name: "registry URL without protocol prefix",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "type",
+				registryURLStr: "example.com",
+				logLevel:       "info",
+			},
+			wantErr: "",
 		},
 	}
 
