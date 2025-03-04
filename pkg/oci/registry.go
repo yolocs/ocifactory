@@ -15,6 +15,7 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/errdef"
+	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/retry"
@@ -25,13 +26,18 @@ const (
 	FileNameAnnotation  = "ocifactory.file.title"
 )
 
+type destRepo interface {
+	oras.Target
+	registry.TagLister
+}
+
 type Registry struct {
 	baseURL      *url.URL
 	landingDir   string
 	artifactType string
 
 	// Used in unit test to stub with in memory backend.
-	newBackendFunc func(ctx context.Context, f *RepoFile) (oras.Target, error)
+	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
 }
 
 type RegistryOption func(*Registry) error
@@ -170,6 +176,21 @@ func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, 
 	return nil, nil, fmt.Errorf("file %q not found in manifest: %w", f.Name, errdef.ErrNotFound)
 }
 
+// ListTags lists the tags for a repository.
+func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return nil, err
+	}
+
+	tags, err := registry.Tags(ctx, backendRepo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tags: %w", err)
+	}
+
+	return tags, nil
+}
+
 func (r *Registry) landFile(ro io.Reader) (string, error) {
 	tmpFile, err := os.CreateTemp(r.landingDir, "oci-upload-")
 	if err != nil {
@@ -194,11 +215,12 @@ func (r *Registry) loadFile(ctx context.Context, fileLanded string, f *RepoFile)
 		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to add file to local OCI store: %w", err)
 	}
 	fileDesc.Annotations[FileNameAnnotation] = f.Name
+	fileDesc.Annotations[ocispec.AnnotationTitle] = f.Name // The 'Add' method by default sets the title to the full path.
 
 	return fs, fileDesc, nil
 }
 
-func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (oras.Target, error) {
+func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error) {
 	repoRef := r.baseURL.Host + r.baseURL.Path + "/" + f.OwningRepo
 	repo, err := remote.NewRepository(repoRef)
 	if err != nil {

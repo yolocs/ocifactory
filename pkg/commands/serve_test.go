@@ -19,7 +19,6 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "type",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
 			wantErr: "",
 		},
@@ -28,7 +27,6 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				repoType:       "type",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
 			wantErr: "port is required",
 		},
@@ -37,7 +35,6 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:           "8080",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
 			wantErr: "repo-type is required",
 		},
@@ -46,18 +43,8 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:     "8080",
 				repoType: "type",
-				logLevel: "info",
 			},
 			wantErr: "backend-registry is required",
-		},
-		{
-			name: "missing log level",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "type",
-				registryURLStr: "http://example.com",
-			},
-			wantErr: "loglevel is required",
 		},
 		{
 			name: "registry URL without protocol prefix",
@@ -65,7 +52,6 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "type",
 				registryURLStr: "example.com",
-				logLevel:       "info",
 			},
 			wantErr: "",
 		},
