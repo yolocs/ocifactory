@@ -4,17 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/abcxyz/pkg/cli"
+	"github.com/yolocs/ocifactory/pkg/handler"
+	"github.com/yolocs/ocifactory/pkg/handler/maven"
+	"github.com/yolocs/ocifactory/pkg/oci"
+)
+
+var (
+	supportedRepoTypes = []string{
+		maven.RepoType,
+	}
 )
 
 type serveFlags struct {
 	port           string
 	repoType       string
 	registryURLStr string
-	logLevel       string
+	landingDir     string
 
 	registryURL *url.URL
 }
@@ -24,8 +35,15 @@ func (f *serveFlags) Validate() error {
 	if f.port == "" {
 		merr = errors.Join(merr, fmt.Errorf("port is required"))
 	}
-	if f.repoType == "" {
-		merr = errors.Join(merr, fmt.Errorf("repo-type is required"))
+	repoSupported := false
+	for _, repoType := range supportedRepoTypes {
+		if repoType == f.repoType {
+			repoSupported = true
+			break
+		}
+	}
+	if !repoSupported {
+		merr = errors.Join(merr, fmt.Errorf("repo-type %q is not supported", f.repoType))
 	}
 	if f.registryURLStr == "" {
 		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
@@ -40,8 +58,9 @@ func (f *serveFlags) Validate() error {
 			f.registryURL = u
 		}
 	}
-	if f.logLevel == "" {
-		merr = errors.Join(merr, fmt.Errorf("loglevel is required"))
+	// This default is implicit because temp dir will be different each time.
+	if f.landingDir == "" {
+		f.landingDir = os.TempDir()
 	}
 	return merr
 }
@@ -63,6 +82,7 @@ Usage: {{ COMMAND }} [options]
 }
 
 func (c *ServeCommand) Flags() *cli.FlagSet {
+	c.flags = &serveFlags{}
 	set := c.NewFlagSet()
 	sec := set.NewSection("OPTIONS")
 
@@ -77,7 +97,7 @@ func (c *ServeCommand) Flags() *cli.FlagSet {
 	sec.StringVar(&cli.StringVar{
 		Name:    "repo-type",
 		Aliases: []string{"t"},
-		Usage:   "Type of repository to serve. Allowed: [TBD]",
+		Usage:   "Type of repository to serve. Allowed: [maven]",
 		EnvVar:  "OCIFACTORY_REPO_TYPE",
 		Target:  &c.flags.repoType,
 	})
@@ -90,15 +110,13 @@ func (c *ServeCommand) Flags() *cli.FlagSet {
 	})
 
 	sec.StringVar(&cli.StringVar{
-		Name:    "loglevel",
-		Aliases: []string{"v"}, // Verbosity
-		Usage:   "The log level.",
-		EnvVar:  "OCIFACTORY_LOGLEVEL",
-		Target:  &c.flags.logLevel,
-		Default: "info",
+		Name:   "landing-dir",
+		Usage:  "The directory to store the temporary artifact files. If not set, a temp dir will be created each time.",
+		EnvVar: "OCIFACTORY_LANDING_DIR",
+		Target: &c.flags.landingDir,
 	})
 
-	return nil
+	return set
 }
 
 func (c *ServeCommand) Run(ctx context.Context, args []string) error {
@@ -110,5 +128,30 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("invalid flags: %w", err)
 	}
 
-	return fmt.Errorf("not implemented")
+	var h http.Handler
+	switch c.flags.repoType {
+	case maven.RepoType:
+		reg, err := oci.NewRegistry(
+			c.flags.registryURL,
+			oci.WithLandingDir(c.flags.landingDir),
+			oci.WithArtifactType(maven.ArtifactType),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create registry: %w", err)
+		}
+		mh, err := maven.NewHandler(reg)
+		if err != nil {
+			return fmt.Errorf("failed to create maven handler: %w", err)
+		}
+		h = mh.Mux()
+	default:
+		return fmt.Errorf("repo-type %q is not supported", c.flags.repoType)
+	}
+
+	srv, err := handler.NewServer(c.flags.port, handler.PassThroughAuth, handler.Loggeer)
+	if err != nil {
+		return fmt.Errorf("failed to create server: %w", err)
+	}
+
+	return srv.Start(ctx, h)
 }

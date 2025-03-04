@@ -17,18 +17,16 @@ func TestServeFlagsValidate(t *testing.T) {
 			name: "all fields set",
 			flags: serveFlags{
 				port:           "8080",
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
 			wantErr: "",
 		},
 		{
 			name: "missing port",
 			flags: serveFlags{
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
 			wantErr: "port is required",
 		},
@@ -37,35 +35,32 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:           "8080",
 				registryURLStr: "http://example.com",
-				logLevel:       "info",
 			},
-			wantErr: "repo-type is required",
+			wantErr: `repo-type "" is not supported`,
+		},
+		{
+			name: "invalid repo type",
+			flags: serveFlags{
+				port:           "8080",
+				registryURLStr: "http://example.com",
+				repoType:       "invalid",
+			},
+			wantErr: `repo-type "invalid" is not supported`,
 		},
 		{
 			name: "missing registry URL",
 			flags: serveFlags{
 				port:     "8080",
-				repoType: "type",
-				logLevel: "info",
+				repoType: "maven",
 			},
 			wantErr: "backend-registry is required",
-		},
-		{
-			name: "missing log level",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "type",
-				registryURLStr: "http://example.com",
-			},
-			wantErr: "loglevel is required",
 		},
 		{
 			name: "registry URL without protocol prefix",
 			flags: serveFlags{
 				port:           "8080",
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "example.com",
-				logLevel:       "info",
 			},
 			wantErr: "",
 		},

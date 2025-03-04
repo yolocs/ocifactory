@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/abcxyz/pkg v1.4.0
 	github.com/google/go-cmp v0.6.0
+	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.0
 	oras.land/oras-go/v2 v2.5.0
 )
@@ -12,7 +13,6 @@ require (
 require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/posener/complete/v2 v2.1.0 // indirect
 	github.com/posener/script v1.2.0 // indirect
 	golang.org/x/net v0.34.0 // indirect

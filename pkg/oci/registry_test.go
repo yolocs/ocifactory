@@ -11,7 +11,6 @@ import (
 	"github.com/abcxyz/pkg/testutil"
 	"github.com/google/go-cmp/cmp"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/memory"
 )
 
@@ -296,6 +295,15 @@ func TestUpsertFileLayer(t *testing.T) {
 	}
 }
 
+type inMemoryRepo struct {
+	*memory.Store
+	allTags []string
+}
+
+func (r *inMemoryRepo) Tags(_ context.Context, _ string, fn func(tags []string) error) error {
+	return fn(r.allTags)
+}
+
 func TestAddReadRoundtrip(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -309,8 +317,8 @@ func TestAddReadRoundtrip(t *testing.T) {
 	}
 
 	// Override the newBackendFunc to use the memory backend.
-	memRepo := memory.New()
-	r.newBackendFunc = func(ctx context.Context, f *RepoFile) (oras.Target, error) {
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: []string{"v0"}}
+	r.newBackendFunc = func(ctx context.Context, f *RepoFile) (destRepo, error) {
 		return memRepo, nil
 	}
 
@@ -356,6 +364,17 @@ func TestAddReadRoundtrip(t *testing.T) {
 
 		if got, want := string(gotContent), content; got != want {
 			t.Errorf("ReadAll() content = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("list tags", func(t *testing.T) {
+		wantTags := []string{"v0"}
+		gotTags, err := r.ListTags(ctx, "foobar")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("ListTags() error diff: %s", diff)
+		}
+		if diff := cmp.Diff(wantTags, gotTags); diff != "" {
+			t.Errorf("ListTags() tags diff: %s", diff)
 		}
 	})
 }
