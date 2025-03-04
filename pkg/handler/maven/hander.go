@@ -85,7 +85,7 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 }
 
 func pathToRepoFile(p string) (*oci.RepoFile, error) {
-	if p == "archetype-catalog.xml" {
+	if strings.HasPrefix(p, "archetype-catalog.xml") {
 		return &oci.RepoFile{
 			OwningRepo: "archetype",
 			OwningTag:  "latest",
@@ -100,13 +100,13 @@ func pathToRepoFile(p string) (*oci.RepoFile, error) {
 	}
 
 	fn := parts[len(parts)-1]
-	if fn == "maven-metadata.xml" {
+	if strings.HasPrefix(fn, "maven-metadata.xml") {
 		if strings.Contains(parts[len(parts)-2], "-SNAPSHOT") {
 			// This is a version level maven-metadata.xml for snapshots.
 			return &oci.RepoFile{
 				OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
 				OwningTag:  parts[len(parts)-2] + "-metadata",       // versionId-metadata
-				Name:       "maven-metadata.xml",
+				Name:       fn,
 				MediaType:  "text/xml",
 			}, nil
 		} else {
@@ -114,7 +114,7 @@ func pathToRepoFile(p string) (*oci.RepoFile, error) {
 			return &oci.RepoFile{
 				OwningRepo: strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
 				OwningTag:  "metadata",                              // metadata
-				Name:       "maven-metadata.xml",
+				Name:       fn,
 				MediaType:  "text/xml",
 			}, nil
 		}

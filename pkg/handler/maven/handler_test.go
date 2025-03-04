@@ -65,6 +65,11 @@ func TestPathToRepoFile(t *testing.T) {
 			path:    "com/example",
 			wantErr: true,
 		},
+		{
+			name:    "invalid path for artifact file",
+			path:    "com/example/project",
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {
