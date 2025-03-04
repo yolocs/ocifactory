@@ -17,7 +17,7 @@ func TestServeFlagsValidate(t *testing.T) {
 			name: "all fields set",
 			flags: serveFlags{
 				port:           "8080",
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "http://example.com",
 			},
 			wantErr: "",
@@ -25,7 +25,7 @@ func TestServeFlagsValidate(t *testing.T) {
 		{
 			name: "missing port",
 			flags: serveFlags{
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "http://example.com",
 			},
 			wantErr: "port is required",
@@ -36,13 +36,22 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				registryURLStr: "http://example.com",
 			},
-			wantErr: "repo-type is required",
+			wantErr: `repo-type "" is not supported`,
+		},
+		{
+			name: "invalid repo type",
+			flags: serveFlags{
+				port:           "8080",
+				registryURLStr: "http://example.com",
+				repoType:       "invalid",
+			},
+			wantErr: `repo-type "invalid" is not supported`,
 		},
 		{
 			name: "missing registry URL",
 			flags: serveFlags{
 				port:     "8080",
-				repoType: "type",
+				repoType: "maven",
 			},
 			wantErr: "backend-registry is required",
 		},
@@ -50,7 +59,7 @@ func TestServeFlagsValidate(t *testing.T) {
 			name: "registry URL without protocol prefix",
 			flags: serveFlags{
 				port:           "8080",
-				repoType:       "type",
+				repoType:       "maven",
 				registryURLStr: "example.com",
 			},
 			wantErr: "",
