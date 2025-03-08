@@ -16,6 +16,7 @@ type Registry interface {
 	AddFile(ctx context.Context, f *oci.RepoFile, ro io.Reader) (*oci.FileDescriptor, error)
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
 	ListTags(ctx context.Context, repo string) ([]string, error)
+	ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error)
 }
 
 type Middleware func(next http.Handler) http.Handler
@@ -66,8 +67,10 @@ func PassThroughAuth(next http.Handler) http.Handler {
 // Use OCIFACTORY_LOG_LEVEL, OCIFACTORY_LOG_FORMAT, and OCIFACTORY_LOG_DEBUG to
 // configure the logger.
 func Loggeer(next http.Handler) http.Handler {
+	logger := logging.NewFromEnv("OCIFACTORY_")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r = r.WithContext(logging.WithLogger(r.Context(), logging.NewFromEnv("OCIFACTORY_")))
+		logger.DebugContext(r.Context(), "request", "method", r.Method, "url", r.URL.String())
+		r = r.WithContext(logging.WithLogger(r.Context(), logger))
 		next.ServeHTTP(w, r)
 	})
 }

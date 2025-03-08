@@ -377,4 +377,15 @@ func TestAddReadRoundtrip(t *testing.T) {
 			t.Errorf("ListTags() tags diff: %s", diff)
 		}
 	})
+
+	t.Run("list files", func(t *testing.T) {
+		wantFiles := []*RepoFile{f}
+		gotFiles, err := r.ListFiles(ctx, "foobar")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("ListFiles() error diff: %s", diff)
+		}
+		if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
+			t.Errorf("ListFiles() files diff: %s", diff)
+		}
+	})
 }

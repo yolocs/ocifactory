@@ -3,6 +3,7 @@ package oci
 import (
 	"context"
 	"io"
+	"sort"
 	"strings"
 	"testing"
 
@@ -358,6 +359,83 @@ func Test_generateDescriptor(t *testing.T) {
 			if got.Annotations[FileNameAnnotation] != tt.want.Annotations[FileNameAnnotation] {
 				t.Errorf("Filename annotation = %q, want %q",
 					got.Annotations[FileNameAnnotation], tt.want.Annotations[FileNameAnnotation])
+			}
+		})
+	}
+}
+
+func TestFakeRegistry_ListFiles(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		repo    string
+		files   map[string][]byte
+		want    []*RepoFile
+		wantErr bool
+	}{
+		{
+			name: "list files in repo",
+			repo: "example/repo",
+			files: map[string][]byte{
+				"example/repo/v1.0.0/file1.txt": []byte("content1"),
+				"example/repo/v1.0.0/file2.txt": []byte("content2"),
+				"example/repo/v2.0.0/file3.txt": []byte("content3"),
+				"other/repo/v1.0.0/file4.txt":   []byte("content4"),
+			},
+			want: []*RepoFile{
+				{Name: "file1.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0"},
+				{Name: "file2.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0"},
+				{Name: "file3.txt", OwningRepo: "example/repo", OwningTag: "v2.0.0"},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "empty repo",
+			repo:    "empty/repo",
+			files:   map[string][]byte{},
+			wantErr: false,
+		},
+		{
+			name: "no matching files",
+			repo: "missing/repo",
+			files: map[string][]byte{
+				"example/repo/v1.0.0/file1.txt": []byte("content1"),
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			registry := &FakeRegistry{
+				Files: tt.files,
+				Tags:  make(map[string][]string),
+			}
+
+			got, err := registry.ListFiles(context.Background(), tt.repo)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("FakeRegistry.ListFiles() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			// Sort the results for stable comparison
+			sortRepoFiles := func(files []*RepoFile) {
+				sort.Slice(files, func(i, j int) bool {
+					if files[i].OwningTag != files[j].OwningTag {
+						return files[i].OwningTag < files[j].OwningTag
+					}
+					return files[i].Name < files[j].Name
+				})
+			}
+
+			sortRepoFiles(got)
+			sortRepoFiles(tt.want)
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("FakeRegistry.ListFiles() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

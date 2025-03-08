@@ -64,6 +64,7 @@ type RepoFile struct {
 	OwningTag  string // Usually the package version that owns the file.
 	Name       string // File name.
 	MediaType  string // Media type of the file. If not provided, it will be inferred from the file name.
+	Digest     string // Digest of the file. If provided, it will be used to cross check retrieved or calculated digest.
 }
 
 type FileDescriptor struct {
@@ -165,6 +166,9 @@ func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, 
 
 	for _, l := range layers {
 		if l.Annotations[FileNameAnnotation] == f.Name {
+			if f.Digest != "" && string(l.Digest) != f.Digest {
+				return nil, nil, fmt.Errorf("file digest mismatch: %q != %q", l.Digest, f.Digest)
+			}
 			rc, err := backendRepo.Fetch(ctx, l)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to fetch file: %w", err)
@@ -191,6 +195,46 @@ func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) 
 	return tags, nil
 }
 
+// ListFiles lists the files in a repository.
+func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return nil, err
+	}
+
+	tags, err := registry.Tags(ctx, backendRepo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tags: %w", err)
+	}
+
+	var files []*RepoFile
+
+	for _, tag := range tags {
+		manifestDesc, err := backendRepo.Resolve(ctx, tag)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)
+		}
+
+		layers, err := manifestLayers(ctx, backendRepo, manifestDesc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get manifest layers: %w", err)
+		}
+
+		for _, l := range layers {
+			if l.Annotations != nil && l.Annotations[FileNameAnnotation] != "" {
+				files = append(files, &RepoFile{
+					Name:       l.Annotations[FileNameAnnotation],
+					OwningRepo: repo,
+					OwningTag:  tag,
+					Digest:     string(l.Digest),
+				})
+			}
+		}
+	}
+
+	return files, nil
+}
+
 func (r *Registry) landFile(ro io.Reader) (string, error) {
 	tmpFile, err := os.CreateTemp(r.landingDir, "oci-upload-")
 	if err != nil {
@@ -213,6 +257,9 @@ func (r *Registry) loadFile(ctx context.Context, fileLanded string, f *RepoFile)
 	fileDesc, err := fs.Add(ctx, fileLanded, detectFileMediaType(f), "")
 	if err != nil {
 		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to add file to local OCI store: %w", err)
+	}
+	if f.Digest != "" && string(fileDesc.Digest) != f.Digest {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("file digest mismatch: %q != %q", fileDesc.Digest, f.Digest)
 	}
 	fileDesc.Annotations[FileNameAnnotation] = f.Name
 	fileDesc.Annotations[ocispec.AnnotationTitle] = f.Name // The 'Add' method by default sets the title to the full path.
