@@ -57,6 +57,7 @@ func (h *Handler) Mux() http.Handler {
 
 	// Metadata. As a special case, GET also matches HEAD.
 	mux.HandleFunc(`PUT /{filepath...}`, h.handleFilePut)
+	mux.HandleFunc(`POST /{filepath...}`, h.handleFilePut)
 	mux.HandleFunc(`GET /{filepath...}`, h.handleFileGet)
 
 	return mux

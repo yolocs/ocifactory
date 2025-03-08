@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title> Links for {{.Title}} </title>
+</head>
+
+<body>
+  <h1> Links for {{.Title}} </h1>
+  {{range $file := .Files}}
+  <a href="{{ $file.FileURL }}">{{$file.FileName}}</a><br />
+  {{end}}
+</body>
+
+</html>

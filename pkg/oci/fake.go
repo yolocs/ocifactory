@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"strings"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -84,4 +85,20 @@ func (r *FakeRegistry) ListTags(ctx context.Context, repo string) ([]string, err
 		return []string{}, nil
 	}
 	return tags, nil
+}
+
+func (r *FakeRegistry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
+	var filesList []*RepoFile
+	for key := range r.Files {
+		parts := strings.Split(key, "/")
+		if len(parts) < 3 {
+			continue
+		}
+		fn, tag, rp := parts[len(parts)-1], parts[len(parts)-2], strings.Join(parts[:len(parts)-2], "/")
+		if rp != repo {
+			continue
+		}
+		filesList = append(filesList, &RepoFile{Name: fn, OwningRepo: rp, OwningTag: tag})
+	}
+	return filesList, nil
 }

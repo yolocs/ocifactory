@@ -326,6 +326,7 @@ func TestAddReadRoundtrip(t *testing.T) {
 		OwningRepo: "foobar",
 		OwningTag:  "v0",
 		Name:       "test.txt",
+		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
 	}
 
 	t.Run("read file not found", func(t *testing.T) {
@@ -375,6 +376,17 @@ func TestAddReadRoundtrip(t *testing.T) {
 		}
 		if diff := cmp.Diff(wantTags, gotTags); diff != "" {
 			t.Errorf("ListTags() tags diff: %s", diff)
+		}
+	})
+
+	t.Run("list files", func(t *testing.T) {
+		wantFiles := []*RepoFile{f}
+		gotFiles, err := r.ListFiles(ctx, "foobar")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("ListFiles() error diff: %s", diff)
+		}
+		if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
+			t.Errorf("ListFiles() files diff: %s", diff)
 		}
 	})
 }
