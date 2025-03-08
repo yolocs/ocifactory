@@ -326,6 +326,7 @@ func TestAddReadRoundtrip(t *testing.T) {
 		OwningRepo: "foobar",
 		OwningTag:  "v0",
 		Name:       "test.txt",
+		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
 	}
 
 	t.Run("read file not found", func(t *testing.T) {
