@@ -6,8 +6,8 @@ require (
 	github.com/abcxyz/pkg v1.4.0
 	github.com/google/go-cmp v0.6.0
 	github.com/opencontainers/go-digest v1.0.0
-	github.com/opencontainers/image-spec v1.1.0
-	oras.land/oras-go/v2 v2.5.0
+	github.com/opencontainers/image-spec v1.1.1
+	oras.land/oras-go/v2 v2.6.0
 )
 
 require (
@@ -16,7 +16,7 @@ require (
 	github.com/posener/complete/v2 v2.1.0 // indirect
 	github.com/posener/script v1.2.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
-	golang.org/x/sync v0.12.0 // indirect
+	golang.org/x/sync v0.14.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250204164813-702378808489 // indirect
