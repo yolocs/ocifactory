@@ -9,10 +9,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/yolocs/ocifactory/pkg/cred"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry"
@@ -29,6 +31,7 @@ const (
 type destRepo interface {
 	oras.Target
 	registry.TagLister
+	content.Tagger
 }
 
 type Registry struct {
@@ -62,6 +65,7 @@ func WithArtifactType(artifactType string) RegistryOption {
 type RepoFile struct {
 	OwningRepo string // Repository the owns the file. Usually what's right after the registy host.
 	OwningTag  string // Usually the package version that owns the file.
+	RefTag     string // Tag that points to the file. Could be empty.
 	Name       string // File name.
 	MediaType  string // Media type of the file. If not provided, it will be inferred from the file name.
 	Digest     string // Digest of the file. If provided, it will be used to cross check retrieved or calculated digest.
@@ -89,11 +93,40 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	return r, nil
 }
 
+// AppendRefs appends tags to a manifest.
+// The canonical tag is the tag that points to the manifest.
+// The tags are the tags to append to the manifest.
+// The tags are appended in the order they are provided.
+// The canonical tag is not included in the tags list.
+func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+
+	manifestDesc, err := backendRepo.Resolve(ctx, canonicalTag)
+	if err != nil {
+		return fmt.Errorf("failed to resolve manifest for canonical tag %q: %w", canonicalTag, err)
+	}
+
+	for _, ref := range refs {
+		if err := backendRepo.Tag(ctx, manifestDesc, "ref_"+ref); err != nil {
+			return fmt.Errorf("failed to tag manifest for ref %q: %w", ref, err)
+		}
+	}
+
+	return nil
+}
+
 // AddFile adds a file to the registry.
 // The file is first uploaded to the landing zone, then to the OCI store, and finally to the backend repository.
 // If the file already exists in the backend repository, it will be updated if and only if the digest has changed.
 // Returns the updated manifest descriptor and the file descriptor.
 func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
+	if strings.HasPrefix(f.OwningTag, "ref_") {
+		return nil, fmt.Errorf("canonical tag cannot be prefixed with ref_; got %q", f.OwningTag)
+	}
+
 	// Load the file in the landing zone.
 	tmpFile, err := r.landFile(ro)
 	if err != nil {
@@ -148,15 +181,25 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 
 // ReadFile reads a file from the registry.
 // Returns the file descriptor and a reader for the file.
+// It's allowed to use a ref tag to read a file. Set it in the RepoFile.RefTag field.
 func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, io.ReadCloser, error) {
+	if f.OwningTag == "" && f.RefTag == "" {
+		return nil, nil, fmt.Errorf("either OwningTag or RefTag must be set")
+	}
+
+	t := f.OwningTag
+	if t == "" {
+		t = "ref_" + f.RefTag
+	}
+
 	backendRepo, err := r.newBackendFunc(ctx, f)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	manifestDesc, err := backendRepo.Resolve(ctx, f.OwningTag)
+	manifestDesc, err := backendRepo.Resolve(ctx, t)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", f.OwningTag, err)
+		return nil, nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", t, err)
 	}
 
 	layers, err := manifestLayers(ctx, backendRepo, manifestDesc)
@@ -192,7 +235,14 @@ func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) 
 		return nil, fmt.Errorf("failed to list tags: %w", err)
 	}
 
-	return tags, nil
+	var excludeRefs []string
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, "ref_") {
+			excludeRefs = append(excludeRefs, tag)
+		}
+	}
+
+	return excludeRefs, nil
 }
 
 // ListFiles lists the files in a repository.
@@ -210,6 +260,10 @@ func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, err
 	var files []*RepoFile
 
 	for _, tag := range tags {
+		if strings.HasPrefix(tag, "ref_") {
+			continue // Ignore refs otherwise we'll get duplicated files.
+		}
+
 		manifestDesc, err := backendRepo.Resolve(ctx, tag)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)

@@ -304,6 +304,19 @@ func (r *inMemoryRepo) Tags(_ context.Context, _ string, fn func(tags []string) 
 	return fn(r.allTags)
 }
 
+func (r *inMemoryRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	tagExist := false
+	for _, tag := range r.allTags {
+		if tag == reference {
+			tagExist = true
+		}
+	}
+	if !tagExist {
+		r.allTags = append(r.allTags, reference)
+	}
+	return r.Store.Tag(ctx, desc, reference)
+}
+
 func TestAddReadRoundtrip(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -349,6 +362,39 @@ func TestAddReadRoundtrip(t *testing.T) {
 
 	t.Run("read file", func(t *testing.T) {
 		gotDesc, r, err := r.ReadFile(ctx, f)
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("ReadFile() error diff: %s", diff)
+		}
+		defer r.Close()
+
+		if diff := cmp.Diff(wantDesc, gotDesc); diff != "" {
+			t.Errorf("ReadFile() desc diff: %s", diff)
+		}
+
+		gotContent, err := io.ReadAll(r)
+		if err != nil {
+			t.Errorf("ReadAll() unexpected error = %v", err)
+		}
+
+		if got, want := string(gotContent), content; got != want {
+			t.Errorf("ReadAll() content = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("append tags", func(t *testing.T) {
+		err := r.AppendRefs(ctx, "foobar", "v0", "tag1", "tag2")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("AppendTags() error diff: %s", diff)
+		}
+	})
+
+	t.Run("read file by ref", func(t *testing.T) {
+		gotDesc, r, err := r.ReadFile(ctx, &RepoFile{
+			OwningRepo: "foobar",
+			RefTag:     "tag1",
+			Name:       "test.txt",
+			Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+		})
 		if diff := testutil.DiffErrString(err, ""); diff != "" {
 			t.Errorf("ReadFile() error diff: %s", diff)
 		}
