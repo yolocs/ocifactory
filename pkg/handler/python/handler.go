@@ -14,6 +14,7 @@ import (
 
 	"github.com/abcxyz/pkg/logging"
 	"github.com/abcxyz/pkg/renderer"
+	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"oras.land/oras-go/v2/errdef"
@@ -77,21 +78,20 @@ func NewHandler(registry handler.Registry) (*Handler, error) {
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
 func (h *Handler) Mux() http.Handler {
-	mux := http.NewServeMux()
+	router := mux.NewRouter()
 
 	// Handle both pip and twine operations
-	mux.HandleFunc(`PUT /{$}`, h.handleFilePut)  // For twine uploads
-	mux.HandleFunc(`POST /{$}`, h.handleFilePut) // For twine uploads
+	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST")
 
-	mux.HandleFunc(`GET /packages/{package}/{version}/{filename}`, h.handleFileGet) // For pip downloads
+	router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD")
 
-	mux.HandleFunc(`GET /simple/{package}/`, h.handlePackageIndex) // For package index (with trailing slash)
-	mux.HandleFunc(`GET /simple/{package}`, h.handlePackageIndex)  // For package index (without trailing slash)
+	router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET")
+	router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET")
 
-	mux.HandleFunc(`GET /simple/`, h.handleSimpleIndex) // For pip index (with trailing slash)
-	mux.HandleFunc(`GET /simple`, h.handleSimpleIndex)  // For pip index (without trailing slash)
+	router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET")
+	router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET")
 
-	return mux
+	return router
 }
 
 // handleSimpleIndex handles the simple index request.
@@ -223,37 +223,31 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 }
 
 func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
-	f, err := repoFileFromReq(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	vars := mux.Vars(req)
+	pkg := vars["package"]
+	version := vars["version"]
+	filename := vars["filename"]
+
+	if pkg == "" || version == "" || filename == "" {
+		http.Error(w, fmt.Sprintf("invalid path: missing package, version, or filename in %s", req.URL.Path), http.StatusBadRequest)
 		return
 	}
-	f.OwningRepo = "packages/" + f.OwningRepo
+
+	f := &oci.RepoFile{
+		OwningRepo: "packages/" + pkg,
+		OwningTag:  version,
+		Name:       filename,
+		MediaType:  detectMediaType(filename),
+	}
 
 	h.handleGet(w, req, f)
 }
 
-func repoFileFromReq(req *http.Request) (*oci.RepoFile, error) {
-	pkg := req.PathValue("package")
-	version := req.PathValue("version")
-	filename := req.PathValue("filename")
-
-	if pkg == "" || version == "" || filename == "" {
-		return nil, fmt.Errorf("invalid path: %s", req.URL.Path)
-	}
-
-	return &oci.RepoFile{
-		OwningRepo: pkg,
-		OwningTag:  version,
-		Name:       filename,
-		MediaType:  detectMediaType(filename),
-	}, nil
-}
-
 func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
-	pkg := req.PathValue("package")
+	vars := mux.Vars(req)
+	pkg := vars["package"]
 	if pkg == "" {
-		http.Error(w, "invalid path", http.StatusBadRequest)
+		http.Error(w, "invalid path: missing package name", http.StatusBadRequest)
 		return
 	}
 
@@ -285,8 +279,10 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 
 func repoFileURL(req *http.Request, f *oci.RepoFile) *url.URL {
 	return &url.URL{
-		Scheme:   req.URL.Scheme,
-		Host:     req.URL.Host,
+		Scheme: req.URL.Scheme,
+		Host:   req.URL.Host,
+		// Path should be /packages/{package_name_only}/{version}/{filename}
+		// f.OwningRepo is "packages/pkg", f.OwningTag is version, f.Name is filename
 		Path:     fmt.Sprintf("/%s/%s/%s", f.OwningRepo, f.OwningTag, f.Name),
 		Fragment: fmt.Sprintf("sha256=%s", strings.TrimPrefix(f.Digest, "sha256:")),
 	}

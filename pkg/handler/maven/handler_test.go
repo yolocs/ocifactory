@@ -7,92 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
-
-func TestPathToRepoFile(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name    string
-		path    string
-		want    *oci.RepoFile
-		wantErr bool
-	}{
-		{
-			name: "archetype catalog",
-			path: "archetype-catalog.xml",
-			want: &oci.RepoFile{
-				OwningRepo: "archetype",
-				OwningTag:  "latest",
-				Name:       "archetype-catalog.xml",
-				MediaType:  "text/xml",
-			},
-		},
-		{
-			name: "snapshot maven-metadata.xml",
-			path: "com/example/project/1.0.0-SNAPSHOT/maven-metadata.xml",
-			want: &oci.RepoFile{
-				OwningRepo: "com/example/project",
-				OwningTag:  "1.0.0-SNAPSHOT-metadata",
-				Name:       "maven-metadata.xml",
-				MediaType:  "text/xml",
-			},
-		},
-		{
-			name: "release maven-metadata.xml",
-			path: "com/example/project/maven-metadata.xml",
-			want: &oci.RepoFile{
-				OwningRepo: "com/example/project",
-				OwningTag:  "metadata",
-				Name:       "maven-metadata.xml",
-				MediaType:  "text/xml",
-			},
-		},
-		{
-			name: "artifact file",
-			path: "com/example/project/1.0.0/project-1.0.0.jar",
-			want: &oci.RepoFile{
-				OwningRepo: "com/example/project",
-				OwningTag:  "1.0.0",
-				Name:       "project-1.0.0.jar",
-				MediaType:  "application/java-archive",
-			},
-		},
-		{
-			name:    "invalid path",
-			path:    "com/example",
-			wantErr: true,
-		},
-		{
-			name:    "invalid path for artifact file",
-			path:    "com/example/project",
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := pathToRepoFile(tc.path)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("pathToRepoFile(%q) expected error, got nil", tc.path)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("pathToRepoFile(%q) unexpected error: %v", tc.path, err)
-			}
-
-			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("pathToRepoFile(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-		})
-	}
-}
 
 func TestDetectMediaType(t *testing.T) {
 	t.Parallel()
@@ -164,8 +80,29 @@ func TestHandlePut(t *testing.T) {
 			name:       "invalid path",
 			path:       "/com",
 			body:       "content",
-			wantStatus: http.StatusBadRequest,
+			wantStatus: http.StatusNotFound,
 			wantFile:   false,
+		},
+		{
+			name:       "archetype catalog",
+			path:       "/archetype-catalog.xml",
+			body:       "<archetype-catalog></archetype-catalog>",
+			wantStatus: http.StatusCreated,
+			wantFile:   true,
+		},
+		{
+			name:       "snapshot metadata",
+			path:       "/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
+			body:       "<metadata></metadata>",
+			wantStatus: http.StatusCreated,
+			wantFile:   true,
+		},
+		{
+			name:       "release metadata",
+			path:       "/com/example/project/maven-metadata.xml",
+			body:       "<metadata></metadata>",
+			wantStatus: http.StatusCreated,
+			wantFile:   true,
 		},
 	}
 
@@ -189,11 +126,7 @@ func TestHandlePut(t *testing.T) {
 			}
 
 			if tc.wantFile {
-				f, err := pathToRepoFile(strings.Trim(tc.path, "/"))
-				if err != nil {
-					t.Fatalf("pathToRepoFile(%q) unexpected error: %v", tc.path, err)
-				}
-
+				f := pathToRepoFile(t, strings.Trim(tc.path, "/"))
 				key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
 				content, ok := registry.Files[key]
 				if !ok {
@@ -256,7 +189,49 @@ func TestHandleGet(t *testing.T) {
 			name:       "invalid path",
 			path:       "/com",
 			method:     http.MethodGet,
-			wantStatus: http.StatusBadRequest,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "get archetype catalog",
+			setupFile: &oci.RepoFile{
+				OwningRepo: "archetype",
+				OwningTag:  "latest",
+				Name:       "archetype-catalog.xml",
+				MediaType:  "text/xml",
+			},
+			setupData:  "<archetype-catalog></archetype-catalog>",
+			path:       "/archetype-catalog.xml",
+			method:     http.MethodGet,
+			wantStatus: http.StatusOK,
+			wantBody:   "<archetype-catalog></archetype-catalog>",
+		},
+		{
+			name: "get snapshot metadata",
+			setupFile: &oci.RepoFile{
+				OwningRepo: "com/example/project",
+				OwningTag:  "1.0-SNAPSHOT-metadata",
+				Name:       "maven-metadata.xml",
+				MediaType:  "text/xml",
+			},
+			setupData:  "<metadata></metadata>",
+			path:       "/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
+			method:     http.MethodGet,
+			wantStatus: http.StatusOK,
+			wantBody:   "<metadata></metadata>",
+		},
+		{
+			name: "get release metadata",
+			setupFile: &oci.RepoFile{
+				OwningRepo: "com/example/project",
+				OwningTag:  "metadata",
+				Name:       "maven-metadata.xml",
+				MediaType:  "text/xml",
+			},
+			setupData:  "<metadata></metadata>",
+			path:       "/com/example/project/maven-metadata.xml",
+			method:     http.MethodGet,
+			wantStatus: http.StatusOK,
+			wantBody:   "<metadata></metadata>",
 		},
 	}
 
@@ -297,5 +272,53 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
+	if strings.HasPrefix(p, "archetype-catalog.xml") {
+		return &oci.RepoFile{
+			OwningRepo: "archetype",
+			OwningTag:  "latest",
+			Name:       p,
+			MediaType:  "text/xml",
+		}
+	}
+
+	parts := strings.Split(p, "/")
+	if len(parts) < 3 {
+		t.Fatalf("invalid path: %s", p)
+	}
+
+	fn := parts[len(parts)-1]
+	if strings.HasPrefix(fn, "maven-metadata.xml") {
+		if strings.Contains(parts[len(parts)-2], "-SNAPSHOT") {
+			// This is a version level maven-metadata.xml for snapshots.
+			return &oci.RepoFile{
+				OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
+				OwningTag:  parts[len(parts)-2] + "-metadata",       // versionId-metadata
+				Name:       fn,
+				MediaType:  "text/xml",
+			}
+		} else {
+			// This is a group/artifact level maven-metadata.xml for releases.
+			return &oci.RepoFile{
+				OwningRepo: strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
+				OwningTag:  "metadata",                              // metadata
+				Name:       fn,
+				MediaType:  "text/xml",
+			}
+		}
+	}
+
+	if len(parts) < 4 {
+		t.Fatalf("invalid path: %s", p)
+	}
+
+	return &oci.RepoFile{
+		OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
+		OwningTag:  parts[len(parts)-2],                     // versionId
+		Name:       fn,
+		MediaType:  detectMediaType(fn),
 	}
 }

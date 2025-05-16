@@ -9,85 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
-
-func TestRepoFileFromReq(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name    string
-		path    string
-		want    *oci.RepoFile
-		wantErr bool
-	}{
-		{
-			name: "valid path",
-			path: "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
-			want: &oci.RepoFile{
-				OwningRepo: "example-pkg",
-				OwningTag:  "1.0.0",
-				Name:       "example-pkg-1.0.0.whl",
-				MediaType:  "application/x-wheel+zip",
-			},
-		},
-		{
-			name:    "missing package",
-			path:    "/packages//1.0.0/example-pkg-1.0.0.whl",
-			wantErr: true,
-		},
-		{
-			name:    "missing version",
-			path:    "/packages/example-pkg//example-pkg-1.0.0.whl",
-			wantErr: true,
-		},
-		{
-			name:    "missing filename",
-			path:    "/packages/example-pkg/1.0.0/",
-			wantErr: true,
-		},
-		{
-			name:    "invalid path",
-			path:    "/invalid",
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
-			req = req.WithContext(context.Background())
-
-			// Set path values manually since we're not using a real router
-			if strings.HasPrefix(tc.path, "/packages/") && strings.Count(tc.path, "/") >= 4 {
-				parts := strings.Split(strings.TrimPrefix(tc.path, "/packages/"), "/")
-				if len(parts) >= 3 {
-					req.SetPathValue("package", parts[0])
-					req.SetPathValue("version", parts[1])
-					req.SetPathValue("filename", parts[2])
-				}
-			}
-
-			got, err := repoFileFromReq(req)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("repoFileFromReq(%q) expected error, got nil", tc.path)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("repoFileFromReq(%q) unexpected error: %v", tc.path, err)
-			}
-
-			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("repoFileFromReq(%q) mismatch (-want +got):\n%s", tc.path, diff)
-			}
-		})
-	}
-}
 
 func TestDetectMediaType(t *testing.T) {
 	t.Parallel()

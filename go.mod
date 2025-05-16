@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/abcxyz/pkg v1.5.4
 	github.com/google/go-cmp v0.6.0
+	github.com/gorilla/mux v1.8.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	oras.land/oras-go/v2 v2.6.0

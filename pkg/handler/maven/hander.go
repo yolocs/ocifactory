@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/abcxyz/pkg/logging"
+	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"oras.land/oras-go/v2/errdef"
@@ -53,86 +54,103 @@ func NewHandler(registry handler.Registry) (*Handler, error) {
 }
 
 func (h *Handler) Mux() http.Handler {
-	mux := http.NewServeMux()
+	router := mux.NewRouter()
 
-	// Metadata. As a special case, GET also matches HEAD.
-	mux.HandleFunc(`PUT /{filepath...}`, h.handleFilePut)
-	mux.HandleFunc(`POST /{filepath...}`, h.handleFilePut)
-	mux.HandleFunc(`GET /{filepath...}`, h.handleFileGet)
+	// 1. Archetype Catalog
+	// Handles GET, HEAD, PUT, POST for /archetype-catalog.xml
+	router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
-	return mux
+	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
+	// Handles GET, HEAD, PUT, POST for snapshot metadata files.
+	// Example: /{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml
+	router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+
+	// 3. Artifact Metadata (e.g., group/artifact/maven-metadata.xml or group/artifact/version/maven-metadata.xml for releases)
+	// Handles GET, HEAD, PUT, POST for non-snapshot metadata files. This must be after snapshot metadata.
+	// Example: /{groupId}/{artifactId}/maven-metadata.xml
+	router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+
+	// 4. Regular Artifact Files (e.g., group/artifact/version/file.jar)
+	// Handles GET, HEAD, PUT, POST for general artifact files. This is the most general route and must be last.
+	// Example: /{groupId}/{artifactId}/{version}/{filename.ext}
+	router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+
+	return router
 }
 
-func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
-	p := strings.Trim(req.PathValue("filepath"), "/")
-	f, err := pathToRepoFile(p)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+// handleArchetypeCatalog handles requests for archetype-catalog.xml.
+func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Request) {
+	f := &oci.RepoFile{
+		OwningRepo: "archetype",
+		OwningTag:  "latest",
+		Name:       "archetype-catalog.xml",
+		MediaType:  "text/xml",
 	}
-
-	h.handlePut(w, req, f)
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, f)
+	} else { // GET, HEAD
+		h.handleGet(w, req, f)
+	}
 }
 
-func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
-	p := strings.Trim(req.PathValue("filepath"), "/")
-	f, err := pathToRepoFile(p)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+// handleSnapshotMetadata handles requests for snapshot maven-metadata.xml files.
+func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	repoParts := vars["repoParts"]             // This is groupId/artifactId
+	versionSnapshot := vars["versionSnapshot"] // This is version-SNAPSHOT
 
-	h.handleGet(w, req, f)
+	f := &oci.RepoFile{
+		OwningRepo: repoParts,
+		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
+		Name:       "maven-metadata.xml",
+		MediaType:  "text/xml",
+	}
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, f)
+	} else { // GET, HEAD
+		h.handleGet(w, req, f)
+	}
 }
 
-func pathToRepoFile(p string) (*oci.RepoFile, error) {
-	if strings.HasPrefix(p, "archetype-catalog.xml") {
-		return &oci.RepoFile{
-			OwningRepo: "archetype",
-			OwningTag:  "latest",
-			Name:       p,
-			MediaType:  "text/xml",
-		}, nil
-	}
+// handleArtifactMetadata handles requests for non-snapshot maven-metadata.xml files.
+func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	repoParts := vars["repoParts"] // This is groupId/artifactId or groupId/artifactId/version for versioned metadata
 
-	parts := strings.Split(p, "/")
-	if len(parts) < 3 {
-		return nil, fmt.Errorf("invalid path: %s", p)
+	f := &oci.RepoFile{
+		OwningRepo: repoParts,
+		OwningTag:  "metadata", // For release artifact or version metadata
+		Name:       "maven-metadata.xml",
+		MediaType:  "text/xml",
 	}
-
-	fn := parts[len(parts)-1]
-	if strings.HasPrefix(fn, "maven-metadata.xml") {
-		if strings.Contains(parts[len(parts)-2], "-SNAPSHOT") {
-			// This is a version level maven-metadata.xml for snapshots.
-			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-				OwningTag:  parts[len(parts)-2] + "-metadata",       // versionId-metadata
-				Name:       fn,
-				MediaType:  "text/xml",
-			}, nil
-		} else {
-			// This is a group/artifact level maven-metadata.xml for releases.
-			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
-				OwningTag:  "metadata",                              // metadata
-				Name:       fn,
-				MediaType:  "text/xml",
-			}, nil
-		}
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, f)
+	} else { // GET, HEAD
+		h.handleGet(w, req, f)
 	}
-
-	if len(parts) < 4 {
-		return nil, fmt.Errorf("invalid path: %s", p)
-	}
-
-	return &oci.RepoFile{
-		OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-		OwningTag:  parts[len(parts)-2],                     // versionId
-		Name:       fn,
-		MediaType:  detectMediaType(fn),
-	}, nil
 }
 
+// handleRegularArtifact handles requests for regular artifact files.
+func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	repoParts := vars["repoParts"] // groupId/artifactId
+	version := vars["version"]
+	filename := vars["filename"]
+
+	f := &oci.RepoFile{
+		OwningRepo: repoParts,
+		OwningTag:  version,
+		Name:       filename,
+		MediaType:  detectMediaType(filename),
+	}
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, f)
+	} else { // GET, HEAD
+		h.handleGet(w, req, f)
+	}
+}
+
+// handlePut processes PUT/POST requests to add a file.
 func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
