@@ -32,6 +32,7 @@ type destRepo interface {
 	oras.Target
 	registry.TagLister
 	content.Tagger
+	content.Deleter
 }
 
 type Registry struct {
@@ -91,6 +92,54 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	}
 
 	return r, nil
+}
+
+// DeleteTagFiles deletes all files in a tag.
+// It's used to delete a tag and all its files.
+func (r *Registry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+
+	return r.deleteTagFiles(ctx, backendRepo, tag)
+}
+
+// DeleteRepoFiles deletes all files in a repository.
+// It's used to delete a repository and all its tags.
+func (r *Registry) DeleteRepoFiles(ctx context.Context, repo string) error {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+
+	tags, err := r.listTags(ctx, backendRepo)
+	if err != nil {
+		return err
+	}
+
+	for _, tag := range tags {
+		if strings.HasPrefix(tag, "ref_") {
+			continue // Ignore refs otherwise we'll get duplicated files.
+		}
+		if err := r.deleteTagFiles(ctx, backendRepo, tag); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *Registry) deleteTagFiles(ctx context.Context, backendRepo destRepo, tag string) error {
+	manifestDesc, err := backendRepo.Resolve(ctx, tag)
+	if err != nil {
+		return fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)
+	}
+
+	if err := backendRepo.Delete(ctx, manifestDesc); err != nil {
+		return fmt.Errorf("failed to delete manifest for tag %q: %w", tag, err)
+	}
+	return nil
 }
 
 // AppendRefs appends tags to a manifest.
@@ -230,6 +279,10 @@ func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) 
 		return nil, err
 	}
 
+	return r.listTags(ctx, backendRepo)
+}
+
+func (r *Registry) listTags(ctx context.Context, backendRepo destRepo) ([]string, error) {
 	tags, err := registry.Tags(ctx, backendRepo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tags: %w", err)
@@ -252,18 +305,14 @@ func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, err
 		return nil, err
 	}
 
-	tags, err := registry.Tags(ctx, backendRepo)
+	tags, err := r.listTags(ctx, backendRepo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tags: %w", err)
+		return nil, err
 	}
 
 	var files []*RepoFile
 
 	for _, tag := range tags {
-		if strings.HasPrefix(tag, "ref_") {
-			continue // Ignore refs otherwise we'll get duplicated files.
-		}
-
 		manifestDesc, err := backendRepo.Resolve(ctx, tag)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)

@@ -3,8 +3,10 @@ package oci
 import (
 	"context"
 	"io"
+	"maps"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/content/memory"
+	"oras.land/oras-go/v2/errdef"
 )
 
 func TestNewRegistry(t *testing.T) {
@@ -297,24 +300,39 @@ func TestUpsertFileLayer(t *testing.T) {
 
 type inMemoryRepo struct {
 	*memory.Store
-	allTags []string
+	allTags map[string]string
 }
 
 func (r *inMemoryRepo) Tags(_ context.Context, _ string, fn func(tags []string) error) error {
-	return fn(r.allTags)
+	return fn(slices.Collect(maps.Keys(r.allTags)))
 }
 
 func (r *inMemoryRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
-	tagExist := false
-	for _, tag := range r.allTags {
-		if tag == reference {
-			tagExist = true
+	r.allTags[reference] = desc.Digest.String()
+	return r.Store.Tag(ctx, desc, reference)
+}
+
+func (r *inMemoryRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	for tag, digest := range r.allTags {
+		if digest == target.Digest.String() {
+			delete(r.allTags, tag)
 		}
 	}
-	if !tagExist {
-		r.allTags = append(r.allTags, reference)
+	return nil
+}
+
+// Intercept the Resolve call to return ErrNotFound if the target has been deleted.
+func (r *inMemoryRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	target, err := r.Store.Resolve(ctx, reference)
+	if err != nil {
+		return ocispec.Descriptor{}, err
 	}
-	return r.Store.Tag(ctx, desc, reference)
+
+	if _, ok := r.allTags[reference]; !ok {
+		return ocispec.Descriptor{}, errdef.ErrNotFound
+	}
+
+	return target, nil
 }
 
 func TestAddReadRoundtrip(t *testing.T) {
@@ -330,12 +348,12 @@ func TestAddReadRoundtrip(t *testing.T) {
 	}
 
 	// Override the newBackendFunc to use the memory backend.
-	memRepo := &inMemoryRepo{Store: memory.New(), allTags: []string{"v0"}}
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{"v0": "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"}}
 	r.newBackendFunc = func(ctx context.Context, f *RepoFile) (destRepo, error) {
 		return memRepo, nil
 	}
 
-	f := &RepoFile{
+	f0 := &RepoFile{
 		OwningRepo: "foobar",
 		OwningTag:  "v0",
 		Name:       "test.txt",
@@ -343,7 +361,7 @@ func TestAddReadRoundtrip(t *testing.T) {
 	}
 
 	t.Run("read file not found", func(t *testing.T) {
-		_, _, err := r.ReadFile(ctx, f)
+		_, _, err := r.ReadFile(ctx, f0)
 		if diff := testutil.DiffErrString(err, "not found"); diff != "" {
 			t.Errorf("ReadFile() error diff: %s", diff)
 		}
@@ -353,7 +371,7 @@ func TestAddReadRoundtrip(t *testing.T) {
 	content := "hello world"
 
 	t.Run("add file", func(t *testing.T) {
-		desc, err := r.AddFile(ctx, f, strings.NewReader(content))
+		desc, err := r.AddFile(ctx, f0, strings.NewReader(content))
 		if diff := testutil.DiffErrString(err, ""); diff != "" {
 			t.Errorf("AddFile() error diff: %s", diff)
 		}
@@ -361,7 +379,7 @@ func TestAddReadRoundtrip(t *testing.T) {
 	})
 
 	t.Run("read file", func(t *testing.T) {
-		gotDesc, r, err := r.ReadFile(ctx, f)
+		gotDesc, r, err := r.ReadFile(ctx, f0)
 		if diff := testutil.DiffErrString(err, ""); diff != "" {
 			t.Errorf("ReadFile() error diff: %s", diff)
 		}
@@ -426,13 +444,28 @@ func TestAddReadRoundtrip(t *testing.T) {
 	})
 
 	t.Run("list files", func(t *testing.T) {
-		wantFiles := []*RepoFile{f}
+		wantFiles := []*RepoFile{f0}
 		gotFiles, err := r.ListFiles(ctx, "foobar")
 		if diff := testutil.DiffErrString(err, ""); diff != "" {
 			t.Errorf("ListFiles() error diff: %s", diff)
 		}
 		if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
 			t.Errorf("ListFiles() files diff: %s", diff)
+		}
+	})
+
+	t.Run("delete tag files", func(t *testing.T) {
+		err := r.DeleteTagFiles(ctx, "foobar", "v0")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("DeleteTagFiles() error diff: %s", diff)
+		}
+
+		gotFiles, err := r.ListFiles(ctx, "foobar")
+		if diff := testutil.DiffErrString(err, ""); diff != "" {
+			t.Errorf("ListFiles() error diff: %s", diff)
+		}
+		if len(gotFiles) != 0 {
+			t.Errorf("ListFiles() files = %v, want %v", gotFiles, []*RepoFile{})
 		}
 	})
 }
