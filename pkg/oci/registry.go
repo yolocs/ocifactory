@@ -298,6 +298,50 @@ func (r *Registry) listTags(ctx context.Context, backendRepo destRepo) ([]string
 	return excludeRefs, nil
 }
 
+// TagManifest tags an existing manifest identified by existingTagOrDigest with a newTag.
+func (r *Registry) TagManifest(ctx context.Context, repoName string, existingTagOrDigest string, newTag string) error {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repoName})
+	if err != nil {
+		return fmt.Errorf("failed to initialize backend for tagging: %w", err)
+	}
+
+	desc, err := backendRepo.Resolve(ctx, existingTagOrDigest)
+	if err != nil {
+		return fmt.Errorf("failed to resolve existing tag/digest %q in repo %q: %w", existingTagOrDigest, repoName, err)
+	}
+
+	if err := backendRepo.Tag(ctx, desc, newTag); err != nil {
+		return fmt.Errorf("failed to apply new tag %q to manifest %s (from %q) in repo %q: %w", newTag, desc.Digest, existingTagOrDigest, repoName, err)
+	}
+	return nil
+}
+
+// DeleteTag deletes a specific tag from the repository.
+// It does not delete the manifest the tag points to, only the tag itself.
+func (r *Registry) DeleteTag(ctx context.Context, repoName string, tagToDelete string) error {
+	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repoName})
+	if err != nil {
+		return fmt.Errorf("failed to initialize backend for deleting tag: %w", err)
+	}
+
+	// The destRepo is typically a *remote.Repository from ORAS.
+	// We need to check if it implements registry.TagDeleter.
+	tagDeleter, ok := backendRepo.(registry.TagDeleter)
+	if !ok {
+		return fmt.Errorf("OCI backend for repo %q does not support deleting tags directly", repoName)
+	}
+
+	if err := tagDeleter.DeleteTag(ctx, tagToDelete); err != nil {
+		// Check if the error is because the tag was not found.
+		// errdef.ErrNotFound might apply, or specific registry errors.
+		if errors.Is(err, errdef.ErrNotFound) { // Or a more specific error if available from the registry client
+			return fmt.Errorf("tag %q not found in repo %q: %w", tagToDelete, repoName, errdef.ErrNotFound)
+		}
+		return fmt.Errorf("failed to delete tag %q in repo %q: %w", tagToDelete, repoName, err)
+	}
+	return nil
+}
+
 // ListFiles lists the files in a repository.
 func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
 	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
