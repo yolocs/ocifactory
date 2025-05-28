@@ -12,6 +12,7 @@ import (
 	"github.com/abcxyz/pkg/cli"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
+	"github.com/yolocs/ocifactory/pkg/handler/npm" // Added import
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
@@ -20,6 +21,7 @@ var (
 	supportedRepoTypes = []string{
 		maven.RepoType,
 		python.RepoType,
+		npm.RepoType, // Added npm.RepoType
 	}
 )
 
@@ -99,7 +101,7 @@ func (c *ServeCommand) Flags() *cli.FlagSet {
 	sec.StringVar(&cli.StringVar{
 		Name:    "repo-type",
 		Aliases: []string{"t"},
-		Usage:   "Type of repository to serve. Allowed: [maven, python]",
+		Usage:   fmt.Sprintf("Type of repository to serve. Allowed: [%s]", strings.Join(supportedRepoTypes, ", ")), // Updated usage string
 		EnvVar:  "OCIFACTORY_REPO_TYPE",
 		Target:  &c.flags.repoType,
 	})
@@ -160,6 +162,20 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) error {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}
 		h = ph.Mux()
+	case npm.RepoType: // Added case for npm.RepoType
+		reg, err := oci.NewRegistry(
+			c.flags.registryURL,
+			oci.WithLandingDir(c.flags.landingDir),
+			oci.WithArtifactType(npm.ArtifactType), // Using npm.ArtifactType as defined
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create registry for npm: %w", err)
+		}
+		npmHandler, err := npm.NewHandler(reg)
+		if err != nil {
+			return fmt.Errorf("failed to create npm handler: %w", err)
+		}
+		h = npmHandler.Mux()
 	default:
 		return fmt.Errorf("repo-type %q is not supported", c.flags.repoType)
 	}

@@ -17,6 +17,9 @@ type Registry interface {
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
 	ListTags(ctx context.Context, repo string) ([]string, error)
 	ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error)
+	DeleteTagFiles(ctx context.Context, repo string, tag string) error // Deletes the manifest and associated files for a tag.
+	TagManifest(ctx context.Context, repo string, existingTagOrDigest string, newTag string) error // Tags an existing manifest with a new tag.
+	DeleteTag(ctx context.Context, repo string, tag string) error       // Deletes a specific tag, leaving the manifest if other tags point to it.
 }
 
 type Middleware func(next http.Handler) http.Handler
