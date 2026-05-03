@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -34,14 +35,18 @@ const zotImage = "ghcr.io/project-zot/zot-linux-amd64:v2.1.5"
 // every run, so it requires Docker (or another OCI-compatible runtime
 // that testcontainers can talk to) to be available locally.
 //
-// The test is gated behind testing.Short(): pass `-short` to skip it in
-// fast iteration loops or environments without Docker. CI in particular
-// should run a separate `go test -run TestAddFile_StreamingIntegration_`
-// invocation when Docker is available, and `go test -short ./...`
-// elsewhere.
+// Two skip mechanisms (different consumers, same effect):
+//   - `go test -short` skips it for local fast-iteration loops.
+//   - OCIFACTORY_SKIP_INTEGRATION=1 skips it in environments where you
+//     can't pass `-short` directly — e.g. the abcxyz/pkg shared go-test
+//     workflow that runs the rest of our suite. CI uses this to keep
+//     integration runs in a dedicated job.
 func TestAddFile_StreamingIntegration_Zot(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live-zot integration test in -short mode")
+	}
+	if os.Getenv("OCIFACTORY_SKIP_INTEGRATION") == "1" {
+		t.Skip("skipping live-zot integration test (OCIFACTORY_SKIP_INTEGRATION=1)")
 	}
 	t.Parallel()
 
