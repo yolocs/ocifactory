@@ -570,6 +570,12 @@ func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error
 	if err != nil {
 		return nil, fmt.Errorf("failed to create remote OCI repo: %w", err)
 	}
+	// remote.Repository defaults to HTTPS; honour an http:// baseURL the
+	// way the streaming pusher does so a local zot / dev registry round
+	// trips end-to-end.
+	if r.baseURL.Scheme == "http" {
+		repo.PlainHTTP = true
+	}
 
 	if c := r.authClientFromContext(ctx); c != nil {
 		repo.Client = c
