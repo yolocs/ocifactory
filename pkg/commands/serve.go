@@ -9,19 +9,17 @@ import (
 	"os"
 	"strings"
 
-	"github.com/abcxyz/pkg/cli"
+	"github.com/spf13/cobra"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-var (
-	supportedRepoTypes = []string{
-		maven.RepoType,
-		python.RepoType,
-	}
-)
+var supportedRepoTypes = []string{
+	maven.RepoType,
+	python.RepoType,
+}
 
 type serveFlags struct {
 	port           string
@@ -67,75 +65,46 @@ func (f *serveFlags) Validate() error {
 	return merr
 }
 
-type ServeCommand struct {
-	cli.BaseCommand
+func newServeCmd() *cobra.Command {
+	flags := &serveFlags{}
 
-	flags *serveFlags
-}
-
-func (c *ServeCommand) Desc() string {
-	return "Run the server to serve a specific artifact type."
-}
-
-func (c *ServeCommand) Help() string {
-	return `
-Usage: {{ COMMAND }} [options]
-`
-}
-
-func (c *ServeCommand) Flags() *cli.FlagSet {
-	c.flags = &serveFlags{}
-	set := c.NewFlagSet()
-	sec := set.NewSection("OPTIONS")
-
-	sec.StringVar(&cli.StringVar{
-		Name:    "port",
-		Target:  &c.flags.port,
-		EnvVar:  "PORT",
-		Default: "8080",
-		Usage:   `The port the server listens to.`,
-	})
-
-	sec.StringVar(&cli.StringVar{
-		Name:    "repo-type",
-		Aliases: []string{"t"},
-		Usage:   "Type of repository to serve. Allowed: [maven, python]",
-		EnvVar:  "OCIFACTORY_REPO_TYPE",
-		Target:  &c.flags.repoType,
-	})
-
-	sec.StringVar(&cli.StringVar{
-		Name:   "backend-registry",
-		Usage:  "The URL to the backend OCI registry.",
-		EnvVar: "OCIFACTORY_BACKEND_REGISTRY",
-		Target: &c.flags.registryURLStr,
-	})
-
-	sec.StringVar(&cli.StringVar{
-		Name:   "landing-dir",
-		Usage:  "The directory to store the temporary artifact files. If not set, a temp dir will be created each time.",
-		EnvVar: "OCIFACTORY_LANDING_DIR",
-		Target: &c.flags.landingDir,
-	})
-
-	return set
-}
-
-func (c *ServeCommand) Run(ctx context.Context, args []string) error {
-	f := c.Flags()
-	if err := f.Parse(args); err != nil {
-		return fmt.Errorf("failed to parse flags: %w", err)
-	}
-	if err := c.flags.Validate(); err != nil {
-		return fmt.Errorf("invalid flags: %w", err)
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run the server to serve a specific artifact type.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := flags.Validate(); err != nil {
+				return fmt.Errorf("invalid flags: %w", err)
+			}
+			return runServe(cmd.Context(), flags)
+		},
 	}
 
+	cmd.Flags().StringVar(&flags.port, "port", envOr("PORT", "8080"),
+		"The port the server listens to.")
+	cmd.Flags().StringVarP(&flags.repoType, "repo-type", "t", os.Getenv("OCIFACTORY_REPO_TYPE"),
+		fmt.Sprintf("Type of repository to serve. Allowed: %v", supportedRepoTypes))
+	cmd.Flags().StringVar(&flags.registryURLStr, "backend-registry", os.Getenv("OCIFACTORY_BACKEND_REGISTRY"),
+		"The URL to the backend OCI registry.")
+	cmd.Flags().StringVar(&flags.landingDir, "landing-dir", os.Getenv("OCIFACTORY_LANDING_DIR"),
+		"The directory to store the temporary artifact files. If not set, a temp dir will be created each time.")
+
+	return cmd
+}
+
+func envOr(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return fallback
+}
+
+func runServe(ctx context.Context, flags *serveFlags) error {
 	var h http.Handler
-	switch c.flags.repoType {
+	switch flags.repoType {
 	case maven.RepoType:
 		reg, err := oci.NewRegistry(
-			c.flags.registryURL,
-			oci.WithLandingDir(c.flags.landingDir),
+			flags.registryURL,
+			oci.WithLandingDir(flags.landingDir),
 			oci.WithArtifactType(maven.ArtifactType),
 		)
 		if err != nil {
@@ -148,8 +117,8 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) error {
 		h = mh.Mux()
 	case python.RepoType:
 		reg, err := oci.NewRegistry(
-			c.flags.registryURL,
-			oci.WithLandingDir(c.flags.landingDir),
+			flags.registryURL,
+			oci.WithLandingDir(flags.landingDir),
 			oci.WithArtifactType(python.ArtifactType),
 		)
 		if err != nil {
@@ -161,10 +130,10 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) error {
 		}
 		h = ph.Mux()
 	default:
-		return fmt.Errorf("repo-type %q is not supported", c.flags.repoType)
+		return fmt.Errorf("repo-type %q is not supported", flags.repoType)
 	}
 
-	srv, err := handler.NewServer(c.flags.port, handler.PassThroughAuth, handler.Loggeer)
+	srv, err := handler.NewServer(flags.port, handler.PassThroughAuth, handler.Loggeer)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}

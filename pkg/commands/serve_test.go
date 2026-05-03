@@ -1,8 +1,11 @@
 package commands
 
 import (
+	"net/url"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
@@ -10,9 +13,10 @@ func TestServeFlagsValidate(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name    string
-		flags   serveFlags
-		wantErr string
+		name            string
+		flags           serveFlags
+		wantErr         string
+		wantRegistryURL *url.URL
 	}{
 		{
 			name: "all fields set",
@@ -55,6 +59,9 @@ func TestServeFlagsValidate(t *testing.T) {
 				repoType: "maven",
 			},
 			wantErr: "backend-registry is required",
+			wantRegistryURL: &url.URL{
+				Scheme: "https",
+			},
 		},
 		{
 			name: "registry URL without protocol prefix",
@@ -64,6 +71,10 @@ func TestServeFlagsValidate(t *testing.T) {
 				registryURLStr: "example.com",
 			},
 			wantErr: "",
+			wantRegistryURL: &url.URL{
+				Scheme: "https",
+				Host:   "example.com",
+			},
 		},
 	}
 
@@ -73,6 +84,39 @@ func TestServeFlagsValidate(t *testing.T) {
 			err := tc.flags.Validate()
 			if diff := testutil.DiffErrString(err, tc.wantErr); diff != "" {
 				t.Errorf("Validate() returned unexpected error (-got, +want): %s", diff)
+			}
+			if diff := cmp.Diff(tc.wantRegistryURL, tc.flags.registryURL, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("Validate() registryURL mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestServeCmd_Flags(t *testing.T) {
+	t.Parallel()
+
+	cmd := newServeCmd()
+
+	tests := []struct {
+		name      string
+		flagName  string
+		shorthand string
+	}{
+		{name: "port", flagName: "port"},
+		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
+		{name: "backend-registry", flagName: "backend-registry"},
+		{name: "landing-dir", flagName: "landing-dir"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := cmd.Flags().Lookup(tc.flagName)
+			if f == nil {
+				t.Fatalf("flag %q not registered", tc.flagName)
+			}
+			if got, want := f.Shorthand, tc.shorthand; got != want {
+				t.Errorf("flag %q shorthand: got %q, want %q", tc.flagName, got, want)
 			}
 		})
 	}
