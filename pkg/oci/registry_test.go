@@ -467,7 +467,11 @@ func sha256Digest(b []byte) digest.Digest {
 	return digest.NewDigestFromBytes(digest.SHA256, sum[:])
 }
 
-func TestAddFile_Streaming(t *testing.T) {
+// TestAddFile_BufferedPath covers the buffered + monolithic upload path
+// (small bodies, plus the disable-streaming opt-out spilling to a temp
+// file). The streaming chunked-PATCH path is exercised by
+// TestAddFile_StreamingDispatch and the streamPusher unit tests.
+func TestAddFile_BufferedPath(t *testing.T) {
 	t.Parallel()
 
 	// Tiny in-memory threshold so the spill path runs on a few-KB body
@@ -575,6 +579,10 @@ func TestAddFile_Streaming(t *testing.T) {
 				t.Fatalf("NewRegistry() error = %v", err)
 			}
 			r.uploadMemThreshold = testMemThreshold
+			// Pin the buffered + monolithic path so this test exercises
+			// the temp-file spill on largeContent. Streaming dispatch is
+			// covered separately.
+			r.disableStreamingPush = true
 			r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
 				return counting, nil
 			}
@@ -671,6 +679,231 @@ func TestStageUploadWithThreshold(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.body, gotBody); diff != "" {
 				t.Errorf("staged body mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// fakeStreamPusher is a streamingPusher stub used by AddFile dispatch tests
+// to assert that the streaming path was (or was not) taken without spinning
+// up an HTTP server. Push records the body it received and computes the
+// digest so the caller can verify it.
+type fakeStreamPusher struct {
+	calls       int
+	receivedLen int64
+	receivedSHA digest.Digest
+	pushErr     error
+}
+
+func (p *fakeStreamPusher) Push(_ context.Context, mediaType, expectedDigest string, content io.Reader) (ocispec.Descriptor, error) {
+	p.calls++
+	body, err := io.ReadAll(content)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	p.receivedLen = int64(len(body))
+	p.receivedSHA = sha256Digest(body)
+	if p.pushErr != nil {
+		return ocispec.Descriptor{}, p.pushErr
+	}
+	if expectedDigest != "" && string(p.receivedSHA) != expectedDigest {
+		return ocispec.Descriptor{}, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, p.receivedSHA, expectedDigest)
+	}
+	return ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    p.receivedSHA,
+		Size:      p.receivedLen,
+	}, nil
+}
+
+// TestAddFile_StreamingDispatch verifies the size-based fork in AddFile:
+//   - bodies at or below uploadMemThreshold take the buffered + monolithic
+//     path (countingRepo.Push invoked, fakeStreamPusher.Push not invoked);
+//   - bodies above uploadMemThreshold take the streaming path
+//     (fakeStreamPusher.Push invoked, no buffered Push of the file blob).
+//
+// Both paths must end up with the same FileDescriptor digest+size and a
+// tagged manifest in the backend.
+func TestAddFile_StreamingDispatch(t *testing.T) {
+	t.Parallel()
+
+	const threshold int64 = 1024
+
+	tests := []struct {
+		name           string
+		body           []byte
+		wantStreamCall bool
+		wantBufferPush bool
+	}{
+		{
+			name:           "body just under threshold goes monolithic",
+			body:           bytes.Repeat([]byte("a"), int(threshold)-1),
+			wantStreamCall: false,
+			wantBufferPush: true,
+		},
+		{
+			name:           "body equal to threshold goes monolithic",
+			body:           bytes.Repeat([]byte("b"), int(threshold)),
+			wantStreamCall: false,
+			wantBufferPush: true,
+		},
+		{
+			name:           "body one over threshold goes streaming",
+			body:           bytes.Repeat([]byte("c"), int(threshold)+1),
+			wantStreamCall: true,
+			wantBufferPush: false,
+		},
+		{
+			name:           "body well over threshold goes streaming",
+			body:           bytes.Repeat([]byte("d"), int(threshold)*8+7),
+			wantStreamCall: true,
+			wantBufferPush: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+
+			memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+			counting := &countingRepo{inMemoryRepo: memRepo}
+			pusher := &fakeStreamPusher{}
+
+			r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
+			if err != nil {
+				t.Fatalf("NewRegistry() error = %v", err)
+			}
+			r.uploadMemThreshold = threshold
+			r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+				return counting, nil
+			}
+			r.newStreamPusherFunc = func(_ context.Context, _ *RepoFile) (streamingPusher, error) {
+				return pusher, nil
+			}
+
+			f := &RepoFile{
+				OwningRepo: "pkg",
+				OwningTag:  "v1",
+				Name:       "blob.bin",
+			}
+
+			desc, err := r.AddFile(ctx, f, bytes.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("AddFile() error = %v", err)
+			}
+
+			wantDigest := sha256Digest(tc.body)
+			if desc.File.Digest != wantDigest {
+				t.Errorf("File.Digest = %s, want %s", desc.File.Digest, wantDigest)
+			}
+			if desc.File.Size != int64(len(tc.body)) {
+				t.Errorf("File.Size = %d, want %d", desc.File.Size, len(tc.body))
+			}
+
+			if got, want := pusher.calls > 0, tc.wantStreamCall; got != want {
+				t.Errorf("streaming pusher invoked = %v (calls=%d), want %v", got, pusher.calls, want)
+			}
+			_, bufferPushed := counting.pushedBytes[wantDigest.String()]
+			if got, want := bufferPushed, tc.wantBufferPush; got != want {
+				t.Errorf("buffered backend Push of file blob = %v, want %v (pushed=%v)", got, want, counting.pushedBytes)
+			}
+
+			if _, ok := memRepo.allTags[f.OwningTag]; !ok {
+				t.Errorf("AddFile() did not tag manifest under %q", f.OwningTag)
+			}
+		})
+	}
+}
+
+// TestAddFile_StreamingDigestMismatch verifies the streaming path surfaces
+// ErrDigestMismatch when RepoFile.Digest disagrees with the streamed body,
+// without leaving a tagged manifest behind.
+func TestAddFile_StreamingDigestMismatch(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const threshold int64 = 64
+	body := bytes.Repeat([]byte("z"), int(threshold)*4)
+
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+	counting := &countingRepo{inMemoryRepo: memRepo}
+	pusher := &fakeStreamPusher{}
+
+	r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	r.uploadMemThreshold = threshold
+	r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+		return counting, nil
+	}
+	r.newStreamPusherFunc = func(_ context.Context, _ *RepoFile) (streamingPusher, error) {
+		return pusher, nil
+	}
+
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "blob.bin",
+		Digest:     "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+	}
+	if _, err := r.AddFile(ctx, f, bytes.NewReader(body)); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("AddFile() error = %v, want errors.Is ErrDigestMismatch", err)
+	}
+	if pusher.calls == 0 {
+		t.Errorf("streaming pusher never called, want exactly one call")
+	}
+	if _, ok := memRepo.allTags[f.OwningTag]; ok {
+		t.Errorf("AddFile() tagged manifest despite digest mismatch")
+	}
+}
+
+// TestBufferUploadHead covers the peek-and-decide helper that AddFile uses
+// to pick between the buffered and streaming paths.
+func TestBufferUploadHead(t *testing.T) {
+	t.Parallel()
+
+	const threshold int64 = 16
+
+	tests := []struct {
+		name     string
+		body     []byte
+		wantFull bool
+		wantHead int
+	}{
+		{name: "empty body", body: []byte{}, wantFull: true, wantHead: 0},
+		{name: "well under threshold", body: []byte("hi"), wantFull: true, wantHead: 2},
+		{name: "exactly threshold", body: bytes.Repeat([]byte("a"), int(threshold)), wantFull: true, wantHead: int(threshold)},
+		{name: "one over threshold", body: bytes.Repeat([]byte("b"), int(threshold)+1), wantFull: false, wantHead: int(threshold) + 1},
+		{name: "well over threshold", body: bytes.Repeat([]byte("c"), int(threshold)*4), wantFull: false, wantHead: int(threshold) + 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := bytes.NewReader(tc.body)
+			head, full, err := bufferUploadHead(r, threshold)
+			if err != nil {
+				t.Fatalf("bufferUploadHead() error = %v", err)
+			}
+			if full != tc.wantFull {
+				t.Errorf("full = %v, want %v", full, tc.wantFull)
+			}
+			if len(head) != tc.wantHead {
+				t.Errorf("len(head) = %d, want %d", len(head), tc.wantHead)
+			}
+
+			// What's left in r combined with head must equal the body in
+			// order — that's the contract the streaming path relies on.
+			rest, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll(rest) error = %v", err)
+			}
+			combined := append(append([]byte{}, head...), rest...)
+			if diff := cmp.Diff(tc.body, combined); diff != "" {
+				t.Errorf("head+rest mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
