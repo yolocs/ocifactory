@@ -716,11 +716,12 @@ func (p *fakeStreamPusher) Push(_ context.Context, mediaType, expectedDigest str
 	}, nil
 }
 
-// TestAddFile_StreamingDispatch verifies the size-based fork in AddFile:
-//   - bodies at or below uploadMemThreshold take the buffered + monolithic
-//     path (countingRepo.Push invoked, fakeStreamPusher.Push not invoked);
-//   - bodies above uploadMemThreshold take the streaming path
-//     (fakeStreamPusher.Push invoked, no buffered Push of the file blob).
+// TestAddFile_StreamingDispatch verifies the path fork in AddFile across
+// all three dispatch signals:
+//   - RepoFile.Size > 0 short-circuits the peek and dispatches directly;
+//   - Size == 0 (unknown) falls back to the peek-and-decide buffer;
+//   - WithStreamingPushDisabled forces the buffered path regardless of
+//     body size.
 //
 // Both paths must end up with the same FileDescriptor digest+size and a
 // tagged manifest in the backend.
@@ -730,34 +731,51 @@ func TestAddFile_StreamingDispatch(t *testing.T) {
 	const threshold int64 = 1024
 
 	tests := []struct {
-		name           string
-		body           []byte
-		wantStreamCall bool
-		wantBufferPush bool
+		name             string
+		body             []byte
+		size             int64 // RepoFile.Size; 0 == unknown / peek path
+		disableStreaming bool
+		wantStreamCall   bool
+		wantBufferPush   bool
 	}{
 		{
-			name:           "body just under threshold goes monolithic",
+			name:           "unknown size, body under threshold, peek then buffered",
 			body:           bytes.Repeat([]byte("a"), int(threshold)-1),
 			wantStreamCall: false,
 			wantBufferPush: true,
 		},
 		{
-			name:           "body equal to threshold goes monolithic",
+			name:           "unknown size, body equal to threshold, peek then buffered",
 			body:           bytes.Repeat([]byte("b"), int(threshold)),
 			wantStreamCall: false,
 			wantBufferPush: true,
 		},
 		{
-			name:           "body one over threshold goes streaming",
+			name:           "unknown size, body one over threshold, peek then streaming",
 			body:           bytes.Repeat([]byte("c"), int(threshold)+1),
 			wantStreamCall: true,
 			wantBufferPush: false,
 		},
 		{
-			name:           "body well over threshold goes streaming",
-			body:           bytes.Repeat([]byte("d"), int(threshold)*8+7),
+			name:           "known size under threshold short-circuits to buffered",
+			body:           bytes.Repeat([]byte("d"), int(threshold)/2),
+			size:           threshold / 2,
+			wantStreamCall: false,
+			wantBufferPush: true,
+		},
+		{
+			name:           "known size over threshold short-circuits to streaming",
+			body:           bytes.Repeat([]byte("e"), int(threshold)*4+3),
+			size:           threshold*4 + 3,
 			wantStreamCall: true,
 			wantBufferPush: false,
+		},
+		{
+			name:             "streaming disabled forces buffered path even for large body",
+			body:             bytes.Repeat([]byte("f"), int(threshold)*8+11),
+			disableStreaming: true,
+			wantStreamCall:   false,
+			wantBufferPush:   true,
 		},
 	}
 
@@ -770,7 +788,11 @@ func TestAddFile_StreamingDispatch(t *testing.T) {
 			counting := &countingRepo{inMemoryRepo: memRepo}
 			pusher := &fakeStreamPusher{}
 
-			r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
+			opts := []RegistryOption{}
+			if tc.disableStreaming {
+				opts = append(opts, WithStreamingPushDisabled(true))
+			}
+			r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"}, opts...)
 			if err != nil {
 				t.Fatalf("NewRegistry() error = %v", err)
 			}
@@ -786,6 +808,7 @@ func TestAddFile_StreamingDispatch(t *testing.T) {
 				OwningRepo: "pkg",
 				OwningTag:  "v1",
 				Name:       "blob.bin",
+				Size:       tc.size,
 			}
 
 			desc, err := r.AddFile(ctx, f, bytes.NewReader(tc.body))

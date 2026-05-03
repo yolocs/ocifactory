@@ -121,6 +121,7 @@ go run ./cmd/ocifactory serve \
 - **Logging:** `github.com/abcxyz/pkg/logging`. Read with `logging.FromContext(ctx)`; configure via `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`, `OCIFACTORY_LOG_DEBUG`.
 - **Routing:** gorilla/mux (already adopted, see commit `26f36de`). Don't reach for stdlib `http.ServeMux` for new format handlers.
 - **Public API surface:** anything in `pkg/` is public. Don't expose internals you wouldn't want to support — when in doubt, lowercase it.
+- **Configuration:** Operator-tunable knobs (timeouts, thresholds, feature toggles, backend URLs) go through a CLI flag on `cmd/ocifactory serve`, not `os.Getenv` reads scattered inside library code. Library types (e.g. `oci.Registry`) accept the value through a typed option (`WithStreamingPushDisabled(bool)`, `WithArtifactType(string)`, …) so tests can override it without touching the environment and there's exactly one place — the flag definition — that enumerates every knob ocifactory exposes. Environment variables are reserved for what the runtime / harness sets (`OCIFACTORY_LOG_LEVEL`, secret material, GCP `GOOGLE_APPLICATION_CREDENTIALS` and friends), not product behaviour.
 
 ### Testing rules
 

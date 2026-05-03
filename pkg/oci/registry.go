@@ -35,15 +35,6 @@ const (
 	// memory while still allowing multi-tenant Cloud Run instances
 	// comfortable headroom.
 	uploadMemThreshold = 4 * 1024 * 1024
-
-	// envDisableStreamingPush, when set to "1" or "true", forces AddFile to
-	// keep using the buffered + monolithic upload path even for bodies
-	// larger than uploadMemThreshold. The escape hatch exists for
-	// registries with broken or absent chunked-PATCH support — the
-	// distribution-spec requires chunked PATCH from v1.1.1 onward, but
-	// occasional self-hosted registries are still in the wild that don't
-	// implement it correctly.
-	envDisableStreamingPush = "OCIFACTORY_DISABLE_STREAMING_PUSH"
 )
 
 // ErrDigestMismatch is returned by AddFile when the caller-supplied
@@ -89,6 +80,20 @@ func WithArtifactType(artifactType string) RegistryOption {
 	}
 }
 
+// WithStreamingPushDisabled forces AddFile to use the buffered + monolithic
+// upload path for every body, no matter how large — large bodies will spill
+// to a temp file before being pushed instead of streaming via chunked PATCH.
+// The escape hatch exists for registries with broken or absent chunked-PATCH
+// support; the distribution-spec requires chunked PATCH from v1.1.1 onward
+// but occasional self-hosted registries are still in the wild that don't
+// implement it correctly.
+func WithStreamingPushDisabled(disabled bool) RegistryOption {
+	return func(r *Registry) error {
+		r.disableStreamingPush = disabled
+		return nil
+	}
+}
+
 // RepoFile represents a file in an OCI repository.
 type RepoFile struct {
 	OwningRepo string // Repository the owns the file. Usually what's right after the registy host.
@@ -97,6 +102,15 @@ type RepoFile struct {
 	Name       string // File name.
 	MediaType  string // Media type of the file. If not provided, it will be inferred from the file name.
 	Digest     string // Digest of the file. If provided, it will be used to cross check retrieved or calculated digest.
+
+	// Size is the body length in bytes when the caller knows it ahead of
+	// time — typically forwarded from an HTTP Content-Length. It lets
+	// AddFile skip the peek-and-decide buffer entirely and dispatch
+	// straight to the buffered or streaming path, which keeps a 200 MB
+	// jar from pinning even one chunk of memory before the first byte
+	// hits the network. Size <= 0 means unknown and AddFile falls back
+	// to peeking up to uploadMemThreshold+1 bytes.
+	Size int64
 }
 
 type FileDescriptor struct {
@@ -112,10 +126,6 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	}
 	r.newBackendFunc = r.newBackend
 	r.newStreamPusherFunc = r.newStreamPusher
-
-	if v := os.Getenv(envDisableStreamingPush); v == "1" || strings.EqualFold(v, "true") {
-		r.disableStreamingPush = true
-	}
 
 	for _, o := range opt {
 		if err := o(r); err != nil {
@@ -236,11 +246,23 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 		return r.addFileBuffered(ctx, f, ro)
 	}
 
-	// Peek up to memThreshold+1 bytes so we can decide which path to take
-	// without losing the byte that pushed us over the threshold. If the
-	// body fully fits in the head buffer, the monolithic path takes over
-	// and the buffer is replayed; otherwise the streaming path consumes
-	// the head and the rest of `ro` in order.
+	// Fast path: when the caller knows the body length up front (typically
+	// from an HTTP Content-Length), dispatch directly without peeking. The
+	// peek itself only costs O(threshold) memory but it pre-buffers up to
+	// uploadMemThreshold bytes for a body we already know is going to take
+	// the streaming path — a meaningful waste at high concurrency.
+	if f.Size > 0 {
+		if f.Size > r.uploadMemThreshold {
+			return r.addFileStreaming(ctx, f, ro)
+		}
+		return r.addFileBuffered(ctx, f, ro)
+	}
+
+	// Unknown size: peek up to memThreshold+1 bytes so we can decide
+	// which path to take without losing the byte that pushed us over the
+	// threshold. If the body fully fits in the head buffer the monolithic
+	// path takes over and the buffer is replayed; otherwise the streaming
+	// path consumes the head and the rest of `ro` in order.
 	head, full, err := bufferUploadHead(ro, r.uploadMemThreshold)
 	if err != nil {
 		return nil, err
