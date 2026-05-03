@@ -6,10 +6,10 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/abcxyz/pkg/logging"
-	"github.com/abcxyz/pkg/serving"
 	"github.com/yolocs/ocifactory/pkg/cred"
+	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/serving"
 )
 
 type Registry interface {

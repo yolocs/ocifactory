@@ -12,11 +12,11 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/abcxyz/pkg/logging"
-	"github.com/abcxyz/pkg/renderer"
 	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
+	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/renderer"
 	"oras.land/oras-go/v2/errdef"
 )
 
@@ -69,7 +69,7 @@ type Handler struct {
 
 // NewHandler creates a new Handler.
 func NewHandler(registry handler.Registry) (*Handler, error) {
-	r, err := renderer.New(context.Background(), fs)
+	r, err := renderer.New(fs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}

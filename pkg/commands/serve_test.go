@@ -3,7 +3,7 @@ package commands
 import (
 	"testing"
 
-	"github.com/abcxyz/pkg/testutil"
+	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
 func TestServeFlagsValidate(t *testing.T) {

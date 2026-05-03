@@ -8,9 +8,9 @@ import (
 	"path"
 	"strings"
 
-	"github.com/abcxyz/pkg/logging"
 	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
+	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"oras.land/oras-go/v2/errdef"
 )
