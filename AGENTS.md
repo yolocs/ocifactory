@@ -116,12 +116,40 @@ go run ./cmd/ocifactory serve \
 ## Code conventions
 
 - **Languages:** Go is the only implementation language. Avoid pulling in shell scripts when a Go test will do.
-- **Style:** `gofmt -s` clean. Follow [Effective Go](https://go.dev/doc/effective_go) and the [Google Go style guide](https://google.github.io/styleguide/go/) where it doesn't conflict. Prefer explicit and boring over clever.
-- **Errors:** wrap with `fmt.Errorf("...: %w", err)`. Use `errors.Is` / `errors.As` to check. The `pkg/oci` package already exposes `oci.HasCode(err, statusCode)` for translating ORAS HTTP errors — use it in handlers rather than re-deriving status codes.
+- **Style:** Write idiomatic Go. Follow [Effective Go](https://go.dev/doc/effective_go) and the Google Go style guide — [overview](https://google.github.io/styleguide/go/), [style decisions](https://google.github.io/styleguide/go/decisions), [best practices](https://google.github.io/styleguide/go/best-practices). Prefer explicit and boring over clever. `gofmt -s` and `go vet` must be clean before every commit.
+- **Errors:** wrap with `fmt.Errorf("doing X: %w", err)`. Use `errors.Is` / `errors.As` to check. The `pkg/oci` package already exposes `oci.HasCode(err, statusCode)` for translating ORAS HTTP errors — use it in handlers rather than re-deriving status codes.
 - **Logging:** `github.com/abcxyz/pkg/logging`. Read with `logging.FromContext(ctx)`; configure via `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`, `OCIFACTORY_LOG_DEBUG`.
-- **Tests:** table-driven where it fits. Use the in-memory `oci.fake` backend for handler tests. Don't mock `handler.Registry` itself — exercise the real `pkg/oci` code with the fake backend underneath, so we test integration of layers.
 - **Routing:** gorilla/mux (already adopted, see commit `26f36de`). Don't reach for stdlib `http.ServeMux` for new format handlers.
 - **Public API surface:** anything in `pkg/` is public. Don't expose internals you wouldn't want to support — when in doubt, lowercase it.
+
+### Testing rules
+
+These are non-negotiable. Apply them to every test in the repo:
+
+1. **`t.Parallel()`** at the top of every test function and every subtest. The only exception is when a test mutates process-global state and a comment says so. Tests must be safe to run in parallel.
+2. **`t.Context()`** (Go 1.24+) for the test's `context.Context` — it's auto-cancelled on test cleanup. Don't reach for `context.Background()` or hand-roll a cancel.
+3. **Table-driven tests** wherever a function has more than one interesting input. Even for small N, the structure makes adding cases trivial:
+   ```go
+   tests := []struct{
+       name string
+       // inputs...
+       // wants...
+   }{ /* ... */ }
+   for _, tc := range tests {
+       t.Run(tc.name, func(t *testing.T) {
+           t.Parallel()
+           // ...
+       })
+   }
+   ```
+4. **Compare whole values with `cmp.Diff`** (`github.com/google/go-cmp/cmp`):
+   ```go
+   if diff := cmp.Diff(want, got); diff != "" {
+       t.Errorf("Foo() mismatch (-want +got):\n%s", diff)
+   }
+   ```
+   Don't compare field-by-field with `==` or `reflect.DeepEqual` when `cmp.Diff` will work — the diff output is what makes failures debuggable. The argument order is `(want, got)` so the diff legend reads correctly.
+5. **Fakes, not mocks.** No `gomock`, no `testify/mock`, no codegen mock libraries. Write a small fake of the interface in a `_test.go` file (or `pkg/<x>/fake.go` if reused across packages). For handler tests, don't mock `handler.Registry` — exercise the real `pkg/oci` code on top of the in-memory backend in `pkg/oci/fake.go`, so the layers are tested together.
 
 ## Adding a new repo type — checklist
 
