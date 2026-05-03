@@ -3,6 +3,7 @@ package oci
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -29,10 +31,10 @@ const (
 	FileNameAnnotation  = "ocifactory.file.title"
 
 	// uploadMemThreshold is the largest upload body that AddFile will buffer
-	// fully in memory. Anything larger takes the streaming chunked PATCH
-	// path (or, when streaming is disabled, spills to a single temp file).
-	// Sized to keep typical package metadata and small wheels fully in
-	// memory while still allowing multi-tenant Cloud Run instances
+	// fully in memory. Anything larger streams via chunked PATCH unless
+	// streaming is disabled, in which case it spills to a single temp
+	// file. Sized to keep typical package metadata and small wheels fully
+	// in memory while still allowing multi-tenant Cloud Run instances
 	// comfortable headroom.
 	uploadMemThreshold = 4 * 1024 * 1024
 )
@@ -62,6 +64,13 @@ type Registry struct {
 	// above uploadMemThreshold take the chunked PATCH streaming path, which
 	// uses O(streamChunkSize) memory and zero disk regardless of body size.
 	disableStreamingPush bool
+
+	// authClients caches *auth.Client per credential hash so concurrent
+	// AddFile calls share the same bearer-token cache. Without this each
+	// PATCH of a chunked upload would round-trip the registry's auth
+	// endpoint — a 200 MB jar at 4 MiB chunks would issue ~50 token
+	// fetches per upload and saturate the auth path under load.
+	authClients sync.Map // map[string]*auth.Client
 
 	// Used in unit tests to stub with in-memory backend.
 	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
@@ -108,8 +117,9 @@ type RepoFile struct {
 	// AddFile skip the peek-and-decide buffer entirely and dispatch
 	// straight to the buffered or streaming path, which keeps a 200 MB
 	// jar from pinning even one chunk of memory before the first byte
-	// hits the network. Size <= 0 means unknown and AddFile falls back
-	// to peeking up to uploadMemThreshold+1 bytes.
+	// hits the network. Any value <= 0 (matching http.Request.ContentLength's
+	// "unknown" sentinel of -1) means unknown and AddFile falls back to
+	// peeking up to uploadMemThreshold+1 bytes.
 	Size int64
 }
 
@@ -214,15 +224,23 @@ func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag str
 // AddFile picks one of two upload paths per call:
 //
 //   - **Buffered + monolithic.** For bodies that fit within
-//     uploadMemThreshold, or always when streaming is disabled
-//     (OCIFACTORY_DISABLE_STREAMING_PUSH), the body is staged in memory
-//     (or, on the disabled path, into a single temp file) and pushed in a
-//     single POST/PUT round-trip via oras-go.
+//     uploadMemThreshold, or always when streaming is disabled (the
+//     WithStreamingPushDisabled option / --disable-streaming-push flag),
+//     the body is staged in memory (or, on the disabled path, into a
+//     single temp file) and pushed in a single POST/PUT round-trip via
+//     oras-go.
 //   - **Streaming chunked PATCH.** For bodies that exceed
 //     uploadMemThreshold and when streaming is enabled, the body is
 //     streamed straight to the backend using POST/PATCH/PUT chunked
 //     uploads, with the SHA-256 digest computed on-the-fly. Memory is
 //     O(chunk size); disk is zero, regardless of body length.
+//
+// Path selection short-circuits whenever the caller knows the body size
+// up front (RepoFile.Size > 0): no peek-and-decide buffer is allocated,
+// and dispatch falls straight onto the threshold comparison. When the
+// size is unknown (Size <= 0, e.g. an HTTP request with chunked
+// Transfer-Encoding), AddFile peeks up to uploadMemThreshold+1 bytes to
+// decide.
 //
 // Other behaviour is identical between paths:
 //
@@ -284,8 +302,14 @@ func (r *Registry) addFileBuffered(ctx context.Context, f *RepoFile, ro io.Reade
 	}
 	defer staged.cleanup()
 
-	if f.Digest != "" && string(staged.digest) != f.Digest {
-		return nil, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, staged.digest, f.Digest)
+	if f.Digest != "" {
+		expected, err := digest.Parse(f.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expected digest %q: %w", f.Digest, err)
+		}
+		if expected != staged.digest {
+			return nil, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, staged.digest, expected)
+		}
 	}
 
 	fileDesc := ocispec.Descriptor{
@@ -558,9 +582,14 @@ func stageUploadWithThreshold(ro io.Reader, memThreshold int64) (*stagedUpload, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file for upload: %w", err)
 	}
+	// Unlink-while-open (Linux idiom): the directory entry disappears
+	// immediately while the data stays accessible via tmp's fd until
+	// Close. Survives panic and SIGKILL — a Cloud Run instance that
+	// crashes mid-upload doesn't leak a /tmp inode. Best-effort: if the
+	// platform refuses early unlink, the cleanup func still runs.
+	_ = os.Remove(tmp.Name())
 	cleanup := func() {
 		tmp.Close()
-		os.Remove(tmp.Name())
 	}
 
 	if _, err := tmp.Write(buf.Bytes()); err != nil {
@@ -632,18 +661,44 @@ func (r *Registry) newStreamPusher(ctx context.Context, f *RepoFile) (streamingP
 
 // authClientFromContext returns an *auth.Client wired with the basic-auth
 // credentials carried in ctx, or nil if no credentials are present.
+//
+// Clients are memoized on the Registry per (host, user, password) tuple
+// so concurrent AddFile calls share the same bearer-token cache. The two
+// reasons this matters:
+//
+//  1. Each constructed *auth.Client carries its own auth.NewCache(); a
+//     fresh client would fall back to noCache{} and trigger a fresh token
+//     round-trip on every Do() — multiplying auth load by the number of
+//     PATCH chunks in a single upload.
+//  2. addFileStreaming asks for a client twice in a row (once for the
+//     pusher, once for the manifest write). With memoization both legs
+//     hit the same cache; without it they re-fetch tokens independently.
 func (r *Registry) authClientFromContext(ctx context.Context) *auth.Client {
 	c, ok := cred.FromContext(ctx)
 	if !ok || c.Basic == nil {
 		return nil
 	}
-	return &auth.Client{
+
+	// Hash rather than format-as-key so the literal password isn't sitting
+	// in a map keyed on user-controlled data — the heap already holds the
+	// credentials, but a hash key narrows the blast radius of any heap
+	// dump or accidental log spew.
+	sum := sha256.Sum256([]byte(r.baseURL.Host + "\x00" + c.Basic.User + "\x00" + c.Basic.Password))
+	key := string(sum[:])
+	if v, ok := r.authClients.Load(key); ok {
+		return v.(*auth.Client)
+	}
+
+	client := &auth.Client{
 		Client: retry.DefaultClient,
+		Cache:  auth.NewCache(),
 		Credential: auth.StaticCredential(r.baseURL.Host, auth.Credential{
 			Username: c.Basic.User,
 			Password: c.Basic.Password,
 		}),
 	}
+	actual, _ := r.authClients.LoadOrStore(key, client)
+	return actual.(*auth.Client)
 }
 
 // upsertFileLayer updates the layers list with the provided file descriptor.

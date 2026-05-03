@@ -48,16 +48,20 @@ func (f *serveFlags) Validate() error {
 	}
 	if f.registryURLStr == "" {
 		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
+		return merr
 	}
+	// Default to https when the user omits the scheme. Either way, parse
+	// unconditionally — the original code only assigned f.registryURL
+	// inside the prepend branch, leaving registryURL nil when the user
+	// passed an http:// or https:// URL directly.
 	if !strings.HasPrefix(f.registryURLStr, "http://") && !strings.HasPrefix(f.registryURLStr, "https://") {
-		// Default to https.
 		f.registryURLStr = "https://" + f.registryURLStr
-		u, err := url.Parse(f.registryURLStr)
-		if err != nil {
-			merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
-		} else {
-			f.registryURL = u
-		}
+	}
+	u, err := url.Parse(f.registryURLStr)
+	if err != nil {
+		merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
+	} else {
+		f.registryURL = u
 	}
 	return merr
 }

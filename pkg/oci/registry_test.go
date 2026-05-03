@@ -16,6 +16,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/yolocs/ocifactory/pkg/cred"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 	"oras.land/oras-go/v2/content/memory"
 	"oras.land/oras-go/v2/errdef"
@@ -929,5 +930,55 @@ func TestBufferUploadHead(t *testing.T) {
 				t.Errorf("head+rest mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestAuthClientMemoization locks in the per-credentials caching behaviour
+// in authClientFromContext: two calls with the same basic-auth context
+// must return the same *auth.Client (so the per-client token cache is
+// shared across PATCHes and across the pusher/backend split inside one
+// AddFile call), and calls with different credentials must NOT share.
+//
+// The bearer-token re-fetch storm this guards against was the #1 finding
+// from the pre-merge memory-leak audit; do not delete this test without
+// a replacement.
+func TestAuthClientMemoization(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+
+	ctx1 := cred.WithCred(t.Context(), &cred.Cred{
+		Basic: &cred.BasicCred{User: "alice", Password: "p1"},
+	})
+	ctx2 := cred.WithCred(t.Context(), &cred.Cred{
+		Basic: &cred.BasicCred{User: "alice", Password: "p1"},
+	})
+	ctx3 := cred.WithCred(t.Context(), &cred.Cred{
+		Basic: &cred.BasicCred{User: "bob", Password: "p2"},
+	})
+
+	c1 := r.authClientFromContext(ctx1)
+	c2 := r.authClientFromContext(ctx2)
+	c3 := r.authClientFromContext(ctx3)
+
+	if c1 == nil || c2 == nil || c3 == nil {
+		t.Fatalf("authClientFromContext returned nil for credentialled contexts: %v %v %v", c1, c2, c3)
+	}
+	if c1 != c2 {
+		t.Errorf("same credentials produced different clients: %p vs %p", c1, c2)
+	}
+	if c1 == c3 {
+		t.Errorf("different credentials produced the same client: %p", c1)
+	}
+	if c1.Cache == nil {
+		t.Errorf("auth.Client.Cache must be set so token fetches are amortised across PATCHes; got nil")
+	}
+
+	// No credentials -> nil client (auth-free request path).
+	if got := r.authClientFromContext(t.Context()); got != nil {
+		t.Errorf("expected nil client for no-credentials context, got %v", got)
 	}
 }

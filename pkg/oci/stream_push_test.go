@@ -425,9 +425,9 @@ func TestStreamPusher_NewStreamPusherFromRegistry(t *testing.T) {
 		t.Fatalf("newStreamPusher() returned %T, want *streamPusher", pusher)
 	}
 	// Override chunk size so the test body fits in the test registry's
-	// chunk math, and force HTTP since httptest is plain HTTP.
+	// chunk math. plainHTTP is already wired via NewRegistry from the
+	// http:// httptest URL.
 	sp.chunkSize = 8
-	sp.plainHTTP = true
 
 	body := []byte("hello, streaming world")
 	desc, err := sp.Push(t.Context(), "application/octet-stream", "", bytes.NewReader(body))

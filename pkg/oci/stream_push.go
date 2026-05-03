@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
+	"time"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -22,6 +24,24 @@ import (
 // keeping per-upload memory bounded — at this size, instance memory is
 // dominated by concurrent requests, not by any single body.
 const defaultStreamChunkSize = 4 * 1024 * 1024
+
+// defaultChunkPool reuses default-sized chunk buffers across streaming
+// uploads. Without it, N concurrent large uploads each hold an independent
+// 4 MiB byte slice (N × 4 MiB transient heap) — enough to OOM a Cloud Run
+// instance under a burst. The pool entries are pointers because storing a
+// slice value in a sync.Pool boxes it on every Put, defeating the point.
+var defaultChunkPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, defaultStreamChunkSize)
+		return &b
+	},
+}
+
+// abortTimeout caps how long abortUpload is willing to wait for the
+// registry to acknowledge a DELETE. The whole point of abort is cleanup
+// after a failure, so we don't want to compound the original problem by
+// blocking on a slow registry.
+const abortTimeout = 5 * time.Second
 
 // httpDoer is the minimal interface satisfied by both *http.Client and
 // auth.Client. The streaming pusher only needs Do — accepting the smaller
@@ -90,9 +110,19 @@ func (p *streamPusher) Push(ctx context.Context, mediaType, expectedDigest strin
 
 	digester := digest.SHA256.Digester()
 	teed := io.TeeReader(content, digester.Hash())
-	chunk := make([]byte, p.chunkSize)
-	var size int64
 
+	// Pool reuse for the default chunk size; tests with smaller sizes
+	// allocate ad-hoc to keep pool entries uniformly sized.
+	var chunk []byte
+	if p.chunkSize == defaultStreamChunkSize {
+		bufPtr := defaultChunkPool.Get().(*[]byte)
+		defer defaultChunkPool.Put(bufPtr)
+		chunk = *bufPtr
+	} else {
+		chunk = make([]byte, p.chunkSize)
+	}
+
+	var size int64
 	for {
 		// io.ReadFull lets us send full-sized chunks for everything but the
 		// tail without a manual loop. EOF / ErrUnexpectedEOF both mean "this
@@ -122,9 +152,16 @@ func (p *streamPusher) Push(ctx context.Context, mediaType, expectedDigest strin
 	// Compare against the caller-supplied digest BEFORE committing. On
 	// mismatch we DELETE the upload so the blob never lands in the
 	// registry, even though the bytes were already transmitted.
-	if expectedDigest != "" && string(finalDigest) != expectedDigest {
-		p.abortUpload(ctx, location)
-		return ocispec.Descriptor{}, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, finalDigest, expectedDigest)
+	if expectedDigest != "" {
+		expected, err := digest.Parse(expectedDigest)
+		if err != nil {
+			p.abortUpload(ctx, location)
+			return ocispec.Descriptor{}, fmt.Errorf("invalid expected digest %q: %w", expectedDigest, err)
+		}
+		if expected != finalDigest {
+			p.abortUpload(ctx, location)
+			return ocispec.Descriptor{}, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, finalDigest, expected)
+		}
 	}
 
 	if err := p.commitUpload(ctx, location, finalDigest); err != nil {
@@ -214,11 +251,20 @@ func (p *streamPusher) commitUpload(ctx context.Context, location string, finalD
 // registry can reclaim partial bytes. Errors are intentionally swallowed:
 // the caller already has a "real" error to return and an abort failure is
 // strictly less interesting than the underlying cause.
+//
+// The DELETE runs on a context detached from ctx's cancellation: ctx is
+// often already cancelled (request timeout, client disconnect) by the time
+// we abort, and an abort that quietly does nothing is the worst outcome —
+// it leaves the upload session pinned server-side until the registry's
+// own GC runs (and on quota-bound registries like GAR, charges against
+// the partial-upload allowance until then).
 func (p *streamPusher) abortUpload(ctx context.Context, location string) {
 	if location == "" {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, location, nil)
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(abortCtx, http.MethodDelete, location, nil)
 	if err != nil {
 		return
 	}
@@ -226,6 +272,10 @@ func (p *streamPusher) abortUpload(ctx context.Context, location string) {
 	if err != nil {
 		return
 	}
+	// Drain whatever the registry sent back so the connection stays
+	// reusable for the next request — unbounded but small in practice
+	// (registries return JSON or an empty body).
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 }
 
@@ -268,6 +318,13 @@ func appendDigestQuery(location, dgst string) (string, error) {
 // We re-implement it because the upstream is in an internal/ package; the
 // shape of the returned error is identical so callers can match on
 // errcode.ErrorResponse via errors.As (and pkg/oci.HasCode keeps working).
+//
+// Callers are still responsible for closing resp.Body. The body is fully
+// drained here so the underlying connection stays in net/http's
+// keep-alive pool — without the drain, an upstream that sends an
+// error JSON longer than a partial-decode terminus (or just a non-JSON
+// HTML 502 page from a frontend proxy) would leave bytes on the wire and
+// force the next request onto a fresh TCP+TLS handshake.
 func parseStreamErrorResponse(resp *http.Response) error {
 	result := &errcode.ErrorResponse{
 		Method:     resp.Request.Method,
@@ -282,5 +339,6 @@ func parseStreamErrorResponse(resp *http.Response) error {
 	if err := json.NewDecoder(lr).Decode(&body); err == nil {
 		result.Errors = body.Errors
 	}
+	_, _ = io.Copy(io.Discard, lr)
 	return result
 }
