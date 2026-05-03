@@ -1,8 +1,8 @@
 package oci
 
 import (
-	"context"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -85,11 +85,11 @@ func TestFakeRegistry_AddFile(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		file       *RepoFile
-		content    string
-		wantErr    bool
-		wantDigest string
+		name     string
+		file     *RepoFile
+		content  string
+		wantErr  bool
+		wantFile ocispec.Descriptor
 	}{
 		{
 			name: "add simple file",
@@ -99,9 +99,15 @@ func TestFakeRegistry_AddFile(t *testing.T) {
 				Name:       "test.txt",
 				MediaType:  "text/plain",
 			},
-			content:    "test content",
-			wantErr:    false,
-			wantDigest: "sha256:6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72",
+			content: "test content",
+			wantFile: ocispec.Descriptor{
+				MediaType: "text/plain",
+				Digest:    "sha256:6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72",
+				Size:      12,
+				Annotations: map[string]string{
+					FileNameAnnotation: "test.txt",
+				},
+			},
 		},
 	}
 
@@ -110,60 +116,31 @@ func TestFakeRegistry_AddFile(t *testing.T) {
 			t.Parallel()
 
 			registry := NewFakeRegistry()
-			ctx := context.Background()
 
-			desc, err := registry.AddFile(ctx, tt.file, strings.NewReader(tt.content))
+			desc, err := registry.AddFile(t.Context(), tt.file, strings.NewReader(tt.content))
 			if (err != nil) != tt.wantErr {
 				t.Errorf("AddFile() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-
 			if err != nil {
 				return
 			}
 
-			// Check if file was stored correctly
+			if diff := cmp.Diff(tt.wantFile, desc.File); diff != "" {
+				t.Errorf("AddFile() desc.File mismatch (-want +got):\n%s", diff)
+			}
+
 			key := tt.file.OwningRepo + "/" + tt.file.OwningTag + "/" + tt.file.Name
-			content, ok := registry.Files[key]
+			gotContent, ok := registry.Files[key]
 			if !ok {
-				t.Errorf("File not found in registry: %s", key)
-				return
+				t.Errorf("File not stored at key %q", key)
+			} else if string(gotContent) != tt.content {
+				t.Errorf("Stored content = %q, want %q", string(gotContent), tt.content)
 			}
 
-			if string(content) != tt.content {
-				t.Errorf("File content = %q, want %q", string(content), tt.content)
-			}
-
-			// Check if tag was added
-			tags, ok := registry.Tags[tt.file.OwningRepo]
-			if !ok {
-				t.Errorf("Repo not found in tags: %s", tt.file.OwningRepo)
-				return
-			}
-
-			found := false
-			for _, tag := range tags {
-				if tag == tt.file.OwningTag {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("Tag %q not found for repo %q", tt.file.OwningTag, tt.file.OwningRepo)
-			}
-
-			// Check descriptor
-			if desc.File.Digest.String() != tt.wantDigest {
-				t.Errorf("Descriptor digest = %q, want %q", desc.File.Digest.String(), tt.wantDigest)
-			}
-
-			if desc.File.MediaType != tt.file.MediaType {
-				t.Errorf("Descriptor media type = %q, want %q", desc.File.MediaType, tt.file.MediaType)
-			}
-
-			if desc.File.Annotations[FileNameAnnotation] != tt.file.Name {
-				t.Errorf("Descriptor filename annotation = %q, want %q",
-					desc.File.Annotations[FileNameAnnotation], tt.file.Name)
+			gotTags := registry.Tags[tt.file.OwningRepo]
+			if !slices.Contains(gotTags, tt.file.OwningTag) {
+				t.Errorf("Tag %q not found for repo %q (got tags: %v)", tt.file.OwningTag, tt.file.OwningRepo, gotTags)
 			}
 		})
 	}
@@ -219,7 +196,7 @@ func TestFakeRegistry_ReadFile(t *testing.T) {
 			t.Parallel()
 
 			registry := NewFakeRegistry()
-			ctx := context.Background()
+			ctx := t.Context()
 
 			// Setup file if needed
 			if tt.setupFile != nil {
@@ -297,8 +274,7 @@ func TestFakeRegistry_ListTags(t *testing.T) {
 			registry := NewFakeRegistry()
 			registry.Tags = tt.setupTags
 
-			ctx := context.Background()
-			got, err := registry.ListTags(ctx, tt.repo)
+			got, err := registry.ListTags(t.Context(), tt.repo)
 			if err != nil {
 				t.Errorf("ListTags() error = %v", err)
 				return
@@ -344,21 +320,8 @@ func Test_generateDescriptor(t *testing.T) {
 
 			got := generateDescriptor(tt.content, tt.file)
 
-			if got.MediaType != tt.want.MediaType {
-				t.Errorf("MediaType = %q, want %q", got.MediaType, tt.want.MediaType)
-			}
-
-			if got.Digest != tt.want.Digest {
-				t.Errorf("Digest = %q, want %q", got.Digest, tt.want.Digest)
-			}
-
-			if got.Size != tt.want.Size {
-				t.Errorf("Size = %d, want %d", got.Size, tt.want.Size)
-			}
-
-			if got.Annotations[FileNameAnnotation] != tt.want.Annotations[FileNameAnnotation] {
-				t.Errorf("Filename annotation = %q, want %q",
-					got.Annotations[FileNameAnnotation], tt.want.Annotations[FileNameAnnotation])
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("generateDescriptor() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -415,7 +378,7 @@ func TestFakeRegistry_ListFiles(t *testing.T) {
 				Tags:  make(map[string][]string),
 			}
 
-			got, err := registry.ListFiles(context.Background(), tt.repo)
+			got, err := registry.ListFiles(t.Context(), tt.repo)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("FakeRegistry.ListFiles() error = %v, wantErr %v", err, tt.wantErr)
 				return
