@@ -25,7 +25,6 @@ type serveFlags struct {
 	port           string
 	repoType       string
 	registryURLStr string
-	landingDir     string
 
 	registryURL *url.URL
 }
@@ -58,10 +57,6 @@ func (f *serveFlags) Validate() error {
 			f.registryURL = u
 		}
 	}
-	// This default is implicit because temp dir will be different each time.
-	if f.landingDir == "" {
-		f.landingDir = os.TempDir()
-	}
 	return merr
 }
 
@@ -85,8 +80,6 @@ func newServeCmd() *cobra.Command {
 		fmt.Sprintf("Type of repository to serve. Allowed: %v", supportedRepoTypes))
 	cmd.Flags().StringVar(&flags.registryURLStr, "backend-registry", os.Getenv("OCIFACTORY_BACKEND_REGISTRY"),
 		"The URL to the backend OCI registry.")
-	cmd.Flags().StringVar(&flags.landingDir, "landing-dir", os.Getenv("OCIFACTORY_LANDING_DIR"),
-		"The directory to store the temporary artifact files. If not set, a temp dir will be created each time.")
 
 	return cmd
 }
@@ -104,7 +97,6 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	case maven.RepoType:
 		reg, err := oci.NewRegistry(
 			flags.registryURL,
-			oci.WithLandingDir(flags.landingDir),
 			oci.WithArtifactType(maven.ArtifactType),
 		)
 		if err != nil {
@@ -118,7 +110,6 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	case python.RepoType:
 		reg, err := oci.NewRegistry(
 			flags.registryURL,
-			oci.WithLandingDir(flags.landingDir),
 			oci.WithArtifactType(python.ArtifactType),
 		)
 		if err != nil {

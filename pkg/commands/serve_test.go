@@ -105,7 +105,6 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: "port", flagName: "port"},
 		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
 		{name: "backend-registry", flagName: "backend-registry"},
-		{name: "landing-dir", flagName: "landing-dir"},
 	}
 
 	for _, tc := range tests {
