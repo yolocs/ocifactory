@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,11 +12,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/yolocs/ocifactory/pkg/cred"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
-	"oras.land/oras-go/v2/content/file"
 	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
@@ -26,7 +27,19 @@ import (
 const (
 	DefaultArtifactType = "application/vnd.ocifactory.generic"
 	FileNameAnnotation  = "ocifactory.file.title"
+
+	// uploadMemThreshold is the largest upload body that AddFile will buffer
+	// fully in memory. Anything larger spills to a single temp file before
+	// being pushed to the backend. Sized to keep typical package metadata and
+	// small wheels fully in memory while still allowing multi-tenant Cloud
+	// Run instances comfortable headroom.
+	uploadMemThreshold = 4 * 1024 * 1024
 )
+
+// ErrDigestMismatch is returned by AddFile when the caller-supplied
+// RepoFile.Digest does not match the digest computed from the uploaded body.
+// It is returned before any data is pushed to the backend.
+var ErrDigestMismatch = errors.New("file digest mismatch")
 
 type destRepo interface {
 	oras.Target
@@ -37,23 +50,17 @@ type destRepo interface {
 
 type Registry struct {
 	baseURL      *url.URL
-	landingDir   string
 	artifactType string
+
+	// uploadMemThreshold is the in-memory staging cap for AddFile bodies.
+	// Initialised to the package default; overridable from tests.
+	uploadMemThreshold int64
 
 	// Used in unit test to stub with in memory backend.
 	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
 }
 
 type RegistryOption func(*Registry) error
-
-// WithLandingDir sets the directory where files are stored before being uploaded.
-// The provided dir must already exist. The default is the current directory.
-func WithLandingDir(dir string) RegistryOption {
-	return func(r *Registry) error {
-		r.landingDir = dir
-		return nil
-	}
-}
 
 func WithArtifactType(artifactType string) RegistryOption {
 	return func(r *Registry) error {
@@ -79,9 +86,9 @@ type FileDescriptor struct {
 
 func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	r := &Registry{
-		baseURL:      baseURL,
-		landingDir:   os.TempDir(), // Default to the system tmp directory.
-		artifactType: DefaultArtifactType,
+		baseURL:            baseURL,
+		artifactType:       DefaultArtifactType,
+		uploadMemThreshold: uploadMemThreshold,
 	}
 	r.newBackendFunc = r.newBackend
 
@@ -168,32 +175,63 @@ func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag str
 }
 
 // AddFile adds a file to the registry.
-// The file is first uploaded to the landing zone, then to the OCI store, and finally to the backend repository.
-// If the file already exists in the backend repository, it will be updated if and only if the digest has changed.
-// Returns the updated manifest descriptor and the file descriptor.
+//
+// The body is streamed exactly once: bytes are simultaneously hashed and
+// staged into either an in-memory buffer (for bodies up to uploadMemThreshold)
+// or a single temp file (for larger bodies). The staged content is then
+// pushed directly to the backend repository — no intermediate OCI file store
+// or multi-hop disk copy.
+//
+// If RepoFile.Digest is set and disagrees with the digest computed from the
+// body, AddFile returns ErrDigestMismatch before any data is sent to the
+// backend.
+//
+// If the layer with the same digest already exists in the backend, the blob
+// upload is skipped. If the file is unchanged in the manifest for
+// RepoFile.OwningTag, the manifest is left untouched. Otherwise the manifest
+// is repacked and re-tagged.
 func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
 	if strings.HasPrefix(f.OwningTag, "ref_") {
 		return nil, fmt.Errorf("canonical tag cannot be prefixed with ref_; got %q", f.OwningTag)
 	}
 
-	// Load the file in the landing zone.
-	tmpFile, err := r.landFile(ro)
+	staged, err := stageUploadWithThreshold(ro, r.uploadMemThreshold)
 	if err != nil {
 		return nil, err
 	}
-	defer os.Remove(tmpFile)
+	defer staged.cleanup()
 
-	// Load the file in the OCI store.
-	fs, fileDesc, err := r.loadFile(ctx, tmpFile, f)
-	if err != nil {
-		return nil, err
+	if f.Digest != "" && string(staged.digest) != f.Digest {
+		return nil, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, staged.digest, f.Digest)
 	}
-	defer fs.Close()
 
-	// Create the backend repository for the file.
+	fileDesc := ocispec.Descriptor{
+		MediaType: detectFileMediaType(f),
+		Digest:    staged.digest,
+		Size:      staged.size,
+		Annotations: map[string]string{
+			FileNameAnnotation:      f.Name,
+			ocispec.AnnotationTitle: f.Name,
+		},
+	}
+
 	backendRepo, err := r.newBackendFunc(ctx, f)
 	if err != nil {
 		return nil, err
+	}
+
+	exists, err := backendRepo.Exists(ctx, fileDesc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check if file blob exists: %w", err)
+	}
+	if !exists {
+		blobReader, err := staged.reader()
+		if err != nil {
+			return nil, err
+		}
+		if err := backendRepo.Push(ctx, fileDesc, blobReader); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+			return nil, fmt.Errorf("failed to push file blob: %w", err)
+		}
 	}
 
 	manifestDesc, err := backendRepo.Resolve(ctx, f.OwningTag)
@@ -210,19 +248,13 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 		return &FileDescriptor{Manifest: manifestDesc, File: fileDesc}, nil
 	}
 
-	// Pack the updated manifest
 	packOpts := oras.PackManifestOptions{Layers: layers}
-	newManifestDesc, err := oras.PackManifest(ctx, fs, oras.PackManifestVersion1_1, r.artifactType, packOpts)
+	newManifestDesc, err := oras.PackManifest(ctx, backendRepo, oras.PackManifestVersion1_1, r.artifactType, packOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack new manifest: %w", err)
 	}
-	if err := fs.Tag(ctx, newManifestDesc, f.OwningTag); err != nil {
+	if err := backendRepo.Tag(ctx, newManifestDesc, f.OwningTag); err != nil {
 		return nil, fmt.Errorf("failed to tag new manifest: %w", err)
-	}
-
-	// Push the manifest and tag it
-	if _, err := oras.Copy(ctx, fs, f.OwningTag, backendRepo, f.OwningTag, oras.DefaultCopyOptions); err != nil {
-		return nil, fmt.Errorf("failed to copy manifest to backend repo: %w", err)
 	}
 
 	return &FileDescriptor{Manifest: newManifestDesc, File: fileDesc}, nil
@@ -338,36 +370,79 @@ func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, err
 	return files, nil
 }
 
-func (r *Registry) landFile(ro io.Reader) (string, error) {
-	tmpFile, err := os.CreateTemp(r.landingDir, "oci-upload-")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary file in the landing zone: %w", err)
-	}
-
-	if _, err := io.Copy(tmpFile, ro); err != nil {
-		return "", fmt.Errorf("failed to copy reader to the landing zone: %w", err)
-	}
-
-	return tmpFile.Name(), nil
+// stagedUpload is the result of staging an upload body for a single push.
+// reader() returns a fresh io.Reader positioned at the start of the staged
+// content; it may be called at most once. cleanup releases any temp file
+// and is safe to call multiple times.
+type stagedUpload struct {
+	digest  digest.Digest
+	size    int64
+	reader  func() (io.Reader, error)
+	cleanup func()
 }
 
-func (r *Registry) loadFile(ctx context.Context, fileLanded string, f *RepoFile) (*file.Store, ocispec.Descriptor, error) {
-	fs, err := file.New(r.landingDir) // The OCI file store is not used for writing files.
+// stageUploadWithThreshold reads ro to completion, computing its sha256
+// digest as it goes. Bodies up to memThreshold are buffered in memory;
+// larger bodies spill to a single temp file. Either way, the returned
+// stagedUpload exposes a rewindable reader and a cleanup callback for any
+// spilled state. Production callers thread the per-Registry threshold so
+// tests can dial it down to small sizes.
+func stageUploadWithThreshold(ro io.Reader, memThreshold int64) (*stagedUpload, error) {
+	digester := digest.SHA256.Digester()
+
+	buf := &bytes.Buffer{}
+	// Read at most memThreshold+1 bytes into memory so we can decide whether
+	// to spill without losing the byte that pushed us over.
+	headLimit := memThreshold + 1
+	headTee := io.TeeReader(io.LimitReader(ro, headLimit), digester.Hash())
+	headN, err := io.Copy(buf, headTee)
 	if err != nil {
-		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to create local OCI store: %w", err)
+		return nil, fmt.Errorf("failed to stage upload: %w", err)
 	}
 
-	fileDesc, err := fs.Add(ctx, fileLanded, detectFileMediaType(f), "")
-	if err != nil {
-		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to add file to local OCI store: %w", err)
+	if headN <= memThreshold {
+		// Whole body fit in memory.
+		data := buf.Bytes()
+		return &stagedUpload{
+			digest:  digester.Digest(),
+			size:    int64(len(data)),
+			reader:  func() (io.Reader, error) { return bytes.NewReader(data), nil },
+			cleanup: func() {},
+		}, nil
 	}
-	if f.Digest != "" && string(fileDesc.Digest) != f.Digest {
-		return nil, ocispec.Descriptor{}, fmt.Errorf("file digest mismatch: %q != %q", fileDesc.Digest, f.Digest)
-	}
-	fileDesc.Annotations[FileNameAnnotation] = f.Name
-	fileDesc.Annotations[ocispec.AnnotationTitle] = f.Name // The 'Add' method by default sets the title to the full path.
 
-	return fs, fileDesc, nil
+	// Spill: dump what we already buffered into a temp file, then drain the
+	// rest of the body into the same file (and the digester) in one pass.
+	tmp, err := os.CreateTemp("", "ocifactory-upload-")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file for upload: %w", err)
+	}
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}
+
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to write head buffer to temp file: %w", err)
+	}
+	tailN, err := io.Copy(io.MultiWriter(tmp, digester.Hash()), ro)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("failed to stage upload tail to temp file: %w", err)
+	}
+
+	return &stagedUpload{
+		digest: digester.Digest(),
+		size:   headN + tailN,
+		reader: func() (io.Reader, error) {
+			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("failed to rewind staged upload: %w", err)
+			}
+			return tmp, nil
+		},
+		cleanup: cleanup,
+	}, nil
 }
 
 func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error) {

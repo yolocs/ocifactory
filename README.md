@@ -49,8 +49,7 @@ pip install --index-url http://localhost:8080/simple/ requests
 ```
 
 Runtime config is also available via env vars: `PORT`, `OCIFACTORY_REPO_TYPE`,
-`OCIFACTORY_BACKEND_REGISTRY`, `OCIFACTORY_LANDING_DIR`,
-`OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`.
+`OCIFACTORY_BACKEND_REGISTRY`, `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`.
 
 ## Architecture
 
