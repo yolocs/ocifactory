@@ -26,6 +26,10 @@ func TestServeFlagsValidate(t *testing.T) {
 				registryURLStr: "http://example.com",
 			},
 			wantErr: "",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
 		},
 		{
 			name: "missing port",
@@ -34,6 +38,10 @@ func TestServeFlagsValidate(t *testing.T) {
 				registryURLStr: "http://example.com",
 			},
 			wantErr: "port is required",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
 		},
 		{
 			name: "missing repo type",
@@ -42,6 +50,10 @@ func TestServeFlagsValidate(t *testing.T) {
 				registryURLStr: "http://example.com",
 			},
 			wantErr: `repo-type "" is not supported`,
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
 		},
 		{
 			name: "invalid repo type",
@@ -51,6 +63,10 @@ func TestServeFlagsValidate(t *testing.T) {
 				repoType:       "invalid",
 			},
 			wantErr: `repo-type "invalid" is not supported`,
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
 		},
 		{
 			name: "missing registry URL",
@@ -59,9 +75,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				repoType: "maven",
 			},
 			wantErr: "backend-registry is required",
-			wantRegistryURL: &url.URL{
-				Scheme: "https",
-			},
+			// registryURL stays nil — Validate short-circuits before
+			// touching it when the user didn't pass --backend-registry.
 		},
 		{
 			name: "registry URL without protocol prefix",
@@ -74,6 +89,20 @@ func TestServeFlagsValidate(t *testing.T) {
 			wantRegistryURL: &url.URL{
 				Scheme: "https",
 				Host:   "example.com",
+			},
+		},
+		{
+			name: "https registry URL passed directly",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "maven",
+				registryURLStr: "https://gar.example.com/project",
+			},
+			wantErr: "",
+			wantRegistryURL: &url.URL{
+				Scheme: "https",
+				Host:   "gar.example.com",
+				Path:   "/project",
 			},
 		},
 	}
@@ -105,6 +134,7 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: "port", flagName: "port"},
 		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
 		{name: "backend-registry", flagName: "backend-registry"},
+		{name: "disable-streaming-push", flagName: "disable-streaming-push"},
 	}
 
 	for _, tc := range tests {

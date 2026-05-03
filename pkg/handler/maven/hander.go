@@ -155,6 +155,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	logger := logging.FromContext(req.Context())
 
 	defer req.Body.Close()
+	// Forward the HTTP Content-Length so AddFile can short-circuit the
+	// peek-and-decide buffer for sized uploads (mvn deploy always sets
+	// it). req.ContentLength is -1 for chunked / unknown, which AddFile
+	// treats as "size unknown" and falls back to peeking.
+	f.Size = req.ContentLength
 	desc, err := h.registry.AddFile(req.Context(), f, req.Body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)

@@ -70,6 +70,23 @@ and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's coming.
 - See [`AGENTS.md`](AGENTS.md) for code conventions, the per-format handler
   checklist, and guidance on what to ask about before changing.
 
+### Running the tests
+
+```bash
+# Full suite. The streaming-upload integration test under pkg/oci spins up
+# a real zot registry via testcontainers-go, so a Docker daemon must be
+# reachable. CI runs this on every PR. If Docker isn't available the
+# integration test self-skips with a clear message; the rest still runs.
+go test -race ./...
+
+# Skip the live-zot test for fast local iteration or environments without
+# Docker. Everything else runs unchanged.
+go test -race -short ./...
+
+# Race detector + coverage, same flags CI uses (sans -short):
+go test -count=1 -race -shuffle=on -coverprofile=coverage.out ./...
+```
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE).

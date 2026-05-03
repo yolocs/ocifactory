@@ -26,6 +26,8 @@ type serveFlags struct {
 	repoType       string
 	registryURLStr string
 
+	disableStreamingPush bool
+
 	registryURL *url.URL
 }
 
@@ -46,16 +48,20 @@ func (f *serveFlags) Validate() error {
 	}
 	if f.registryURLStr == "" {
 		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
+		return merr
 	}
+	// Default to https when the user omits the scheme. Either way, parse
+	// unconditionally — the original code only assigned f.registryURL
+	// inside the prepend branch, leaving registryURL nil when the user
+	// passed an http:// or https:// URL directly.
 	if !strings.HasPrefix(f.registryURLStr, "http://") && !strings.HasPrefix(f.registryURLStr, "https://") {
-		// Default to https.
 		f.registryURLStr = "https://" + f.registryURLStr
-		u, err := url.Parse(f.registryURLStr)
-		if err != nil {
-			merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
-		} else {
-			f.registryURL = u
-		}
+	}
+	u, err := url.Parse(f.registryURLStr)
+	if err != nil {
+		merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
+	} else {
+		f.registryURL = u
 	}
 	return merr
 }
@@ -80,6 +86,11 @@ func newServeCmd() *cobra.Command {
 		fmt.Sprintf("Type of repository to serve. Allowed: %v", supportedRepoTypes))
 	cmd.Flags().StringVar(&flags.registryURLStr, "backend-registry", os.Getenv("OCIFACTORY_BACKEND_REGISTRY"),
 		"The URL to the backend OCI registry.")
+	cmd.Flags().BoolVar(&flags.disableStreamingPush, "disable-streaming-push", false,
+		"Force every blob upload through the buffered + monolithic path. "+
+			"Bodies above the in-memory threshold will spill to a temp file "+
+			"instead of streaming via chunked PATCH. Set this only for "+
+			"backend registries with broken or missing chunked-PATCH support.")
 
 	return cmd
 }
@@ -93,11 +104,15 @@ func envOr(key, fallback string) string {
 
 func runServe(ctx context.Context, flags *serveFlags) error {
 	var h http.Handler
+	registryOpts := []oci.RegistryOption{
+		oci.WithStreamingPushDisabled(flags.disableStreamingPush),
+	}
+
 	switch flags.repoType {
 	case maven.RepoType:
 		reg, err := oci.NewRegistry(
 			flags.registryURL,
-			oci.WithArtifactType(maven.ArtifactType),
+			append(registryOpts, oci.WithArtifactType(maven.ArtifactType))...,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
@@ -110,7 +125,7 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	case python.RepoType:
 		reg, err := oci.NewRegistry(
 			flags.registryURL,
-			oci.WithArtifactType(python.ArtifactType),
+			append(registryOpts, oci.WithArtifactType(python.ArtifactType))...,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
