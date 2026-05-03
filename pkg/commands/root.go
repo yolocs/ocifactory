@@ -3,20 +3,24 @@ package commands
 import (
 	"context"
 
-	"github.com/abcxyz/pkg/cli"
+	"github.com/spf13/cobra"
 )
 
-var rootCmd = func() cli.Command {
-	return &cli.RootCommand{
-		Name:    "ocifactory",
-		Version: "dev",
-		Commands: map[string]cli.CommandFactory{
-			"serve": func() cli.Command { return &ServeCommand{} },
-		},
+func newRootCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:           "ocifactory",
+		Short:         "ocifactory is a multi-format artifact registry backed by OCI.",
+		Version:       "dev",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
+	cmd.AddCommand(newServeCmd())
+	return cmd
 }
 
 // Run executes the CLI.
 func Run(ctx context.Context, args []string) error {
-	return rootCmd().Run(ctx, args) //nolint:wrapcheck // Want passthrough
+	cmd := newRootCmd()
+	cmd.SetArgs(args)
+	return cmd.ExecuteContext(ctx) //nolint:wrapcheck // Want passthrough
 }
