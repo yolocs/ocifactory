@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
 	"testing"
 	"time"
 
@@ -30,23 +29,17 @@ const zotImage = "ghcr.io/project-zot/zot-linux-amd64:v2.1.5"
 // pusher round-trips correctly end-to-end.
 //
 // It is the live counterpart to the httptest-fake unit tests in
-// stream_push_test.go and satisfies issue #38's acceptance criterion of an
-// integration test against zot. It spins up zot via testcontainers-go on
-// every run, so it requires Docker (or another OCI-compatible runtime
-// that testcontainers can talk to) to be available locally.
+// stream_push_test.go and satisfies issue #38's acceptance criterion of
+// an integration test against zot. It spins up zot via testcontainers-go
+// on every run, so it requires Docker (or another OCI-compatible runtime
+// that testcontainers can talk to) to be available.
 //
-// Two skip mechanisms (different consumers, same effect):
-//   - `go test -short` skips it for local fast-iteration loops.
-//   - OCIFACTORY_SKIP_INTEGRATION=1 skips it in environments where you
-//     can't pass `-short` directly — e.g. the abcxyz/pkg shared go-test
-//     workflow that runs the rest of our suite. CI uses this to keep
-//     integration runs in a dedicated job.
+// Pass `-short` to skip it in local fast-iteration loops. CI runs every
+// PR (ubuntu-latest has Docker preinstalled), so regressions in the
+// chunked-PATCH wire path are caught before merge.
 func TestAddFile_StreamingIntegration_Zot(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live-zot integration test in -short mode")
-	}
-	if os.Getenv("OCIFACTORY_SKIP_INTEGRATION") == "1" {
-		t.Skip("skipping live-zot integration test (OCIFACTORY_SKIP_INTEGRATION=1)")
 	}
 	t.Parallel()
 

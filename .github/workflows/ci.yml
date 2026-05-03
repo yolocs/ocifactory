@@ -11,38 +11,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # go-test runs the full Go test suite, including the live-zot streaming
+  # push integration test in pkg/oci/stream_push_integration_test.go.
+  # ubuntu-latest (the shared workflow's default) ships with Docker
+  # preinstalled and the daemon already running, so testcontainers-go can
+  # spin up zot without any extra setup steps here.
   go-test:
     uses: 'abcxyz/pkg/.github/workflows/go-test.yml@main' # ratchet:exclude
-    with:
-      # The shared workflow doesn't expose a way to pass `-short`, so we
-      # signal the integration test to skip itself via env var. The
-      # dedicated `integration-test` job below runs without this set.
-      env: '{"OCIFACTORY_SKIP_INTEGRATION":"1"}'
-
-  # integration-test exercises the streaming chunked-PATCH push path
-  # against a real OCI registry (zot) spun up via testcontainers-go.
-  # It runs on ubuntu-latest, where Docker is preinstalled and the
-  # daemon is already running — no extra setup steps needed.
-  integration-test:
-    runs-on: 'ubuntu-latest'
-    timeout-minutes: 10
-    steps:
-      - name: 'Checkout'
-        uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # ratchet:actions/checkout@v4
-
-      - name: 'Setup Go'
-        uses: 'actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b' # ratchet:actions/setup-go@v5
-        with:
-          go-version-file: 'go.mod'
-
-      - name: 'Verify Docker is available'
-        run: 'docker info'
-
-      - name: 'Run integration tests'
-        run: |-
-          go test \
-            -count=1 \
-            -race \
-            -timeout=5m \
-            -run='Integration' \
-            ./pkg/oci/...
