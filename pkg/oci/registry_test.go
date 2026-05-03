@@ -83,8 +83,8 @@ func TestNewRegistry(t *testing.T) {
 				t.Errorf("NewRegistry() artifactType = %v, want %v", got.artifactType, tt.wantArtifactType)
 			}
 
-			if !cmp.Equal(got.baseURL, tt.baseURL) {
-				t.Errorf("NewRegistry() baseURL diff = %v", cmp.Diff(tt.baseURL, got.baseURL))
+			if diff := cmp.Diff(tt.baseURL, got.baseURL); diff != "" {
+				t.Errorf("NewRegistry() baseURL mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -335,9 +335,13 @@ func (r *inMemoryRepo) Resolve(ctx context.Context, reference string) (ocispec.D
 	return target, nil
 }
 
+// TestAddReadRoundtrip exercises the full add → read → ref → list → delete
+// lifecycle in sequence. It is intentionally a single non-subtest function:
+// each phase depends on state established by the previous one (the in-memory
+// backend, the recorded wantDesc), so subtests with t.Parallel would race.
 func TestAddReadRoundtrip(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	r, err := NewRegistry(
 		&url.URL{Scheme: "https", Host: "example.com"},
@@ -360,112 +364,91 @@ func TestAddReadRoundtrip(t *testing.T) {
 		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
 	}
 
-	t.Run("read file not found", func(t *testing.T) {
-		_, _, err := r.ReadFile(ctx, f0)
-		if diff := testutil.DiffErrString(err, "not found"); diff != "" {
-			t.Errorf("ReadFile() error diff: %s", diff)
-		}
-	})
+	// Read missing file -> ErrNotFound.
+	if _, _, err := r.ReadFile(ctx, f0); err == nil {
+		t.Errorf("ReadFile() before AddFile: got nil error, want not-found")
+	} else if diff := testutil.DiffErrString(err, "not found"); diff != "" {
+		t.Errorf("ReadFile() error diff: %s", diff)
+	}
 
-	var wantDesc *FileDescriptor
-	content := "hello world"
+	// Add file.
+	const content = "hello world"
+	wantDesc, err := r.AddFile(ctx, f0, strings.NewReader(content))
+	if err != nil {
+		t.Fatalf("AddFile() error = %v", err)
+	}
 
-	t.Run("add file", func(t *testing.T) {
-		desc, err := r.AddFile(ctx, f0, strings.NewReader(content))
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("AddFile() error diff: %s", diff)
-		}
-		wantDesc = desc
-	})
-
-	t.Run("read file", func(t *testing.T) {
-		gotDesc, r, err := r.ReadFile(ctx, f0)
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("ReadFile() error diff: %s", diff)
-		}
-		defer r.Close()
-
+	// Read by owning tag.
+	if gotDesc, body, err := r.ReadFile(ctx, f0); err != nil {
+		t.Errorf("ReadFile() by owning tag: %v", err)
+	} else {
+		defer body.Close()
 		if diff := cmp.Diff(wantDesc, gotDesc); diff != "" {
-			t.Errorf("ReadFile() desc diff: %s", diff)
+			t.Errorf("ReadFile() desc mismatch (-want +got):\n%s", diff)
 		}
-
-		gotContent, err := io.ReadAll(r)
+		gotContent, err := io.ReadAll(body)
 		if err != nil {
 			t.Errorf("ReadAll() unexpected error = %v", err)
 		}
-
-		if got, want := string(gotContent), content; got != want {
-			t.Errorf("ReadAll() content = %v, want %v", got, want)
+		if string(gotContent) != content {
+			t.Errorf("ReadAll() content = %q, want %q", string(gotContent), content)
 		}
-	})
+	}
 
-	t.Run("append tags", func(t *testing.T) {
-		err := r.AppendRefs(ctx, "foobar", "v0", "tag1", "tag2")
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("AppendTags() error diff: %s", diff)
-		}
-	})
+	// Append ref tags.
+	if err := r.AppendRefs(ctx, "foobar", "v0", "tag1", "tag2"); err != nil {
+		t.Fatalf("AppendRefs() error = %v", err)
+	}
 
-	t.Run("read file by ref", func(t *testing.T) {
-		gotDesc, r, err := r.ReadFile(ctx, &RepoFile{
-			OwningRepo: "foobar",
-			RefTag:     "tag1",
-			Name:       "test.txt",
-			Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-		})
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("ReadFile() error diff: %s", diff)
-		}
-		defer r.Close()
-
+	// Read by ref tag.
+	if gotDesc, body, err := r.ReadFile(ctx, &RepoFile{
+		OwningRepo: "foobar",
+		RefTag:     "tag1",
+		Name:       "test.txt",
+		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+	}); err != nil {
+		t.Errorf("ReadFile() by ref tag: %v", err)
+	} else {
+		defer body.Close()
 		if diff := cmp.Diff(wantDesc, gotDesc); diff != "" {
-			t.Errorf("ReadFile() desc diff: %s", diff)
+			t.Errorf("ReadFile() by ref tag desc mismatch (-want +got):\n%s", diff)
 		}
-
-		gotContent, err := io.ReadAll(r)
+		gotContent, err := io.ReadAll(body)
 		if err != nil {
 			t.Errorf("ReadAll() unexpected error = %v", err)
 		}
+		if string(gotContent) != content {
+			t.Errorf("ReadAll() content = %q, want %q", string(gotContent), content)
+		}
+	}
 
-		if got, want := string(gotContent), content; got != want {
-			t.Errorf("ReadAll() content = %v, want %v", got, want)
-		}
-	})
+	// List tags.
+	gotTags, err := r.ListTags(ctx, "foobar")
+	if err != nil {
+		t.Errorf("ListTags() error = %v", err)
+	}
+	if diff := cmp.Diff([]string{"v0"}, gotTags); diff != "" {
+		t.Errorf("ListTags() mismatch (-want +got):\n%s", diff)
+	}
 
-	t.Run("list tags", func(t *testing.T) {
-		wantTags := []string{"v0"}
-		gotTags, err := r.ListTags(ctx, "foobar")
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("ListTags() error diff: %s", diff)
-		}
-		if diff := cmp.Diff(wantTags, gotTags); diff != "" {
-			t.Errorf("ListTags() tags diff: %s", diff)
-		}
-	})
+	// List files.
+	gotFiles, err := r.ListFiles(ctx, "foobar")
+	if err != nil {
+		t.Errorf("ListFiles() error = %v", err)
+	}
+	if diff := cmp.Diff([]*RepoFile{f0}, gotFiles); diff != "" {
+		t.Errorf("ListFiles() mismatch (-want +got):\n%s", diff)
+	}
 
-	t.Run("list files", func(t *testing.T) {
-		wantFiles := []*RepoFile{f0}
-		gotFiles, err := r.ListFiles(ctx, "foobar")
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("ListFiles() error diff: %s", diff)
-		}
-		if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
-			t.Errorf("ListFiles() files diff: %s", diff)
-		}
-	})
-
-	t.Run("delete tag files", func(t *testing.T) {
-		err := r.DeleteTagFiles(ctx, "foobar", "v0")
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("DeleteTagFiles() error diff: %s", diff)
-		}
-
-		gotFiles, err := r.ListFiles(ctx, "foobar")
-		if diff := testutil.DiffErrString(err, ""); diff != "" {
-			t.Errorf("ListFiles() error diff: %s", diff)
-		}
-		if len(gotFiles) != 0 {
-			t.Errorf("ListFiles() files = %v, want %v", gotFiles, []*RepoFile{})
-		}
-	})
+	// Delete tag files, then re-list.
+	if err := r.DeleteTagFiles(ctx, "foobar", "v0"); err != nil {
+		t.Errorf("DeleteTagFiles() error = %v", err)
+	}
+	gotFiles, err = r.ListFiles(ctx, "foobar")
+	if err != nil {
+		t.Errorf("ListFiles() after delete: %v", err)
+	}
+	if len(gotFiles) != 0 {
+		t.Errorf("ListFiles() after delete = %v, want empty", gotFiles)
+	}
 }

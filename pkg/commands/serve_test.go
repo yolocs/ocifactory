@@ -7,6 +7,7 @@ import (
 )
 
 func TestServeFlagsValidate(t *testing.T) {
+	t.Parallel()
 
 	cases := []struct {
 		name    string

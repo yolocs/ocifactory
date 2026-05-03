@@ -2,7 +2,6 @@ package python
 
 import (
 	"bytes"
-	"context"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -260,7 +259,7 @@ func TestHandleGet(t *testing.T) {
 
 			registry := oci.NewFakeRegistry()
 			if tc.setupFile != nil {
-				_, err := registry.AddFile(context.Background(), tc.setupFile, strings.NewReader(tc.setupData))
+				_, err := registry.AddFile(t.Context(), tc.setupFile, strings.NewReader(tc.setupData))
 				if err != nil {
 					t.Fatalf("Failed to set up file: %v", err)
 				}

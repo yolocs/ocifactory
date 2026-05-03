@@ -45,8 +45,7 @@ func TestWithCred(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := context.Background()
-			gotCtx := WithCred(ctx, tt.cred)
+			gotCtx := WithCred(t.Context(), tt.cred)
 			gotCred, ok := FromContext(gotCtx)
 
 			if tt.wantCred == nil {
@@ -74,8 +73,7 @@ func TestFromContext(t *testing.T) {
 	t.Run("missing cred", func(t *testing.T) {
 		t.Parallel()
 
-		ctx := context.Background()
-		gotCred, ok := FromContext(ctx)
+		gotCred, ok := FromContext(t.Context())
 
 		if ok {
 			t.Errorf("FromContext() ok = true, want false")
@@ -89,7 +87,7 @@ func TestFromContext(t *testing.T) {
 	t.Run("incorrect value type", func(t *testing.T) {
 		t.Parallel()
 
-		ctx := context.WithValue(context.Background(), credKey, "not a cred")
+		ctx := context.WithValue(t.Context(), credKey, "not a cred")
 		gotCred, ok := FromContext(ctx)
 
 		if ok {
