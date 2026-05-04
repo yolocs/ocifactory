@@ -26,6 +26,15 @@ const (
 
 	maxPackageLength = 256
 	maxVersionLength = 128
+
+	// indexSentinelName and indexSentinelContent are the constant layer
+	// name and body written under index/<pkgName>. handleSimpleIndex only
+	// reads tag names, so the layer body is unused — keeping it constant
+	// lets the OCI backend deduplicate the blob and the file manifest
+	// across every upload of every package, so the index repo grows by
+	// one tag per package rather than one layer per (package, version).
+	indexSentinelName    = "present"
+	indexSentinelContent = "1"
 )
 
 var (
@@ -189,8 +198,12 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 				return
 			}
 			contentName = p.FileName()
-			// Every time we upload a file, we also write a new tag in the index repository.
-			// If the package/version already exists, it shouldn't cause a real write.
+			// The index repo write is a single sentinel per package, not
+			// per version. handleSimpleIndex only reads tag names from
+			// "index" via ListTags, so storing one constant placeholder
+			// layer under index/<pkgName> is enough — the OCI backend
+			// deduplicates the identical blob and file manifest across
+			// every subsequent upload of the same package.
 			fs := []*repoFile{
 				{
 					RepoFile: oci.RepoFile{
@@ -205,10 +218,10 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 					RepoFile: oci.RepoFile{
 						OwningRepo: "index",
 						OwningTag:  pkgName,
-						Name:       versionNum,
+						Name:       indexSentinelName,
 						MediaType:  "text/plain",
 					},
-					Content: io.NopCloser(strings.NewReader(versionNum)),
+					Content: io.NopCloser(strings.NewReader(indexSentinelContent)),
 				},
 			}
 			h.handlePut(req.Context(), w, fs)
