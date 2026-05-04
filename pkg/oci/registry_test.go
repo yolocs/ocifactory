@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -165,141 +166,35 @@ func TestDetectFileMediaType(t *testing.T) {
 	}
 }
 
-func TestUpsertFileLayer(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name           string
-		existingLayers []ocispec.Descriptor
-		newFileDesc    ocispec.Descriptor
-		wantUpdated    bool
-		wantLayers     []ocispec.Descriptor
-	}{
-		{
-			name:           "add new file",
-			existingLayers: []ocispec.Descriptor{},
-			newFileDesc: ocispec.Descriptor{
-				MediaType: "text/plain",
-				Digest:    "sha256:123",
-				Size:      100,
-				Annotations: map[string]string{
-					FileNameAnnotation: "test.txt",
-				},
-			},
-			wantUpdated: true,
-			wantLayers: []ocispec.Descriptor{
-				{
-					MediaType: "text/plain",
-					Digest:    "sha256:123",
-					Size:      100,
-					Annotations: map[string]string{
-						FileNameAnnotation: "test.txt",
-					},
-				},
-			},
-		},
-		{
-			name: "update existing file with different digest",
-			existingLayers: []ocispec.Descriptor{
-				{
-					MediaType: "text/plain",
-					Digest:    "sha256:123",
-					Size:      100,
-					Annotations: map[string]string{
-						FileNameAnnotation: "test.txt",
-					},
-				},
-			},
-			newFileDesc: ocispec.Descriptor{
-				MediaType: "text/plain",
-				Digest:    "sha256:456",
-				Size:      200,
-				Annotations: map[string]string{
-					FileNameAnnotation: "test.txt",
-				},
-			},
-			wantUpdated: true,
-			wantLayers: []ocispec.Descriptor{
-				{
-					MediaType: "text/plain",
-					Digest:    "sha256:456",
-					Size:      200,
-					Annotations: map[string]string{
-						FileNameAnnotation: "test.txt",
-					},
-				},
-			},
-		},
-		{
-			name: "no update for same digest",
-			existingLayers: []ocispec.Descriptor{
-				{
-					MediaType: "text/plain",
-					Digest:    "sha256:123",
-					Size:      100,
-					Annotations: map[string]string{
-						FileNameAnnotation: "test.txt",
-					},
-				},
-			},
-			newFileDesc: ocispec.Descriptor{
-				MediaType: "text/plain",
-				Digest:    "sha256:123",
-				Size:      100,
-				Annotations: map[string]string{
-					FileNameAnnotation: "test.txt",
-				},
-			},
-			wantUpdated: false,
-			wantLayers: []ocispec.Descriptor{
-				{
-					MediaType: "text/plain",
-					Digest:    "sha256:123",
-					Size:      100,
-					Annotations: map[string]string{
-						FileNameAnnotation: "test.txt",
-					},
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			gotUpdated, gotLayers := upsertFileLayer(tt.existingLayers, tt.newFileDesc)
-			if gotUpdated != tt.wantUpdated {
-				t.Errorf("upsertFileLayer() updated = %v, want %v", gotUpdated, tt.wantUpdated)
-			}
-
-			if diff := cmp.Diff(tt.wantLayers, gotLayers); diff != "" {
-				t.Errorf("upsertFileLayer() layers mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
 type inMemoryRepo struct {
 	*memory.Store
+
+	mu      sync.Mutex
 	allTags map[string]string
 }
 
 func (r *inMemoryRepo) Tags(_ context.Context, _ string, fn func(tags []string) error) error {
-	return fn(slices.Collect(maps.Keys(r.allTags)))
+	r.mu.Lock()
+	tags := slices.Collect(maps.Keys(r.allTags))
+	r.mu.Unlock()
+	return fn(tags)
 }
 
 func (r *inMemoryRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	r.mu.Lock()
 	r.allTags[reference] = desc.Digest.String()
+	r.mu.Unlock()
 	return r.Store.Tag(ctx, desc, reference)
 }
 
 func (r *inMemoryRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	r.mu.Lock()
 	for tag, digest := range r.allTags {
 		if digest == target.Digest.String() {
 			delete(r.allTags, tag)
 		}
 	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -310,10 +205,12 @@ func (r *inMemoryRepo) Resolve(ctx context.Context, reference string) (ocispec.D
 		return ocispec.Descriptor{}, err
 	}
 
-	if _, ok := r.allTags[reference]; !ok {
+	r.mu.Lock()
+	_, ok := r.allTags[reference]
+	r.mu.Unlock()
+	if !ok {
 		return ocispec.Descriptor{}, errdef.ErrNotFound
 	}
-
 	return target, nil
 }
 
@@ -333,16 +230,19 @@ func TestAddReadRoundtrip(t *testing.T) {
 	}
 
 	// Override the newBackendFunc to use the memory backend.
-	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{"v0": "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"}}
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
 	r.newBackendFunc = func(ctx context.Context, f *RepoFile) (destRepo, error) {
 		return memRepo, nil
 	}
+
+	const content = "hello world"
+	wantBlobDigest := sha256Digest([]byte(content))
 
 	f0 := &RepoFile{
 		OwningRepo: "foobar",
 		OwningTag:  "v0",
 		Name:       "test.txt",
-		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+		Digest:     wantBlobDigest.String(),
 	}
 
 	// Read missing file -> ErrNotFound.
@@ -353,10 +253,12 @@ func TestAddReadRoundtrip(t *testing.T) {
 	}
 
 	// Add file.
-	const content = "hello world"
 	wantDesc, err := r.AddFile(ctx, f0, strings.NewReader(content))
 	if err != nil {
 		t.Fatalf("AddFile() error = %v", err)
+	}
+	if wantDesc.File.Digest != wantBlobDigest {
+		t.Errorf("AddFile() blob digest = %s, want %s", wantDesc.File.Digest, wantBlobDigest)
 	}
 
 	// Read by owning tag.
@@ -364,8 +266,8 @@ func TestAddReadRoundtrip(t *testing.T) {
 		t.Errorf("ReadFile() by owning tag: %v", err)
 	} else {
 		defer body.Close()
-		if diff := cmp.Diff(wantDesc, gotDesc); diff != "" {
-			t.Errorf("ReadFile() desc mismatch (-want +got):\n%s", diff)
+		if got, want := gotDesc.File.Digest, wantBlobDigest; got != want {
+			t.Errorf("ReadFile() blob digest = %s, want %s", got, want)
 		}
 		gotContent, err := io.ReadAll(body)
 		if err != nil {
@@ -386,13 +288,13 @@ func TestAddReadRoundtrip(t *testing.T) {
 		OwningRepo: "foobar",
 		RefTag:     "tag1",
 		Name:       "test.txt",
-		Digest:     "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+		Digest:     wantBlobDigest.String(),
 	}); err != nil {
 		t.Errorf("ReadFile() by ref tag: %v", err)
 	} else {
 		defer body.Close()
-		if diff := cmp.Diff(wantDesc, gotDesc); diff != "" {
-			t.Errorf("ReadFile() by ref tag desc mismatch (-want +got):\n%s", diff)
+		if got, want := gotDesc.File.Digest, wantBlobDigest; got != want {
+			t.Errorf("ReadFile() by ref tag blob digest = %s, want %s", got, want)
 		}
 		gotContent, err := io.ReadAll(body)
 		if err != nil {
@@ -403,21 +305,31 @@ func TestAddReadRoundtrip(t *testing.T) {
 		}
 	}
 
-	// List tags.
+	// List tags. Both canonical version tags and alias tags are returned in
+	// the new layout — the legacy ref_ filter is gone.
 	gotTags, err := r.ListTags(ctx, "foobar")
 	if err != nil {
 		t.Errorf("ListTags() error = %v", err)
 	}
-	if diff := cmp.Diff([]string{"v0"}, gotTags); diff != "" {
+	slices.Sort(gotTags)
+	if diff := cmp.Diff([]string{"tag1", "tag2", "v0"}, gotTags); diff != "" {
 		t.Errorf("ListTags() mismatch (-want +got):\n%s", diff)
 	}
 
-	// List files.
+	// List files. The new ListFiles filters to files under canonical
+	// version manifests (so aliases don't double-count), and reads the
+	// blob digest from the file manifest's annotation.
+	wantFile := &RepoFile{
+		Name:       "test.txt",
+		OwningRepo: "foobar",
+		OwningTag:  "v0",
+		Digest:     wantBlobDigest.String(),
+	}
 	gotFiles, err := r.ListFiles(ctx, "foobar")
 	if err != nil {
 		t.Errorf("ListFiles() error = %v", err)
 	}
-	if diff := cmp.Diff([]*RepoFile{f0}, gotFiles); diff != "" {
+	if diff := cmp.Diff([]*RepoFile{wantFile}, gotFiles); diff != "" {
 		t.Errorf("ListFiles() mismatch (-want +got):\n%s", diff)
 	}
 
@@ -552,14 +464,13 @@ func TestAddFile_BufferedPath(t *testing.T) {
 			wantErrSubstr: "failed to push file blob",
 		},
 		{
-			name:    "ref_ owning tag rejected",
+			name:    "missing OwningTag rejected",
 			content: smallContent,
 			repoFile: &RepoFile{
 				OwningRepo: "pkg",
-				OwningTag:  "ref_latest",
 				Name:       "test.txt",
 			},
-			wantErrSubstr: "canonical tag cannot be prefixed with ref_",
+			wantErrSubstr: "OwningTag must be set",
 		},
 	}
 
@@ -980,5 +891,223 @@ func TestAuthClientMemoization(t *testing.T) {
 	// No credentials -> nil client (auth-free request path).
 	if got := r.authClientFromContext(t.Context()); got != nil {
 		t.Errorf("expected nil client for no-credentials context, got %v", got)
+	}
+}
+
+// newTestRegistry builds a Registry whose backend is a fresh in-memory
+// store. Returned together with the backing store so tests can assert on
+// post-conditions directly.
+func newTestRegistry(t *testing.T) (*Registry, *inMemoryRepo) {
+	t.Helper()
+	r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+	r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+		return memRepo, nil
+	}
+	return r, memRepo
+}
+
+// TestAddFile_ConcurrentSameVersion proves the cross-request race in #26
+// is fixed: N goroutines uploading distinct files into the same OwningTag
+// must all succeed and all files must be readable afterwards. Under the
+// pre-redesign aggregated-manifest layout this test was deterministic to
+// fail because of the un-CAS'd tag write — the loser dropped its layer.
+func TestAddFile_ConcurrentSameVersion(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, _ := newTestRegistry(t)
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	errs := make([]error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(i int) {
+			defer wg.Done()
+			content := fmt.Sprintf("content-%d", i)
+			f := &RepoFile{
+				OwningRepo: "pkg",
+				OwningTag:  "v1",
+				Name:       fmt.Sprintf("file-%d.txt", i),
+			}
+			if _, err := r.AddFile(ctx, f, strings.NewReader(content)); err != nil {
+				errs[i] = err
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d AddFile() error = %v", i, err)
+		}
+	}
+
+	files, err := r.ListFiles(ctx, "pkg")
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	if got, want := len(files), goroutines; got != want {
+		names := make([]string, len(files))
+		for i, f := range files {
+			names[i] = f.Name
+		}
+		t.Fatalf("ListFiles() = %d files, want %d (got: %v)", got, want, names)
+	}
+
+	// Every file must round-trip via ReadFile too — proves the file
+	// manifests aren't just listed but actually fetchable end-to-end.
+	for i := 0; i < goroutines; i++ {
+		f := &RepoFile{
+			OwningRepo: "pkg",
+			OwningTag:  "v1",
+			Name:       fmt.Sprintf("file-%d.txt", i),
+		}
+		_, body, err := r.ReadFile(ctx, f)
+		if err != nil {
+			t.Errorf("ReadFile(%s) error = %v", f.Name, err)
+			continue
+		}
+		got, _ := io.ReadAll(body)
+		body.Close()
+		if want := fmt.Sprintf("content-%d", i); string(got) != want {
+			t.Errorf("ReadFile(%s) = %q, want %q", f.Name, got, want)
+		}
+	}
+}
+
+// TestAppendRefs_CollidesWithVersion verifies the alias-vs-version
+// namespace check on the AppendRefs side: pointing an alias at a name
+// that's already a canonical version tag is refused with
+// ErrAliasCollision rather than silently overwriting the version.
+func TestAppendRefs_CollidesWithVersion(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, _ := newTestRegistry(t)
+
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile(v1) error = %v", err)
+	}
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v2",
+		Name:       "b.txt",
+	}, strings.NewReader("b")); err != nil {
+		t.Fatalf("AddFile(v2) error = %v", err)
+	}
+
+	// "v2" is already a canonical version — cannot be repurposed as an
+	// alias of v1.
+	err := r.AppendRefs(ctx, "pkg", "v1", "v2")
+	if !errors.Is(err, ErrAliasCollision) {
+		t.Fatalf("AppendRefs(collide) error = %v, want errors.Is ErrAliasCollision", err)
+	}
+}
+
+// TestAddFile_CollidesWithAlias verifies the inverse check on the
+// AddFile side: pushing a canonical version under a name that's already
+// an alias is refused with ErrAliasCollision.
+func TestAddFile_CollidesWithAlias(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, _ := newTestRegistry(t)
+
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile(v1) error = %v", err)
+	}
+	if err := r.AppendRefs(ctx, "pkg", "v1", "latest"); err != nil {
+		t.Fatalf("AppendRefs(latest) error = %v", err)
+	}
+
+	// "latest" is now an alias — adding a file whose OwningTag is "latest"
+	// must refuse rather than clobber the alias.
+	_, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "latest",
+		Name:       "x.txt",
+	}, strings.NewReader("x"))
+	if !errors.Is(err, ErrAliasCollision) {
+		t.Fatalf("AddFile(latest) error = %v, want errors.Is ErrAliasCollision", err)
+	}
+}
+
+// TestAppendRefs_RepointReapsOldAlias verifies that re-pointing an
+// existing alias to a new canonical version replaces the alias manifest
+// and best-effort deletes the previous one. Without the cleanup, every
+// re-point would leave behind an orphaned alias manifest still
+// discoverable via the old version's referrers list.
+func TestAppendRefs_RepointReapsOldAlias(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, memRepo := newTestRegistry(t)
+
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile(v1) error = %v", err)
+	}
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v2",
+		Name:       "b.txt",
+	}, strings.NewReader("b")); err != nil {
+		t.Fatalf("AddFile(v2) error = %v", err)
+	}
+
+	// First point latest -> v1, capture the alias manifest digest.
+	if err := r.AppendRefs(ctx, "pkg", "v1", "latest"); err != nil {
+		t.Fatalf("AppendRefs(latest -> v1) error = %v", err)
+	}
+	memRepo.mu.Lock()
+	v1AliasDigest := memRepo.allTags["latest"]
+	memRepo.mu.Unlock()
+	if v1AliasDigest == "" {
+		t.Fatalf("latest tag missing after first AppendRefs")
+	}
+
+	// Re-point latest -> v2.
+	if err := r.AppendRefs(ctx, "pkg", "v2", "latest"); err != nil {
+		t.Fatalf("AppendRefs(latest -> v2) error = %v", err)
+	}
+	memRepo.mu.Lock()
+	v2AliasDigest := memRepo.allTags["latest"]
+	memRepo.mu.Unlock()
+	if v2AliasDigest == "" {
+		t.Fatalf("latest tag missing after re-point")
+	}
+	if v1AliasDigest == v2AliasDigest {
+		t.Fatalf("alias manifest digest unchanged after re-point: %s", v1AliasDigest)
+	}
+
+	// Verify ReadFile via "latest" now yields v2's file.
+	_, body, err := r.ReadFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		RefTag:     "latest",
+		Name:       "b.txt",
+	})
+	if err != nil {
+		t.Fatalf("ReadFile(latest, b.txt) error = %v", err)
+	}
+	got, _ := io.ReadAll(body)
+	body.Close()
+	if string(got) != "b" {
+		t.Errorf("ReadFile(latest, b.txt) = %q, want %q", got, "b")
 	}
 }
