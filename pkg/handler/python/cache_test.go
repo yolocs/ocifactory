@@ -10,6 +10,11 @@ import (
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
+// TestSimpleIndexCache exercises the wrapper's contract: get, put, and
+// invalidate behave correctly across enabled (ttl > 0) and disabled
+// (ttl <= 0) configurations. TTL-driven eviction is owned by the
+// underlying hashicorp/golang-lru/v2/expirable LRU and tested upstream;
+// here we just verify the wiring with a short real-clock TTL.
 func TestSimpleIndexCache(t *testing.T) {
 	t.Parallel()
 
@@ -22,10 +27,10 @@ func TestSimpleIndexCache(t *testing.T) {
 	}
 
 	type cacheOp struct {
-		op      string // "put", "get", "invalidate", "advance"
-		pkg     string
-		files   []*oci.RepoFile
-		advance time.Duration
+		op    string // "put", "get", "invalidate", "sleep"
+		pkg   string
+		files []*oci.RepoFile
+		sleep time.Duration
 		// Only meaningful for "get" steps.
 		wantOK    bool
 		wantFiles []*oci.RepoFile
@@ -37,15 +42,21 @@ func TestSimpleIndexCache(t *testing.T) {
 		ops  []cacheOp
 	}{
 		{
-			name: "miss then hit then expire",
-			ttl:  10 * time.Second,
+			name: "miss then hit",
+			ttl:  time.Minute,
 			ops: []cacheOp{
 				{op: "get", pkg: "requests", wantOK: false},
 				{op: "put", pkg: "requests", files: files("requests-1.0.0.whl")},
 				{op: "get", pkg: "requests", wantOK: true, wantFiles: files("requests-1.0.0.whl")},
-				{op: "advance", advance: 9 * time.Second},
+			},
+		},
+		{
+			name: "entry expires after TTL",
+			ttl:  50 * time.Millisecond,
+			ops: []cacheOp{
+				{op: "put", pkg: "requests", files: files("requests-1.0.0.whl")},
 				{op: "get", pkg: "requests", wantOK: true, wantFiles: files("requests-1.0.0.whl")},
-				{op: "advance", advance: 2 * time.Second},
+				{op: "sleep", sleep: 120 * time.Millisecond},
 				{op: "get", pkg: "requests", wantOK: false},
 			},
 		},
@@ -66,7 +77,7 @@ func TestSimpleIndexCache(t *testing.T) {
 			ops: []cacheOp{
 				{op: "put", pkg: "requests", files: files("requests-1.0.0.whl")},
 				{op: "get", pkg: "requests", wantOK: false},
-				// invalidate must remain a no-op-friendly call even when disabled.
+				// Invalidate must remain a safe no-op when caching is disabled.
 				{op: "invalidate", pkg: "requests"},
 			},
 		},
@@ -77,8 +88,6 @@ func TestSimpleIndexCache(t *testing.T) {
 			t.Parallel()
 
 			c := newSimpleIndexCache(tc.ttl)
-			now := time.Unix(1700000000, 0)
-			c.now = func() time.Time { return now }
 
 			for i, step := range tc.ops {
 				switch step.op {
@@ -94,8 +103,8 @@ func TestSimpleIndexCache(t *testing.T) {
 					}
 				case "invalidate":
 					c.invalidate(step.pkg)
-				case "advance":
-					now = now.Add(step.advance)
+				case "sleep":
+					time.Sleep(step.sleep)
 				default:
 					t.Fatalf("unknown op %q", step.op)
 				}
@@ -114,7 +123,7 @@ func TestSimpleIndexCache_Concurrent(t *testing.T) {
 	wg.Add(writers + readers)
 	var hits, misses int64
 	for i := 0; i < writers; i++ {
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < ops; j++ {
 				pkg := "pkg" + string(rune('a'+(j%4)))
@@ -127,7 +136,7 @@ func TestSimpleIndexCache_Concurrent(t *testing.T) {
 					c.put(pkg, nil)
 				}
 			}
-		}(i)
+		}()
 	}
 	for i := 0; i < readers; i++ {
 		go func() {

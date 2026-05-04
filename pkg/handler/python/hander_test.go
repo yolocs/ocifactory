@@ -409,14 +409,16 @@ func TestPackageIndexCache(t *testing.T) {
 	t.Run("entry expires after TTL", func(t *testing.T) {
 		t.Parallel()
 
+		// Use a short real-clock TTL: the underlying expirable LRU runs on
+		// time.Now() with no injection point, so we wait it out. 50ms is
+		// short enough to keep the suite fast and long enough to be robust
+		// under -race.
+		const ttl = 50 * time.Millisecond
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(10*time.Second))
+		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(ttl))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
-		// Inject a fake clock so we can advance time without waiting.
-		clock := time.Unix(1700000000, 0)
-		h.indexCache.now = func() time.Time { return clock }
 
 		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
 			t.Fatalf("seed upload: status=%d", code)
@@ -433,7 +435,7 @@ func TestPackageIndexCache(t *testing.T) {
 
 		render() // miss → ListFiles=1
 		render() // hit  → still 1
-		clock = clock.Add(11 * time.Second)
+		time.Sleep(3 * ttl)
 		render() // expired → ListFiles=2
 
 		if got := reg.listFiles.Load(); got != 2 {
