@@ -5,9 +5,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -186,13 +188,23 @@ func TestHandlePut(t *testing.T) {
 			}
 
 			if tc.wantIndex {
-				// Verify index file was created
-				indexKey := "index/" + tc.pkgName + "/" + tc.version
+				// Verify the per-package sentinel was written under index/<pkgName>.
+				// The body is a constant placeholder, not the version, so the
+				// OCI backend deduplicates the blob across uploads.
+				indexKey := "index/" + tc.pkgName + "/" + indexSentinelName
 				indexContent, ok := registry.Files[indexKey]
 				if !ok {
-					t.Errorf("Index file not found in registry: %s", indexKey)
-				} else if string(indexContent) != tc.version {
-					t.Errorf("Index file content = %q, want %q", string(indexContent), tc.version)
+					t.Errorf("Index sentinel not found in registry: %s", indexKey)
+				} else if string(indexContent) != indexSentinelContent {
+					t.Errorf("Index sentinel content = %q, want %q", string(indexContent), indexSentinelContent)
+				}
+
+				// The version string should never appear as a layer name in
+				// the index repo — that was the per-version write the new
+				// sentinel approach replaces.
+				perVersionKey := "index/" + tc.pkgName + "/" + tc.version
+				if _, ok := registry.Files[perVersionKey]; ok {
+					t.Errorf("Per-version index layer must not exist: %s", perVersionKey)
 				}
 			}
 		})
@@ -303,6 +315,142 @@ func TestHandleGet(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIndexSentinel covers the per-package sentinel write path: the
+// index repo grows by exactly one tag per package, regardless of how
+// many versions of that package have been uploaded, and handleSimpleIndex
+// surfaces every uploaded package in /simple/.
+func TestIndexSentinel(t *testing.T) {
+	t.Parallel()
+
+	type upload struct {
+		pkg     string
+		version string
+	}
+
+	cases := []struct {
+		name           string
+		uploads        []upload
+		wantIndexTags  []string
+		wantIndexFiles map[string]string
+	}{
+		{
+			name:          "first upload writes sentinel",
+			uploads:       []upload{{pkg: "requests", version: "1.0.0"}},
+			wantIndexTags: []string{"requests"},
+			wantIndexFiles: map[string]string{
+				"index/requests/" + indexSentinelName: indexSentinelContent,
+			},
+		},
+		{
+			name: "second version of same package does not add a new index layer",
+			uploads: []upload{
+				{pkg: "requests", version: "1.0.0"},
+				{pkg: "requests", version: "1.0.1"},
+				{pkg: "requests", version: "2.0.0"},
+			},
+			wantIndexTags: []string{"requests"},
+			wantIndexFiles: map[string]string{
+				"index/requests/" + indexSentinelName: indexSentinelContent,
+			},
+		},
+		{
+			name: "different packages each get their own sentinel tag",
+			uploads: []upload{
+				{pkg: "requests", version: "1.0.0"},
+				{pkg: "flask", version: "2.3.0"},
+				{pkg: "requests", version: "1.0.1"},
+				{pkg: "django", version: "5.0.0"},
+			},
+			wantIndexTags: []string{"django", "flask", "requests"},
+			wantIndexFiles: map[string]string{
+				"index/requests/" + indexSentinelName: indexSentinelContent,
+				"index/flask/" + indexSentinelName:    indexSentinelContent,
+				"index/django/" + indexSentinelName:   indexSentinelContent,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			registry := oci.NewFakeRegistry()
+			h, err := NewHandler(registry)
+			if err != nil {
+				t.Fatalf("NewHandler() unexpected error: %v", err)
+			}
+
+			for _, up := range tc.uploads {
+				if code := uploadPackage(t, h, up.pkg, up.version); code != http.StatusCreated {
+					t.Fatalf("upload %q@%q: status = %d, want %d", up.pkg, up.version, code, http.StatusCreated)
+				}
+			}
+
+			gotIndexTags := append([]string{}, registry.Tags["index"]...)
+			sort.Strings(gotIndexTags)
+			if diff := cmp.Diff(tc.wantIndexTags, gotIndexTags); diff != "" {
+				t.Errorf("index repo tags mismatch (-want +got):\n%s", diff)
+			}
+
+			gotIndexFiles := map[string]string{}
+			for k, v := range registry.Files {
+				if strings.HasPrefix(k, "index/") {
+					gotIndexFiles[k] = string(v)
+				}
+			}
+			if diff := cmp.Diff(tc.wantIndexFiles, gotIndexFiles); diff != "" {
+				t.Errorf("index repo files mismatch (-want +got):\n%s", diff)
+			}
+
+			// handleSimpleIndex must list every uploaded package, regardless
+			// of how many versions each has.
+			req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+			resp := httptest.NewRecorder()
+			h.Mux().ServeHTTP(resp, req)
+			if got, want := resp.Code, http.StatusOK; got != want {
+				t.Fatalf("/simple/ status = %d, want %d", got, want)
+			}
+			body := resp.Body.String()
+			for _, pkg := range tc.wantIndexTags {
+				if !strings.Contains(body, "/simple/"+pkg+"/") {
+					t.Errorf("/simple/ body missing link for %q, got:\n%s", pkg, body)
+				}
+			}
+		})
+	}
+}
+
+// uploadPackage performs a multipart twine-style upload of a package
+// version through the python handler and returns the response status.
+func uploadPackage(t *testing.T, h *Handler, pkgName, version string) int {
+	t.Helper()
+
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	if err := w.WriteField("name", pkgName); err != nil {
+		t.Fatalf("write name field: %v", err)
+	}
+	if err := w.WriteField("version", version); err != nil {
+		t.Fatalf("write version field: %v", err)
+	}
+	fw, err := w.CreateFormFile("content", pkgName+"-"+version+".whl")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write([]byte("payload-" + pkgName + "-" + version)); err != nil {
+		t.Fatalf("write content: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp := httptest.NewRecorder()
+	h.Mux().ServeHTTP(resp, req)
+	return resp.Code
 }
 
 func TestHandleSimpleIndex(t *testing.T) {
