@@ -2,16 +2,57 @@ package python
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
+
+// countingRegistry wraps an *oci.FakeRegistry and tracks the number of
+// times each method on the handler.Registry interface is invoked. It
+// exists so the simple-index cache tests can assert that a /simple/<pkg>/
+// request served from cache does not fall through to the backend, without
+// reaching for mock libraries (per AGENTS.md: fakes, not mocks).
+type countingRegistry struct {
+	*oci.FakeRegistry
+	addFile   atomic.Int64
+	readFile  atomic.Int64
+	listTags  atomic.Int64
+	listFiles atomic.Int64
+}
+
+func newCountingRegistry() *countingRegistry {
+	return &countingRegistry{FakeRegistry: oci.NewFakeRegistry()}
+}
+
+func (r *countingRegistry) AddFile(ctx context.Context, f *oci.RepoFile, ro io.Reader) (*oci.FileDescriptor, error) {
+	r.addFile.Add(1)
+	return r.FakeRegistry.AddFile(ctx, f, ro)
+}
+
+func (r *countingRegistry) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
+	r.readFile.Add(1)
+	return r.FakeRegistry.ReadFile(ctx, f)
+}
+
+func (r *countingRegistry) ListTags(ctx context.Context, repo string) ([]string, error) {
+	r.listTags.Add(1)
+	return r.FakeRegistry.ListTags(ctx, repo)
+}
+
+func (r *countingRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
+	r.listFiles.Add(1)
+	return r.FakeRegistry.ListFiles(ctx, repo)
+}
 
 func TestDetectMediaType(t *testing.T) {
 	t.Parallel()
@@ -315,6 +356,162 @@ func TestHandleGet(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPackageIndexCache exercises the per-package simple-index cache
+// end-to-end through the HTTP mux: repeated /simple/<pkg>/ requests
+// within the TTL must not fall through to Registry.ListFiles, the entry
+// must expire after the TTL, and a successful upload must invalidate the
+// entry for that package only. The counting registry wrapper makes the
+// "did the cache hit?" assertion verifiable without mocks.
+func TestPackageIndexCache(t *testing.T) {
+	t.Parallel()
+
+	t.Run("repeated reads within TTL hit the cache", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newCountingRegistry()
+		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
+		if err != nil {
+			t.Fatalf("NewHandler: %v", err)
+		}
+		// Seed one published file so the first /simple/<pkg>/ render is
+		// non-empty; the upload itself contributes ListFiles=0 calls.
+		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
+			t.Fatalf("seed upload: status=%d", code)
+		}
+		// Upload increments ListFiles=0 (handlePut path doesn't list).
+		if got := reg.listFiles.Load(); got != 0 {
+			t.Fatalf("ListFiles after seed upload = %d, want 0", got)
+		}
+
+		simple := func() {
+			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			resp := httptest.NewRecorder()
+			h.Mux().ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("/simple/requests/ status=%d body=%q", resp.Code, resp.Body.String())
+			}
+		}
+
+		simple()
+		if got := reg.listFiles.Load(); got != 1 {
+			t.Fatalf("ListFiles after first render = %d, want 1", got)
+		}
+		for i := 0; i < 5; i++ {
+			simple()
+		}
+		if got := reg.listFiles.Load(); got != 1 {
+			t.Errorf("ListFiles after 6 renders = %d, want 1 (subsequent renders should hit the cache)", got)
+		}
+	})
+
+	t.Run("entry expires after TTL", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newCountingRegistry()
+		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(10*time.Second))
+		if err != nil {
+			t.Fatalf("NewHandler: %v", err)
+		}
+		// Inject a fake clock so we can advance time without waiting.
+		clock := time.Unix(1700000000, 0)
+		h.indexCache.now = func() time.Time { return clock }
+
+		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
+			t.Fatalf("seed upload: status=%d", code)
+		}
+
+		render := func() {
+			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			resp := httptest.NewRecorder()
+			h.Mux().ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status=%d", resp.Code)
+			}
+		}
+
+		render() // miss → ListFiles=1
+		render() // hit  → still 1
+		clock = clock.Add(11 * time.Second)
+		render() // expired → ListFiles=2
+
+		if got := reg.listFiles.Load(); got != 2 {
+			t.Errorf("ListFiles = %d, want 2 (one initial miss + one post-expiry miss)", got)
+		}
+	})
+
+	t.Run("successful upload invalidates only the affected package", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newCountingRegistry()
+		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
+		if err != nil {
+			t.Fatalf("NewHandler: %v", err)
+		}
+
+		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
+			t.Fatalf("upload requests: %d", code)
+		}
+		if code := uploadPackage(t, h, "flask", "2.3.0"); code != http.StatusCreated {
+			t.Fatalf("upload flask: %d", code)
+		}
+
+		render := func(pkg string) {
+			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/", nil)
+			resp := httptest.NewRecorder()
+			h.Mux().ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("/simple/%s/ status=%d", pkg, resp.Code)
+			}
+		}
+
+		// Prime the cache for both packages.
+		render("requests")
+		render("flask")
+		afterPrime := reg.listFiles.Load()
+		if afterPrime != 2 {
+			t.Fatalf("ListFiles after priming both = %d, want 2", afterPrime)
+		}
+
+		// A new version of requests must drop only that entry.
+		if code := uploadPackage(t, h, "requests", "1.0.1"); code != http.StatusCreated {
+			t.Fatalf("upload requests 1.0.1: %d", code)
+		}
+
+		render("requests") // miss → +1
+		render("flask")    // still cached → unchanged
+
+		if got, want := reg.listFiles.Load(), int64(3); got != want {
+			t.Errorf("ListFiles after invalidation = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("ttl=0 disables caching", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newCountingRegistry()
+		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+		if err != nil {
+			t.Fatalf("NewHandler: %v", err)
+		}
+		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
+			t.Fatalf("upload: %d", code)
+		}
+
+		for i := 0; i < 3; i++ {
+			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			resp := httptest.NewRecorder()
+			h.Mux().ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("status=%d", resp.Code)
+			}
+		}
+
+		if got := reg.listFiles.Load(); got != 3 {
+			t.Errorf("ListFiles with cache disabled = %d, want 3 (one per render)", got)
+		}
+	})
 }
 
 // TestIndexSentinel covers the per-package sentinel write path: the
