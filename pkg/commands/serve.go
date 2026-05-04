@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/yolocs/ocifactory/pkg/handler"
@@ -27,6 +28,7 @@ type serveFlags struct {
 	registryURLStr string
 
 	disableStreamingPush bool
+	simpleIndexCacheTTL  time.Duration
 
 	registryURL *url.URL
 }
@@ -91,6 +93,13 @@ func newServeCmd() *cobra.Command {
 			"Bodies above the in-memory threshold will spill to a temp file "+
 			"instead of streaming via chunked PATCH. Set this only for "+
 			"backend registries with broken or missing chunked-PATCH support.")
+	cmd.Flags().DurationVar(&flags.simpleIndexCacheTTL, "simple-index-cache-ttl", python.DefaultSimpleIndexCacheTTL,
+		"TTL for the per-replica per-package PyPI simple-index cache. "+
+			"Within the TTL, repeated GET /simple/<pkg>/ requests skip the "+
+			"backend ListFiles call. Successful uploads invalidate the entry "+
+			"for the affected package. Set to 0 to disable caching. "+
+			"Note: in multi-replica deployments, an upload landing on one "+
+			"replica may take up to this long to be reflected by another.")
 
 	return cmd
 }
@@ -130,7 +139,7 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(reg)
+		ph, err := python.NewHandler(reg, python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL))
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}

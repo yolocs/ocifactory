@@ -11,6 +11,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
@@ -72,17 +73,42 @@ type repoFile struct {
 }
 
 type Handler struct {
-	registry handler.Registry
-	renderer *renderer.Renderer
+	registry   handler.Registry
+	renderer   *renderer.Renderer
+	indexCache *simpleIndexCache
+}
+
+// Option configures optional Handler behaviour.
+type Option func(*handlerConfig)
+
+type handlerConfig struct {
+	simpleIndexCacheTTL time.Duration
+}
+
+// WithSimpleIndexCacheTTL sets the per-package simple-index cache TTL.
+// A zero or negative value disables the cache. The default is
+// DefaultSimpleIndexCacheTTL.
+func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
+	return func(c *handlerConfig) {
+		c.simpleIndexCacheTTL = ttl
+	}
 }
 
 // NewHandler creates a new Handler.
-func NewHandler(registry handler.Registry) (*Handler, error) {
+func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
+	cfg := handlerConfig{simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	r, err := renderer.New(fs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}
-	return &Handler{registry: registry, renderer: r}, nil
+	return &Handler{
+		registry:   registry,
+		renderer:   r,
+		indexCache: newSimpleIndexCache(cfg.simpleIndexCacheTTL),
+	}, nil
 }
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
@@ -224,7 +250,12 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 					Content: io.NopCloser(strings.NewReader(indexSentinelContent)),
 				},
 			}
-			h.handlePut(req.Context(), w, fs)
+			if h.handlePut(req.Context(), w, fs) {
+				// A successful publish changes what /simple/<pkg>/ should
+				// render; drop the cached file list so the next render
+				// fetches fresh from the backend.
+				h.indexCache.invalidate(pkgName)
+			}
 		}
 	}
 
@@ -264,22 +295,27 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	files, err := h.registry.ListFiles(req.Context(), "packages/"+pkg)
-	if err != nil {
-		if errors.Is(err, errdef.ErrNotFound) {
-			http.Error(w, err.Error(), http.StatusNotFound)
+	files, ok := h.indexCache.get(pkg)
+	if !ok {
+		var err error
+		files, err = h.registry.ListFiles(req.Context(), "packages/"+pkg)
+		if err != nil {
+			if errors.Is(err, errdef.ErrNotFound) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			if oci.HasCode(err, http.StatusUnauthorized) {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if oci.HasCode(err, http.StatusForbidden) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if oci.HasCode(err, http.StatusUnauthorized) {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if oci.HasCode(err, http.StatusForbidden) {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		h.indexCache.put(pkg, files)
 	}
 
 	idx := index{Title: pkg}
@@ -301,7 +337,13 @@ func repoFileURL(req *http.Request, f *oci.RepoFile) *url.URL {
 	}
 }
 
-func (h *Handler) handlePut(ctx context.Context, w http.ResponseWriter, fs []*repoFile) {
+// handlePut writes every file in fs to the registry. It is also
+// responsible for the HTTP response: on success it writes 201 Created and
+// returns true; on the first failure it writes the appropriate error
+// status and returns false. The boolean return lets handleFilePut perform
+// post-write side effects (e.g. cache invalidation) only when the upload
+// actually succeeded.
+func (h *Handler) handlePut(ctx context.Context, w http.ResponseWriter, fs []*repoFile) bool {
 	logger := logging.FromContext(ctx)
 
 	for _, f := range fs {
@@ -311,18 +353,19 @@ func (h *Handler) handlePut(ctx context.Context, w http.ResponseWriter, fs []*re
 			logger.DebugContext(ctx, "failed to add file", "error", err)
 			if oci.HasCode(err, http.StatusUnauthorized) {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
-				return
+				return false
 			}
 			if oci.HasCode(err, http.StatusForbidden) {
 				http.Error(w, err.Error(), http.StatusForbidden)
-				return
+				return false
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return false
 		}
 		logger.DebugContext(ctx, "added file", "descriptor", desc)
 	}
 	w.WriteHeader(http.StatusCreated)
+	return true
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
