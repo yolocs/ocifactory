@@ -22,7 +22,9 @@ Design pillars (in priority order):
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested |
 | `pkg/handler/npm` — Routes wired up, all handlers return 501 | **Stub — next up** |
-| `pkg/handler` — `Server`, `PassThroughAuth`, `Logger` middlewares | Done |
+| `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
+| `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
+| `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/cred` — Auth credential context | Done (basic auth only) |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven` |
 | Go module proxy support | Not started |
@@ -43,7 +45,9 @@ HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)    │
                      ┌────────────▼────────────────────────┐
                      │  pkg/handler                         │
                      │  • Server (port + middleware chain)  │
-                     │  • PassThroughAuth, Logger           │
+                     │  • PassThroughAuth, Logger,          │
+                     │    MetricsMiddleware                 │
+                     │  • /healthz, /readyz, /metrics       │
                      └────────────┬────────────────────────┘
                                   │ http.Handler
                      ┌────────────▼────────────────────────┐
