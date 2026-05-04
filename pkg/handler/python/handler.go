@@ -112,19 +112,29 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 }
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
+//
+// Each route is .Name()'d so the metrics middleware uses a stable op
+// label (write / read / list) instead of a method-derived default. The
+// list label distinguishes simple-index enumeration from blob reads,
+// which is the diagnostic split operators want to see on dashboards.
+// RouteNameOpMiddleware copies the matched route's name into the
+// per-request op holder; without it the names would be visible only
+// inside gorilla/mux's request clone and the outer metrics middleware
+// would fall back to the method-based default.
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
+	router.Use(mux.MiddlewareFunc(handler.RouteNameOpMiddleware))
 
 	// Handle both pip and twine operations
-	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST")
+	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
 
-	router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD")
+	router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
 
-	router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET")
-	router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET")
+	router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
+	router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
 
-	router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET")
-	router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET")
+	router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
+	router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
 
 	return router
 }

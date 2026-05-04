@@ -14,6 +14,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
+	"github.com/yolocs/ocifactory/pkg/metrics"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -29,6 +30,9 @@ type serveFlags struct {
 
 	disableStreamingPush bool
 	simpleIndexCacheTTL  time.Duration
+
+	enableMetrics bool
+	metricsPath   string
 
 	registryURL *url.URL
 }
@@ -100,6 +104,14 @@ func newServeCmd() *cobra.Command {
 			"for the affected package. Set to 0 to disable caching. "+
 			"Note: in multi-replica deployments, an upload landing on one "+
 			"replica may take up to this long to be reflected by another.")
+	cmd.Flags().BoolVar(&flags.enableMetrics, "enable-metrics", true,
+		"Expose Prometheus metrics at --metrics-path and instrument the "+
+			"HTTP and OCI backend layers. When false, the no-op recorder is "+
+			"wired throughout and the metrics endpoint returns 404.")
+	cmd.Flags().StringVar(&flags.metricsPath, "metrics-path", "/metrics",
+		"Path on the main listener that serves Prometheus exposition. "+
+			"Operators wanting authn / network ACLs on metrics should "+
+			"front this with their own reverse proxy.")
 
 	return cmd
 }
@@ -112,46 +124,82 @@ func envOr(key, fallback string) string {
 }
 
 func runServe(ctx context.Context, flags *serveFlags) error {
-	var h http.Handler
+	rec, metricsHandler := buildRecorder(flags.enableMetrics)
+
+	var (
+		h      http.Handler
+		reg    *oci.Registry
+		format string
+	)
 	registryOpts := []oci.RegistryOption{
 		oci.WithStreamingPushDisabled(flags.disableStreamingPush),
+		oci.WithMetrics(rec),
 	}
 
 	switch flags.repoType {
 	case maven.RepoType:
-		reg, err := oci.NewRegistry(
+		r, err := oci.NewRegistry(
 			flags.registryURL,
 			append(registryOpts, oci.WithArtifactType(maven.ArtifactType))...,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(reg)
+		mh, err := maven.NewHandler(r)
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
-		h = mh.Mux()
+		reg, format, h = r, maven.RepoType, mh.Mux()
 	case python.RepoType:
-		reg, err := oci.NewRegistry(
+		r, err := oci.NewRegistry(
 			flags.registryURL,
 			append(registryOpts, oci.WithArtifactType(python.ArtifactType))...,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(reg, python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL))
+		ph, err := python.NewHandler(r, python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL))
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}
-		h = ph.Mux()
+		reg, format, h = r, python.RepoType, ph.Mux()
 	default:
 		return fmt.Errorf("repo-type %q is not supported", flags.repoType)
 	}
 
-	srv, err := handler.NewServer(flags.port, handler.PassThroughAuth, handler.Loggeer)
+	// Wrap the format mux with the format tag, then with the
+	// observability endpoints. MetricsMiddleware (registered below at
+	// the server level) injects its state holder before either fires,
+	// so SetFormat from inside WrapWithFormat propagates back up
+	// through any gorilla/mux dispatch.
+	h = handler.WrapWithFormat(format)(h)
+	metricsPath := flags.metricsPath
+	if !flags.enableMetrics {
+		metricsPath = ""
+	}
+	h = handler.ObservabilityHandler(h, reg, metricsHandler, metricsPath)
+
+	srv, err := handler.NewServer(
+		flags.port,
+		handler.PassThroughAuth,
+		handler.Loggeer,
+		handler.MetricsMiddleware(rec),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 
 	return srv.Start(ctx, h)
+}
+
+// buildRecorder returns the metrics recorder and the http.Handler that
+// serves Prometheus exposition. When metrics are disabled both the
+// recorder and the handler default to no-op equivalents so the rest of
+// the wiring path can stay identical.
+func buildRecorder(enabled bool) (metrics.Recorder, http.Handler) {
+	if !enabled {
+		return metrics.NoOp(), nil
+	}
+	p := metrics.NewPrometheus(nil)
+	return p, p.Handler()
 }

@@ -16,6 +16,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/yolocs/ocifactory/pkg/cred"
+	"github.com/yolocs/ocifactory/pkg/metrics"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/errdef"
@@ -107,6 +108,12 @@ type Registry struct {
 	// uses O(streamChunkSize) memory and zero disk regardless of body size.
 	disableStreamingPush bool
 
+	// rec collects per-backend-call observations. Defaults to
+	// metrics.NoOp() so existing tests and library callers that don't
+	// opt into instrumentation see no behavioural change. Wire a real
+	// recorder via WithMetrics.
+	rec metrics.Recorder
+
 	// authClients caches *auth.Client per credential hash so concurrent
 	// AddFile calls share the same bearer-token cache. Without this each
 	// PATCH of a chunked upload would round-trip the registry's auth
@@ -127,6 +134,21 @@ type RegistryOption func(*Registry) error
 func WithArtifactType(artifactType string) RegistryOption {
 	return func(r *Registry) error {
 		r.artifactType = artifactType
+		return nil
+	}
+}
+
+// WithMetrics wires a metrics.Recorder into the registry so every OCI
+// backend call (push_blob, push_manifest, fetch_*, list_tags, …) and
+// every streaming-push session is observed. Defaults to metrics.NoOp()
+// when not set, so tests and library callers that don't opt into
+// instrumentation keep their existing behaviour.
+func WithMetrics(rec metrics.Recorder) RegistryOption {
+	return func(r *Registry) error {
+		if rec == nil {
+			rec = metrics.NoOp()
+		}
+		r.rec = rec
 		return nil
 	}
 }
@@ -180,6 +202,7 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 		baseURL:            baseURL,
 		artifactType:       DefaultArtifactType,
 		uploadMemThreshold: uploadMemThreshold,
+		rec:                metrics.NoOp(),
 	}
 	r.newBackendFunc = r.newBackend
 	r.newStreamPusherFunc = r.newStreamPusher
@@ -978,7 +1001,7 @@ func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error
 		repo.Client = c
 	}
 
-	return remoteRepo{Repository: repo}, nil
+	return newInstrumentedRepo(remoteRepo{Repository: repo}, r.rec), nil
 }
 
 // remoteRepo adapts oras-go's *remote.Repository to our destRepo
@@ -1010,7 +1033,7 @@ func (r *Registry) newStreamPusher(ctx context.Context, f *RepoFile) (streamingP
 	}
 
 	plainHTTP := r.baseURL.Scheme == "http"
-	return newStreamPusher(client, ref, plainHTTP), nil
+	return newInstrumentedStreamPusher(newStreamPusher(client, ref, plainHTTP), r.rec), nil
 }
 
 // authClientFromContext returns an *auth.Client wired with the basic-auth

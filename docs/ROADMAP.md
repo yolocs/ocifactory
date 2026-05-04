@@ -29,7 +29,9 @@ Make it trivial to run. Without this, nobody adopts it.
   build + push (GHCR) on tag.
 - [ ] Cloud Run deployment guide + sample Terraform.
 - [ ] Cloudflare Workers/Containers deployment guide.
-- [ ] Health check endpoint, Prometheus metrics, structured request logs.
+- [x] Health check endpoint (`/healthz`, `/readyz`), Prometheus metrics
+  (`/metrics`), HTTP- and OCI-backend-layer instrumentation.
+- [ ] Structured request logs.
 - [ ] Rate limiting hooks (interface, default no-op).
 
 ## Phase 3 — Auth/Authz extensibility
