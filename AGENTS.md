@@ -25,13 +25,15 @@ Design pillars (in priority order):
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
-| `pkg/cred` — Auth credential context | Done (basic auth only) |
+| `pkg/cred` — Backend OCI credential context | Carries Basic creds for backend HTTP client; populated by future backend cred provider |
+| `pkg/auth` — Pluggable frontend authentication (Authenticator, Subject, Chain, OIDC, basictoken) | Done, tested |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven` |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
 | Vulnerability scanning | Not started |
-| Authn/Authz beyond pass-through basic auth | Not started |
+| Authorization (per-repo, per-op policy) | Not started |
+| Backend credential provider (how ocifactory talks to GAR/ECR/zot) | Not started |
 | Dockerfile / deployment | Not started |
 | CI: lint, test, build, image publish | Only `go-test` from `abcxyz/pkg` |
 
@@ -45,8 +47,8 @@ HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)    │
                      ┌────────────▼────────────────────────┐
                      │  pkg/handler                         │
                      │  • Server (port + middleware chain)  │
-                     │  • PassThroughAuth, Logger,          │
-                     │    MetricsMiddleware                 │
+                     │  • Logger, MetricsMiddleware         │
+                     │  • auth.Middleware (pkg/auth)        │
                      │  • /healthz, /readyz, /metrics       │
                      └────────────┬────────────────────────┘
                                   │ http.Handler

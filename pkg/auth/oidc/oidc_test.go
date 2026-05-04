@@ -1,0 +1,486 @@
+package oidc
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/google/go-cmp/cmp"
+	"github.com/yolocs/ocifactory/pkg/auth"
+)
+
+// fakeIssuer is a minimal OIDC provider: it serves
+// /.well-known/openid-configuration and a JWKS document, and signs
+// tokens with an in-process RSA key. Multiple keys are supported so
+// tests can exercise kid-mismatch / rotation.
+type fakeIssuer struct {
+	t      *testing.T
+	server *httptest.Server
+	keys   []signingKey
+}
+
+type signingKey struct {
+	kid string
+	key *rsa.PrivateKey
+}
+
+func newFakeIssuer(t *testing.T) *fakeIssuer {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	f := &fakeIssuer{t: t, keys: []signingKey{{kid: "kid-1", key: priv}}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", f.handleDiscovery)
+	mux.HandleFunc("/jwks", f.handleJWKS)
+	f.server = httptest.NewServer(mux)
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *fakeIssuer) Issuer() string { return f.server.URL }
+
+func (f *fakeIssuer) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	doc := map[string]any{
+		"issuer":   f.server.URL,
+		"jwks_uri": f.server.URL + "/jwks",
+		// go-oidc requires id_token_signing_alg_values_supported
+		// in the discovery doc to be non-empty; otherwise it
+		// rejects every token.
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+	}
+	_ = json.NewEncoder(w).Encode(doc)
+}
+
+func (f *fakeIssuer) handleJWKS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	keys := make([]jose.JSONWebKey, 0, len(f.keys))
+	for _, k := range f.keys {
+		keys = append(keys, jose.JSONWebKey{
+			Key:       &k.key.PublicKey,
+			KeyID:     k.kid,
+			Algorithm: "RS256",
+			Use:       "sig",
+		})
+	}
+	_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: keys})
+}
+
+// signToken builds and RS256-signs a JWT with the supplied claims.
+// kid selects which configured key to sign with; pass "" to use
+// the first.
+func (f *fakeIssuer) signToken(t *testing.T, kid string, claims map[string]any) string {
+	t.Helper()
+	var sk signingKey
+	if kid == "" {
+		sk = f.keys[0]
+	} else {
+		for _, k := range f.keys {
+			if k.kid == kid {
+				sk = k
+				break
+			}
+		}
+		if sk.key == nil {
+			t.Fatalf("signToken: no key with kid %q", kid)
+		}
+	}
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: sk.key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", sk.kid),
+	)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	return raw
+}
+
+// claims builds the standard claim set used in the happy-path
+// tests. Tests override individual fields (aud, iss, exp, ...) by
+// mutating the returned map before signing.
+func (f *fakeIssuer) claims(audience, sub string) map[string]any {
+	now := time.Now()
+	return map[string]any{
+		"iss": f.server.URL,
+		"aud": audience,
+		"sub": sub,
+		"iat": now.Unix(),
+		"exp": now.Add(5 * time.Minute).Unix(),
+	}
+}
+
+func TestNew_Validation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		issuer      string
+		audience    string
+		wantErrPart string
+	}{
+		{name: "valid", issuer: "https://x", audience: "y"},
+		{name: "missing issuer", audience: "y", wantErrPart: "issuer is required"},
+		{name: "missing audience", issuer: "https://x", wantErrPart: "audience is required"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := New(tc.issuer, tc.audience)
+			if tc.wantErrPart != "" {
+				if err == nil {
+					t.Fatalf("error = nil, want %q", tc.wantErrPart)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrPart) {
+					t.Errorf("error = %q, want substring %q", err, tc.wantErrPart)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticate_HappyPaths(t *testing.T) {
+	t.Parallel()
+
+	iss := newFakeIssuer(t)
+	const audience = "ocifactory.example"
+
+	tests := []struct {
+		name      string
+		mutate    func(map[string]any)
+		header    func(token string) string
+		wantEmail string
+	}{
+		{
+			name:   "bearer token",
+			mutate: func(c map[string]any) {},
+			header: func(tok string) string { return "Bearer " + tok },
+		},
+		{
+			name:   "sentinel _oidc",
+			mutate: func(c map[string]any) {},
+			header: func(tok string) string {
+				return "Basic " + base64.StdEncoding.EncodeToString([]byte("_oidc:"+tok))
+			},
+		},
+		{
+			name:   "sentinel oauth2accesstoken",
+			mutate: func(c map[string]any) {},
+			header: func(tok string) string {
+				return "Basic " + base64.StdEncoding.EncodeToString([]byte("oauth2accesstoken:"+tok))
+			},
+		},
+		{
+			name: "verified email surfaces",
+			mutate: func(c map[string]any) {
+				c["email"] = "alice@example.com"
+				c["email_verified"] = true
+			},
+			header:    func(tok string) string { return "Bearer " + tok },
+			wantEmail: "alice@example.com",
+		},
+		{
+			name: "unverified email is dropped",
+			mutate: func(c map[string]any) {
+				c["email"] = "alice@example.com"
+				c["email_verified"] = false
+			},
+			header: func(tok string) string { return "Bearer " + tok },
+		},
+		{
+			name: "audience as array containing match",
+			mutate: func(c map[string]any) {
+				c["aud"] = []any{"other", audience}
+			},
+			header: func(tok string) string { return "Bearer " + tok },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			claims := iss.claims(audience, "subject-123")
+			tc.mutate(claims)
+			tok := iss.signToken(t, "", claims)
+
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header.Set("Authorization", tc.header(tok))
+			r = r.WithContext(t.Context())
+
+			subj, err := a.Authenticate(r)
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			want := &auth.Subject{
+				Issuer: iss.Issuer(),
+				ID:     "subject-123",
+				Email:  tc.wantEmail,
+				Claims: claims,
+			}
+			if diff := cmp.Diff(want, subj, claimsCmp()); diff != "" {
+				t.Errorf("subject mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAuthenticate_Failures(t *testing.T) {
+	t.Parallel()
+
+	iss := newFakeIssuer(t)
+	const audience = "ocifactory.example"
+
+	tests := []struct {
+		name      string
+		header    func(t *testing.T) string
+		wantErrIs error
+	}{
+		{
+			name: "no header",
+			header: func(t *testing.T) string {
+				return ""
+			},
+			wantErrIs: auth.ErrNoCredential,
+		},
+		{
+			name: "regular basic non-sentinel",
+			header: func(t *testing.T) string {
+				return "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:pwd"))
+			},
+			wantErrIs: auth.ErrNoCredential,
+		},
+		{
+			name: "wrong audience",
+			header: func(t *testing.T) string {
+				c := iss.claims("wrong", "u")
+				return "Bearer " + iss.signToken(t, "", c)
+			},
+			wantErrIs: auth.ErrInvalidToken,
+		},
+		{
+			name: "wrong issuer",
+			header: func(t *testing.T) string {
+				c := iss.claims(audience, "u")
+				c["iss"] = "https://attacker"
+				return "Bearer " + iss.signToken(t, "", c)
+			},
+			wantErrIs: auth.ErrInvalidToken,
+		},
+		{
+			name: "expired",
+			header: func(t *testing.T) string {
+				c := iss.claims(audience, "u")
+				c["iat"] = time.Now().Add(-2 * time.Hour).Unix()
+				c["exp"] = time.Now().Add(-1 * time.Hour).Unix()
+				return "Bearer " + iss.signToken(t, "", c)
+			},
+			wantErrIs: auth.ErrInvalidToken,
+		},
+		{
+			name: "not yet valid",
+			header: func(t *testing.T) string {
+				c := iss.claims(audience, "u")
+				c["nbf"] = time.Now().Add(1 * time.Hour).Unix()
+				return "Bearer " + iss.signToken(t, "", c)
+			},
+			wantErrIs: auth.ErrInvalidToken,
+		},
+		{
+			name: "garbage token",
+			header: func(t *testing.T) string {
+				return "Bearer not-a-jwt"
+			},
+			wantErrIs: auth.ErrInvalidToken,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			if h := tc.header(t); h != "" {
+				r.Header.Set("Authorization", h)
+			}
+			r = r.WithContext(t.Context())
+
+			_, err = a.Authenticate(r)
+			if !errors.Is(err, tc.wantErrIs) {
+				t.Errorf("error = %v, want errors.Is(%v)", err, tc.wantErrIs)
+			}
+		})
+	}
+}
+
+// TestAuthenticate_DiscoveryFailureSurfaces503 checks that the lazy
+// initialization path turns an unreachable issuer into
+// ErrIssuerUnavailable rather than ErrInvalidToken — the operator
+// can tell the difference between "credential is bad" and "I can't
+// even check this credential right now".
+func TestAuthenticate_DiscoveryFailureSurfaces503(t *testing.T) {
+	t.Parallel()
+
+	// Point at a port that is guaranteed not to answer.
+	a, err := New("http://127.0.0.1:1/issuer", "aud")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer abc")
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
+
+	_, err = a.Authenticate(r)
+	if !errors.Is(err, auth.ErrIssuerUnavailable) {
+		t.Errorf("error = %v, want errors.Is(ErrIssuerUnavailable)", err)
+	}
+}
+
+// TestAuthenticate_VerifierMemoized confirms the discovery
+// round-trip happens at most once across many requests — required
+// for performance and to avoid hammering the issuer's discovery
+// endpoint.
+func TestAuthenticate_VerifierMemoized(t *testing.T) {
+	t.Parallel()
+
+	iss := newFakeIssuer(t)
+	const audience = "ocifactory.example"
+
+	// Wrap the issuer's transport so we can count discovery hits.
+	var hits int
+	rt := countingRoundTripper{
+		inner: iss.server.Client().Transport,
+		onHit: func(path string) {
+			if strings.Contains(path, ".well-known/openid-configuration") {
+				hits++
+			}
+		},
+	}
+	hc := &http.Client{Transport: rt}
+
+	a, err := New(iss.Issuer(), audience, WithHTTPClient(hc))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tok := iss.signToken(t, "", iss.claims(audience, "u"))
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Authorization", "Bearer "+tok)
+		r = r.WithContext(t.Context())
+		if _, err := a.Authenticate(r); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+	if hits != 1 {
+		t.Errorf("discovery hits = %d, want 1", hits)
+	}
+}
+
+// claimsCmp lets cmp.Diff treat numeric claim values that come back
+// as float64 (json default) as equal to the int64 inputs the tests
+// constructed. Without this, every iat/exp comparison would fail
+// even though the values round-trip correctly.
+func claimsCmp() cmp.Option {
+	return cmp.Comparer(func(a, b *auth.Subject) bool {
+		if a == nil || b == nil {
+			return a == b
+		}
+		if a.Issuer != b.Issuer || a.ID != b.ID || a.Email != b.Email {
+			return false
+		}
+		// Compare common keys; numeric values may have been
+		// json-decoded to float64.
+		for k, av := range a.Claims {
+			bv, ok := b.Claims[k]
+			if !ok {
+				return false
+			}
+			if !claimEqual(av, bv) {
+				return false
+			}
+		}
+		for k := range b.Claims {
+			if _, ok := a.Claims[k]; !ok {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+func claimEqual(a, b any) bool {
+	// Coerce numeric flavors to float64 for comparison.
+	toF := func(v any) (float64, bool) {
+		switch n := v.(type) {
+		case float64:
+			return n, true
+		case int:
+			return float64(n), true
+		case int64:
+			return float64(n), true
+		}
+		return 0, false
+	}
+	if af, aok := toF(a); aok {
+		if bf, bok := toF(b); bok {
+			return af == bf
+		}
+	}
+	// Compare slices (aud array).
+	if as, ok := a.([]any); ok {
+		bs, ok := b.([]any)
+		if !ok || len(as) != len(bs) {
+			return false
+		}
+		for i := range as {
+			if !claimEqual(as[i], bs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+type countingRoundTripper struct {
+	inner http.RoundTripper
+	onHit func(path string)
+}
+
+func (c countingRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if c.onHit != nil {
+		c.onHit(r.URL.Path)
+	}
+	return c.inner.RoundTrip(r)
+}

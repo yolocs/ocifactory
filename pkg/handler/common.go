@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/yolocs/ocifactory/pkg/cred"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/serving"
@@ -45,22 +44,6 @@ func (s *Server) Start(ctx context.Context, handler http.Handler) error {
 		h = s.middlewares[i](h)
 	}
 	return s.svr.StartHTTPHandler(ctx, h)
-}
-
-// PassThroughAuth is a middleware that passes through basic auth credentials
-// from the request to the context.
-func PassThroughAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// If we have basic auth, then pass through it via context.
-		user, pwd, ok := r.BasicAuth()
-		if ok {
-			r = r.WithContext(cred.WithCred(
-				r.Context(),
-				&cred.Cred{Basic: &cred.BasicCred{User: user, Password: pwd}}),
-			)
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 // Logger is a middleware that adds a logger to the request context.
