@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -144,5 +145,112 @@ func TestAddFile_StreamingIntegration_Zot(t *testing.T) {
 					len(gotBody), len(body), sha256Digest(gotBody) == wantDigest)
 			}
 		})
+	}
+}
+
+// TestAddFile_ConcurrentSameVersion_Zot exercises the OCI 1.1 referrers
+// concurrency property end-to-end against a real registry: N goroutines
+// upload distinct files into the same OwningTag in parallel and every
+// file must be recoverable via ReadFile afterwards. Under the
+// pre-redesign aggregated-manifest layout this would have lost layers to
+// the un-CAS'd tag-write race that issue #26 documented.
+func TestAddFile_ConcurrentSameVersion_Zot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live-zot integration test in -short mode")
+	}
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	t.Cleanup(cancel)
+
+	zot, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        zotImage,
+			ExposedPorts: []string{"5000/tcp"},
+			WaitingFor: wait.ForHTTP("/v2/").
+				WithPort("5000/tcp").
+				WithStatusCodeMatcher(func(status int) bool { return status == 200 }).
+				WithStartupTimeout(60 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Skipf("could not start zot container (Docker available?): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := zot.Terminate(context.Background()); err != nil {
+			t.Logf("zot terminate: %v", err)
+		}
+	})
+
+	host, err := zot.Host(ctx)
+	if err != nil {
+		t.Fatalf("zot.Host: %v", err)
+	}
+	port, err := zot.MappedPort(ctx, "5000/tcp")
+	if err != nil {
+		t.Fatalf("zot.MappedPort: %v", err)
+	}
+	base := &url.URL{Scheme: "http", Host: net.JoinHostPort(host, port.Port())}
+
+	r, err := NewRegistry(base)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+
+	const goroutines = 12 // mirrors a typical mvn-deploy 12-file fan-out
+	bodies := make([][]byte, goroutines)
+	for i := range bodies {
+		bodies[i] = make([]byte, 32*1024)
+		if _, err := io.ReadFull(rand.Reader, bodies[i]); err != nil {
+			t.Fatalf("rand.Read: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	errs := make([]error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func(i int) {
+			defer wg.Done()
+			f := &RepoFile{
+				OwningRepo: "ocifactory/integration/concurrent",
+				OwningTag:  "v1",
+				Name:       fmt.Sprintf("file-%02d.bin", i),
+				Size:       int64(len(bodies[i])),
+			}
+			if _, err := r.AddFile(ctx, f, bytes.NewReader(bodies[i])); err != nil {
+				errs[i] = err
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d AddFile() error = %v", i, err)
+		}
+	}
+
+	for i := 0; i < goroutines; i++ {
+		f := &RepoFile{
+			OwningRepo: "ocifactory/integration/concurrent",
+			OwningTag:  "v1",
+			Name:       fmt.Sprintf("file-%02d.bin", i),
+		}
+		_, rc, err := r.ReadFile(ctx, f)
+		if err != nil {
+			t.Errorf("ReadFile(%s) error = %v", f.Name, err)
+			continue
+		}
+		gotBody, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Errorf("ReadAll(%s) error = %v", f.Name, err)
+			continue
+		}
+		if !bytes.Equal(bodies[i], gotBody) {
+			t.Errorf("ReadFile(%s): body mismatch (len=%d, want %d)", f.Name, len(gotBody), len(bodies[i]))
+		}
 	}
 }

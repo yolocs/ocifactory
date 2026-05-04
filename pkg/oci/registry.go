@@ -10,10 +10,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/yolocs/ocifactory/pkg/cred"
 	"oras.land/oras-go/v2"
@@ -27,7 +27,31 @@ import (
 
 const (
 	DefaultArtifactType = "application/vnd.ocifactory.generic"
-	FileNameAnnotation  = "ocifactory.file.title"
+
+	// FileNameAnnotation is set on file manifests (and copied onto the file
+	// blob's layer descriptor) so the referrers index surfaces the file
+	// name without callers having to fetch each file manifest's body.
+	FileNameAnnotation = "ocifactory.file.title"
+
+	// FileDigestAnnotation carries the file blob's digest on the file
+	// manifest. ListFiles reads it from the referrers index entry directly,
+	// avoiding an extra fetch per file just to learn the blob digest.
+	FileDigestAnnotation = "ocifactory.file.digest"
+
+	// AliasTargetAnnotation is set on alias manifests to record the
+	// canonical version they point at. The subject field carries the same
+	// information as a digest; the annotation carries it as a human-readable
+	// tag name so an operator inspecting the registry can read it directly.
+	AliasTargetAnnotation = "ocifactory.alias.target"
+
+	// Subtype suffixes appended to the configured base artifactType to
+	// distinguish the three manifest kinds in the OCI 1.1 referrers layout.
+	// Operators inspecting the registry see e.g.
+	// "application/vnd.ocifactory.python.version" and can tell at a glance
+	// which manifests are version anchors, file payloads, or aliases.
+	versionArtifactSuffix = ".version"
+	fileArtifactSuffix    = ".file"
+	aliasArtifactSuffix   = ".alias"
 
 	// uploadMemThreshold is the largest upload body that AddFile will buffer
 	// fully in memory. Anything larger streams via chunked PATCH unless
@@ -43,16 +67,35 @@ const (
 // It is returned before any data is pushed to the backend.
 var ErrDigestMismatch = errors.New("file digest mismatch")
 
+// ErrAliasCollision is returned by AddFile or AppendRefs when a write would
+// clobber an existing tag whose manifest has an incompatible artifactType
+// (e.g. AppendRefs trying to overwrite a canonical version, or AddFile
+// trying to overwrite an alias). The HEAD-and-artifactType probe in the
+// write path turns silent overwrite into a typed error.
+var ErrAliasCollision = errors.New("tag collides with incompatible artifactType")
+
+// destRepo is the subset of oras-go's remote.Repository (and our in-memory
+// fake) that pkg/oci needs. Pinned as an interface so tests can substitute
+// memory-backed implementations.
 type destRepo interface {
 	oras.Target
 	registry.TagLister
 	content.Tagger
 	content.Deleter
+	content.PredecessorFinder
 }
 
 type Registry struct {
-	baseURL      *url.URL
-	artifactType string
+	baseURL *url.URL
+
+	// artifactType is the operator-configured base type. We derive three
+	// suffixed subtypes (versionArtifactType / fileArtifactType /
+	// aliasArtifactType) so each manifest kind in the OCI 1.1 referrers
+	// layout has a distinct, inspectable artifactType.
+	artifactType        string
+	versionArtifactType string
+	fileArtifactType    string
+	aliasArtifactType   string
 
 	// uploadMemThreshold is the in-memory staging cap for AddFile bodies.
 	// Initialised to the package default; overridable from tests.
@@ -69,7 +112,7 @@ type Registry struct {
 	// PATCH of a chunked upload would round-trip the registry's auth
 	// endpoint — a 200 MB jar at 4 MiB chunks would issue ~50 token
 	// fetches per upload and saturate the auth path under load.
-	authClients sync.Map // map[string]*auth.Client
+	authClients sync.Map // map[authCacheKey]*auth.Client
 
 	// Used in unit tests to stub with in-memory backend.
 	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
@@ -122,8 +165,13 @@ type RepoFile struct {
 	Size int64
 }
 
+// FileDescriptor identifies a file within the OCI-backed registry. Manifest
+// is the descriptor of the per-file OCI manifest that owns the file blob;
+// File is the descriptor of the blob layer itself. Callers typically only
+// inspect File.Digest / File.Size (e.g. for HTTP Content-Length / checksum
+// headers).
 type FileDescriptor struct {
-	Manifest ocispec.Descriptor // The owning manifest descriptor.
+	Manifest ocispec.Descriptor
 	File     ocispec.Descriptor
 }
 
@@ -142,83 +190,29 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 		}
 	}
 
+	r.versionArtifactType = r.artifactType + versionArtifactSuffix
+	r.fileArtifactType = r.artifactType + fileArtifactSuffix
+	r.aliasArtifactType = r.artifactType + aliasArtifactSuffix
+
 	return r, nil
 }
 
-// DeleteTagFiles deletes all files in a tag.
-// It's used to delete a tag and all its files.
-func (r *Registry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
-	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
-	if err != nil {
-		return err
-	}
-
-	return r.deleteTagFiles(ctx, backendRepo, tag)
-}
-
-// DeleteRepoFiles deletes all files in a repository.
-// It's used to delete a repository and all its tags.
-func (r *Registry) DeleteRepoFiles(ctx context.Context, repo string) error {
-	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
-	if err != nil {
-		return err
-	}
-
-	tags, err := r.listTags(ctx, backendRepo)
-	if err != nil {
-		return err
-	}
-
-	for _, tag := range tags {
-		if strings.HasPrefix(tag, "ref_") {
-			continue // Ignore refs otherwise we'll get duplicated files.
-		}
-		if err := r.deleteTagFiles(ctx, backendRepo, tag); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (r *Registry) deleteTagFiles(ctx context.Context, backendRepo destRepo, tag string) error {
-	manifestDesc, err := backendRepo.Resolve(ctx, tag)
-	if err != nil {
-		return fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)
-	}
-
-	if err := backendRepo.Delete(ctx, manifestDesc); err != nil {
-		return fmt.Errorf("failed to delete manifest for tag %q: %w", tag, err)
-	}
-	return nil
-}
-
-// AppendRefs appends tags to a manifest.
-// The canonical tag is the tag that points to the manifest.
-// The tags are the tags to append to the manifest.
-// The tags are appended in the order they are provided.
-// The canonical tag is not included in the tags list.
-func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
-	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
-	if err != nil {
-		return err
-	}
-
-	manifestDesc, err := backendRepo.Resolve(ctx, canonicalTag)
-	if err != nil {
-		return fmt.Errorf("failed to resolve manifest for canonical tag %q: %w", canonicalTag, err)
-	}
-
-	for _, ref := range refs {
-		if err := backendRepo.Tag(ctx, manifestDesc, "ref_"+ref); err != nil {
-			return fmt.Errorf("failed to tag manifest for ref %q: %w", ref, err)
-		}
-	}
-
-	return nil
-}
-
-// AddFile adds a file to the registry.
+// AddFile adds a file to the registry under the OwningRepo / OwningTag pair
+// in RepoFile. The implementation uses the OCI 1.1 referrers layout:
+//
+//  1. Push (or skip, if already present) the file blob.
+//  2. Idempotently ensure a "version" manifest exists tagged with
+//     RepoFile.OwningTag. The version manifest carries no layers — it is
+//     a constant-size anchor that file manifests reference via their
+//     subject field.
+//  3. Pack and push a "file" manifest whose single layer is the blob and
+//     whose subject is the version manifest. The file manifest is not
+//     tagged; it is addressed via the referrers API.
+//
+// This eliminates the read-modify-write cycle the legacy aggregated-manifest
+// flow performed on every file, and lets concurrent uploads to the same
+// version proceed independently — there is no shared mutable state between
+// them.
 //
 // AddFile picks one of two upload paths per call:
 //
@@ -241,7 +235,7 @@ func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag str
 // Transfer-Encoding), AddFile peeks up to uploadMemThreshold+1 bytes to
 // decide.
 //
-// Other behaviour is identical between paths:
+// Behaviour shared between paths:
 //
 //   - If RepoFile.Digest is set and disagrees with the digest computed
 //     from the body, AddFile returns ErrDigestMismatch. On the buffered
@@ -251,16 +245,42 @@ func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag str
 //   - If a layer with the same digest already exists in the backend, the
 //     blob upload is skipped (buffered path) or the registry deduplicates
 //     on commit (streaming path).
-//   - If the file is unchanged in the manifest for RepoFile.OwningTag,
-//     the manifest is left untouched. Otherwise the manifest is repacked
-//     and re-tagged.
+//   - The file manifest digest is deterministic for a given (blob,
+//     filename, version) tuple, so re-adding identical content does not
+//     re-push the manifest either — the Exists check inside
+//     packAndPushManifest short-circuits.
+//   - If RepoFile.OwningTag currently resolves to an alias manifest
+//     (artifactType ≠ versionArtifactType), AddFile returns
+//     ErrAliasCollision rather than silently overwriting the alias.
 func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
-	if strings.HasPrefix(f.OwningTag, "ref_") {
-		return nil, fmt.Errorf("canonical tag cannot be prefixed with ref_; got %q", f.OwningTag)
+	if f.OwningTag == "" {
+		return nil, fmt.Errorf("OwningTag must be set")
 	}
 
+	blobDesc, backend, err := r.uploadBlob(ctx, f, ro)
+	if err != nil {
+		return nil, err
+	}
+
+	versionDesc, err := r.ensureVersionManifest(ctx, backend, f.OwningTag)
+	if err != nil {
+		return nil, err
+	}
+
+	fileManifestDesc, err := r.pushFileManifest(ctx, backend, blobDesc, f.Name, versionDesc)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FileDescriptor{Manifest: fileManifestDesc, File: blobDesc}, nil
+}
+
+// uploadBlob picks between the buffered and streaming push paths and
+// returns the resulting blob descriptor along with the backend handle the
+// caller should reuse for subsequent manifest writes.
+func (r *Registry) uploadBlob(ctx context.Context, f *RepoFile, ro io.Reader) (ocispec.Descriptor, destRepo, error) {
 	if r.disableStreamingPush {
-		return r.addFileBuffered(ctx, f, ro)
+		return r.uploadBlobBuffered(ctx, f, ro)
 	}
 
 	// Fast path: when the caller knows the body length up front (typically
@@ -270,9 +290,9 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 	// the streaming path — a meaningful waste at high concurrency.
 	if f.Size > 0 {
 		if f.Size > r.uploadMemThreshold {
-			return r.addFileStreaming(ctx, f, ro)
+			return r.uploadBlobStreaming(ctx, f, ro)
 		}
-		return r.addFileBuffered(ctx, f, ro)
+		return r.uploadBlobBuffered(ctx, f, ro)
 	}
 
 	// Unknown size: peek up to memThreshold+1 bytes so we can decide
@@ -282,129 +302,566 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 	// path consumes the head and the rest of `ro` in order.
 	head, full, err := bufferUploadHead(ro, r.uploadMemThreshold)
 	if err != nil {
-		return nil, err
+		return ocispec.Descriptor{}, nil, err
 	}
 	if full {
-		return r.addFileBuffered(ctx, f, bytes.NewReader(head))
+		return r.uploadBlobBuffered(ctx, f, bytes.NewReader(head))
 	}
-	return r.addFileStreaming(ctx, f, io.MultiReader(bytes.NewReader(head), ro))
+	return r.uploadBlobStreaming(ctx, f, io.MultiReader(bytes.NewReader(head), ro))
 }
 
-// addFileBuffered is the existing pre-#38 upload path: stage into memory or
-// (above the threshold) a single temp file, then monolithic Push. It is
-// preserved for the disable-streaming opt-out and as the small-body fast
-// path.
-func (r *Registry) addFileBuffered(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
+func (r *Registry) uploadBlobBuffered(ctx context.Context, f *RepoFile, ro io.Reader) (ocispec.Descriptor, destRepo, error) {
 	staged, err := stageUploadWithThreshold(ro, r.uploadMemThreshold)
 	if err != nil {
-		return nil, err
+		return ocispec.Descriptor{}, nil, err
 	}
 	defer staged.cleanup()
 
 	if f.Digest != "" {
 		expected, err := digest.Parse(f.Digest)
 		if err != nil {
-			return nil, fmt.Errorf("invalid expected digest %q: %w", f.Digest, err)
+			return ocispec.Descriptor{}, nil, fmt.Errorf("invalid expected digest %q: %w", f.Digest, err)
 		}
 		if expected != staged.digest {
-			return nil, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, staged.digest, expected)
+			return ocispec.Descriptor{}, nil, fmt.Errorf("%w: %q != %q", ErrDigestMismatch, staged.digest, expected)
 		}
 	}
 
-	fileDesc := ocispec.Descriptor{
-		MediaType: detectFileMediaType(f),
-		Digest:    staged.digest,
-		Size:      staged.size,
-		Annotations: map[string]string{
-			FileNameAnnotation:      f.Name,
-			ocispec.AnnotationTitle: f.Name,
-		},
+	blobDesc := newBlobDescriptor(f, staged.digest, staged.size)
+
+	backend, err := r.newBackendFunc(ctx, f)
+	if err != nil {
+		return ocispec.Descriptor{}, nil, err
 	}
 
-	backendRepo, err := r.newBackendFunc(ctx, f)
+	exists, err := backend.Exists(ctx, blobDesc)
 	if err != nil {
-		return nil, err
-	}
-
-	exists, err := backendRepo.Exists(ctx, fileDesc)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if file blob exists: %w", err)
+		return ocispec.Descriptor{}, nil, fmt.Errorf("failed to check if file blob exists: %w", err)
 	}
 	if !exists {
 		blobReader, err := staged.reader()
 		if err != nil {
-			return nil, err
+			return ocispec.Descriptor{}, nil, err
 		}
-		if err := backendRepo.Push(ctx, fileDesc, blobReader); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
-			return nil, fmt.Errorf("failed to push file blob: %w", err)
+		if err := backend.Push(ctx, blobDesc, blobReader); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+			return ocispec.Descriptor{}, nil, fmt.Errorf("failed to push file blob: %w", err)
 		}
 	}
 
-	return r.finishManifest(ctx, backendRepo, f, fileDesc)
+	return blobDesc, backend, nil
 }
 
-// addFileStreaming pushes the blob via chunked PATCH (no in-process
-// buffering) and then runs the same manifest update path as the buffered
-// flow. The streaming pusher computes the digest as bytes flow through it,
-// so f.Digest is checked only after PATCHes complete — see streamPusher.Push
-// for the exact ordering.
-func (r *Registry) addFileStreaming(ctx context.Context, f *RepoFile, body io.Reader) (*FileDescriptor, error) {
+func (r *Registry) uploadBlobStreaming(ctx context.Context, f *RepoFile, body io.Reader) (ocispec.Descriptor, destRepo, error) {
 	pusher, err := r.newStreamPusherFunc(ctx, f)
 	if err != nil {
-		return nil, fmt.Errorf("failed to construct streaming pusher: %w", err)
+		return ocispec.Descriptor{}, nil, fmt.Errorf("failed to construct streaming pusher: %w", err)
 	}
 
 	mediaType := detectFileMediaType(f)
-	desc, err := pusher.Push(ctx, mediaType, f.Digest, body)
+	pushedDesc, err := pusher.Push(ctx, mediaType, f.Digest, body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stream file blob: %w", err)
+		return ocispec.Descriptor{}, nil, fmt.Errorf("failed to stream file blob: %w", err)
 	}
 
-	fileDesc := ocispec.Descriptor{
-		MediaType: mediaType,
-		Digest:    desc.Digest,
-		Size:      desc.Size,
+	blobDesc := newBlobDescriptor(f, pushedDesc.Digest, pushedDesc.Size)
+
+	backend, err := r.newBackendFunc(ctx, f)
+	if err != nil {
+		return ocispec.Descriptor{}, nil, err
+	}
+	return blobDesc, backend, nil
+}
+
+// newBlobDescriptor builds the layer descriptor we store in the file
+// manifest. Annotations carry both the spec-defined image-title and the
+// ocifactory-private FileNameAnnotation; downstream callers that already
+// look up by FileNameAnnotation continue to work unchanged.
+func newBlobDescriptor(f *RepoFile, dgst digest.Digest, size int64) ocispec.Descriptor {
+	return ocispec.Descriptor{
+		MediaType: detectFileMediaType(f),
+		Digest:    dgst,
+		Size:      size,
 		Annotations: map[string]string{
 			FileNameAnnotation:      f.Name,
 			ocispec.AnnotationTitle: f.Name,
 		},
 	}
-
-	backendRepo, err := r.newBackendFunc(ctx, f)
-	if err != nil {
-		return nil, err
-	}
-	return r.finishManifest(ctx, backendRepo, f, fileDesc)
 }
 
-// finishManifest performs the read-modify-write step on the OwningTag
-// manifest after a blob push has completed. Shared between both upload
-// paths so the manifest semantics stay identical.
-func (r *Registry) finishManifest(ctx context.Context, backendRepo destRepo, f *RepoFile, fileDesc ocispec.Descriptor) (*FileDescriptor, error) {
-	manifestDesc, err := backendRepo.Resolve(ctx, f.OwningTag)
-	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		return nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", f.OwningTag, err)
+// ensureVersionManifest resolves owningTag to a version manifest, creating
+// one if it doesn't yet exist. If the tag already resolves to a manifest
+// with an incompatible artifactType (typically an alias), it returns
+// ErrAliasCollision. Idempotent: concurrent callers all converge on the
+// same content-addressed manifest digest.
+func (r *Registry) ensureVersionManifest(ctx context.Context, backend destRepo, owningTag string) (ocispec.Descriptor, error) {
+	if existing, err := backend.Resolve(ctx, owningTag); err == nil {
+		aType, err := manifestArtifactType(ctx, backend, existing)
+		if err != nil {
+			return ocispec.Descriptor{}, fmt.Errorf("failed to inspect tag %q: %w", owningTag, err)
+		}
+		switch aType {
+		case r.versionArtifactType:
+			return existing, nil
+		case r.aliasArtifactType:
+			return ocispec.Descriptor{}, fmt.Errorf("%w: tag %q is an alias", ErrAliasCollision, owningTag)
+		default:
+			return ocispec.Descriptor{}, fmt.Errorf("%w: tag %q has artifactType %q (expected %q)", ErrAliasCollision, owningTag, aType, r.versionArtifactType)
+		}
+	} else if !errors.Is(err, errdef.ErrNotFound) {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to resolve version tag %q: %w", owningTag, err)
 	}
 
-	layers, err := manifestLayers(ctx, backendRepo, manifestDesc)
+	desc, err := packAndPushManifest(ctx, backend, r.versionArtifactType, nil, nil, nil)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to push version manifest for %q: %w", owningTag, err)
+	}
+	if err := backend.Tag(ctx, desc, owningTag); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to tag version manifest %q: %w", owningTag, err)
+	}
+	return desc, nil
+}
+
+// pushFileManifest packs a file manifest with subject = versionDesc, single
+// layer = blobDesc, and the file's name + blob digest mirrored into manifest
+// annotations so the referrers index reflects them without an extra fetch.
+func (r *Registry) pushFileManifest(ctx context.Context, backend destRepo, blobDesc ocispec.Descriptor, fileName string, versionDesc ocispec.Descriptor) (ocispec.Descriptor, error) {
+	annotations := map[string]string{
+		FileNameAnnotation:      fileName,
+		ocispec.AnnotationTitle: fileName,
+		FileDigestAnnotation:    blobDesc.Digest.String(),
+	}
+	desc, err := packAndPushManifest(ctx, backend, r.fileArtifactType, []ocispec.Descriptor{blobDesc}, &versionDesc, annotations)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to push file manifest for %q: %w", fileName, err)
+	}
+	return desc, nil
+}
+
+// ReadFile reads a file by either OwningTag or RefTag. With OwningTag, the
+// version manifest is resolved directly and its file referrers are scanned
+// for a name match. With RefTag, the alias manifest is resolved first, its
+// subject followed to the canonical version manifest, and the same scan
+// runs from there.
+func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, io.ReadCloser, error) {
+	if f.OwningTag == "" && f.RefTag == "" {
+		return nil, nil, fmt.Errorf("either OwningTag or RefTag must be set")
+	}
+
+	backend, err := r.newBackendFunc(ctx, f)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	versionDesc, err := r.resolveVersionDescriptor(ctx, backend, f)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	refs, err := registry.Referrers(ctx, backend, versionDesc, r.fileArtifactType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list file referrers: %w", err)
+	}
+
+	for i := range refs {
+		if refs[i].Annotations[FileNameAnnotation] != f.Name {
+			continue
+		}
+		fileManifestDesc := refs[i]
+		blobDesc, err := fetchBlobDescriptor(ctx, backend, fileManifestDesc)
+		if err != nil {
+			return nil, nil, err
+		}
+		if f.Digest != "" && string(blobDesc.Digest) != f.Digest {
+			return nil, nil, fmt.Errorf("file digest mismatch: %q != %q", blobDesc.Digest, f.Digest)
+		}
+		rc, err := backend.Fetch(ctx, blobDesc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to fetch file blob: %w", err)
+		}
+		return &FileDescriptor{Manifest: fileManifestDesc, File: blobDesc}, rc, nil
+	}
+
+	return nil, nil, fmt.Errorf("file %q not found in version: %w", f.Name, errdef.ErrNotFound)
+}
+
+// resolveVersionDescriptor turns a RepoFile (which may identify the version
+// directly via OwningTag or indirectly via RefTag) into the descriptor of
+// the canonical version manifest. The RefTag path follows the alias
+// manifest's subject field.
+func (r *Registry) resolveVersionDescriptor(ctx context.Context, backend destRepo, f *RepoFile) (ocispec.Descriptor, error) {
+	if f.OwningTag != "" {
+		desc, err := backend.Resolve(ctx, f.OwningTag)
+		if err != nil {
+			return ocispec.Descriptor{}, fmt.Errorf("failed to resolve version tag %q: %w", f.OwningTag, err)
+		}
+		return desc, nil
+	}
+
+	aliasDesc, err := backend.Resolve(ctx, f.RefTag)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to resolve alias tag %q: %w", f.RefTag, err)
+	}
+	var aliasManifest ocispec.Manifest
+	if err := fetchManifestJSON(ctx, backend, aliasDesc, &aliasManifest); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to fetch alias manifest %q: %w", f.RefTag, err)
+	}
+	if aliasManifest.ArtifactType != r.aliasArtifactType {
+		return ocispec.Descriptor{}, fmt.Errorf("%w: tag %q has artifactType %q (expected %q)", ErrAliasCollision, f.RefTag, aliasManifest.ArtifactType, r.aliasArtifactType)
+	}
+	if aliasManifest.Subject == nil {
+		return ocispec.Descriptor{}, fmt.Errorf("alias manifest %q has no subject", f.RefTag)
+	}
+	return *aliasManifest.Subject, nil
+}
+
+// ListTags lists the tags for a repository. Both canonical version tags
+// and alias tags are returned in the same flat list — the legacy ref_
+// prefix filter is gone. Callers that need version-vs-alias discrimination
+// should use a sibling helper (added when first needed; the current
+// in-tree caller is python's "index" repo, which has no aliases).
+func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) {
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
 	if err != nil {
 		return nil, err
 	}
-	updated, layers := upsertFileLayer(layers, fileDesc)
-	if !updated { // No need to update the manifest if the file hasn't changed.
-		return &FileDescriptor{Manifest: manifestDesc, File: fileDesc}, nil
-	}
+	return registry.Tags(ctx, backend)
+}
 
-	packOpts := oras.PackManifestOptions{Layers: layers}
-	newManifestDesc, err := oras.PackManifest(ctx, backendRepo, oras.PackManifestVersion1_1, r.artifactType, packOpts)
+// ListFiles enumerates all files across all canonical versions in repo.
+// Aliases are skipped by checking each tag's manifest artifactType so the
+// same file isn't reported twice. The blob digest comes from the
+// FileDigestAnnotation we mirror on the file manifest, avoiding a fetch
+// per file.
+func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack new manifest: %w", err)
-	}
-	if err := backendRepo.Tag(ctx, newManifestDesc, f.OwningTag); err != nil {
-		return nil, fmt.Errorf("failed to tag new manifest: %w", err)
+		return nil, err
 	}
 
-	return &FileDescriptor{Manifest: newManifestDesc, File: fileDesc}, nil
+	tags, err := registry.Tags(ctx, backend)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tags: %w", err)
+	}
+
+	var files []*RepoFile
+	for _, tag := range tags {
+		versionDesc, err := backend.Resolve(ctx, tag)
+		if err != nil {
+			if errors.Is(err, errdef.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to resolve tag %q: %w", tag, err)
+		}
+		aType, err := manifestArtifactType(ctx, backend, versionDesc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect tag %q: %w", tag, err)
+		}
+		if aType != r.versionArtifactType {
+			// Alias or unrelated manifest — skip.
+			continue
+		}
+		refs, err := registry.Referrers(ctx, backend, versionDesc, r.fileArtifactType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list referrers for %q: %w", tag, err)
+		}
+		for _, ref := range refs {
+			name := ref.Annotations[FileNameAnnotation]
+			if name == "" {
+				continue
+			}
+			files = append(files, &RepoFile{
+				Name:       name,
+				OwningRepo: repo,
+				OwningTag:  tag,
+				Digest:     ref.Annotations[FileDigestAnnotation],
+			})
+		}
+	}
+
+	return files, nil
+}
+
+// AppendRefs creates one alias manifest per ref name, each with subject =
+// the canonical version manifest and tagged with the ref name. Concurrent
+// AppendRefs calls for the same ref are resolved by the registry's tag
+// namespace (last writer wins on the Tag write); orphaned previous alias
+// manifests are best-effort cleaned up.
+//
+// If a ref name already exists as a non-alias tag (e.g. there's a
+// canonical version literally named "latest"), AppendRefs returns
+// ErrAliasCollision rather than overwriting it.
+func (r *Registry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+
+	versionDesc, err := backend.Resolve(ctx, canonicalTag)
+	if err != nil {
+		return fmt.Errorf("failed to resolve canonical tag %q: %w", canonicalTag, err)
+	}
+	// Defence in depth: refuse to alias something that isn't a version
+	// manifest. Stops a stray AppendRefs("packageRoot", "anAlias") from
+	// pointing aliases at random manifests we didn't author.
+	if aType, err := manifestArtifactType(ctx, backend, versionDesc); err != nil {
+		return fmt.Errorf("failed to inspect canonical tag %q: %w", canonicalTag, err)
+	} else if aType != r.versionArtifactType {
+		return fmt.Errorf("%w: canonical tag %q has artifactType %q (expected %q)", ErrAliasCollision, canonicalTag, aType, r.versionArtifactType)
+	}
+
+	for _, ref := range refs {
+		var oldAlias ocispec.Descriptor
+		hasOld := false
+		if existing, err := backend.Resolve(ctx, ref); err == nil {
+			aType, err := manifestArtifactType(ctx, backend, existing)
+			if err != nil {
+				return fmt.Errorf("failed to inspect tag %q: %w", ref, err)
+			}
+			if aType != r.aliasArtifactType {
+				return fmt.Errorf("%w: tag %q has artifactType %q (expected alias)", ErrAliasCollision, ref, aType)
+			}
+			oldAlias = existing
+			hasOld = true
+		} else if !errors.Is(err, errdef.ErrNotFound) {
+			return fmt.Errorf("failed to resolve tag %q: %w", ref, err)
+		}
+
+		annotations := map[string]string{
+			AliasTargetAnnotation: canonicalTag,
+		}
+		aliasDesc, err := packAndPushManifest(ctx, backend, r.aliasArtifactType, nil, &versionDesc, annotations)
+		if err != nil {
+			return fmt.Errorf("failed to push alias manifest %q: %w", ref, err)
+		}
+		if err := backend.Tag(ctx, aliasDesc, ref); err != nil {
+			return fmt.Errorf("failed to tag alias %q: %w", ref, err)
+		}
+		// Best-effort cleanup of the old alias manifest if it had a
+		// different digest. Failure here is non-fatal — the orphan stays
+		// discoverable via the version's referrers list until backend GC
+		// reaps it, but the live tag points at the new alias regardless.
+		if hasOld && oldAlias.Digest != aliasDesc.Digest {
+			_ = backend.Delete(ctx, oldAlias)
+		}
+	}
+
+	return nil
+}
+
+// DeleteTagFiles deletes every file under a canonical version tag, then
+// the version manifest itself. Alias manifests pointing at the version
+// are left alone — callers that want them gone should AppendRefs to a new
+// target first or call DeleteRepoFiles.
+//
+// If tag resolves to a non-version manifest, only that manifest is
+// deleted (treated as deleting the alias). The caller can chain a second
+// call to drop the underlying version.
+func (r *Registry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+	return r.deleteTagFiles(ctx, backend, tag)
+}
+
+func (r *Registry) deleteTagFiles(ctx context.Context, backend destRepo, tag string) error {
+	desc, err := backend.Resolve(ctx, tag)
+	if err != nil {
+		return fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)
+	}
+
+	aType, err := manifestArtifactType(ctx, backend, desc)
+	if err != nil {
+		return fmt.Errorf("failed to inspect tag %q: %w", tag, err)
+	}
+
+	if aType == r.versionArtifactType {
+		// Best-effort: enumerate all referrers (file manifests + any alias
+		// manifests still pointing here) and delete them before the
+		// version manifest itself, so the on-backend graph is left clean.
+		refs, err := registry.Referrers(ctx, backend, desc, "")
+		if err != nil {
+			return fmt.Errorf("failed to list referrers for tag %q: %w", tag, err)
+		}
+		for _, ref := range refs {
+			if err := backend.Delete(ctx, ref); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+				return fmt.Errorf("failed to delete referrer %s: %w", ref.Digest, err)
+			}
+		}
+	}
+
+	if err := backend.Delete(ctx, desc); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		return fmt.Errorf("failed to delete manifest for tag %q: %w", tag, err)
+	}
+	return nil
+}
+
+// DeleteRepoFiles deletes every canonical version (and its files) in a
+// repository. Aliases are dropped as a side effect of DeleteTagFiles
+// reaping referrers.
+func (r *Registry) DeleteRepoFiles(ctx context.Context, repo string) error {
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return err
+	}
+
+	tags, err := registry.Tags(ctx, backend)
+	if err != nil {
+		return fmt.Errorf("failed to list tags: %w", err)
+	}
+
+	for _, tag := range tags {
+		// Resolve and skip anything that isn't a version manifest — alias
+		// manifests are already deleted as referrers when we delete their
+		// version (above), so iterating over them again would either
+		// double-delete (harmless) or, if some are still live because
+		// their target version is gone, blow up the loop ordering. Just
+		// scope deletion to versions and let backend GC tidy the rest.
+		desc, err := backend.Resolve(ctx, tag)
+		if err != nil {
+			if errors.Is(err, errdef.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("failed to resolve tag %q: %w", tag, err)
+		}
+		aType, err := manifestArtifactType(ctx, backend, desc)
+		if err != nil {
+			return fmt.Errorf("failed to inspect tag %q: %w", tag, err)
+		}
+		if aType != r.versionArtifactType {
+			continue
+		}
+		if err := r.deleteTagFiles(ctx, backend, tag); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// packAndPushManifest builds a deterministic OCI image manifest, checks
+// existence in the backend, and pushes it only when missing. Determinism
+// matters: identical (artifactType, layers, subject, annotations) inputs
+// must produce identical manifest digests so re-runs of AddFile /
+// AppendRefs short-circuit at the Exists check rather than re-pushing
+// the same bytes.
+//
+// We avoid oras.PackManifest on this path because it auto-injects the
+// org.opencontainers.image.created annotation with a fresh timestamp,
+// which would defeat content-addressed dedup. Instead we marshal the
+// manifest ourselves and let json.Marshal's stable map-key ordering
+// produce reproducible bytes.
+func packAndPushManifest(
+	ctx context.Context,
+	target destRepo,
+	artifactType string,
+	layers []ocispec.Descriptor,
+	subject *ocispec.Descriptor,
+	annotations map[string]string,
+) (ocispec.Descriptor, error) {
+	emptyDesc := ocispec.DescriptorEmptyJSON
+
+	if err := pushIfMissing(ctx, target, emptyDesc, emptyDesc.Data); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to push empty config blob: %w", err)
+	}
+
+	if len(layers) == 0 {
+		// image-spec v1.1 requires at least one layer; reuse the empty
+		// blob as a constant-size sentinel for version and alias
+		// manifests that semantically have none.
+		layers = []ocispec.Descriptor{emptyDesc}
+	}
+
+	manifest := ocispec.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: artifactType,
+		Config:       emptyDesc,
+		Layers:       layers,
+		Subject:      subject,
+		Annotations:  annotations,
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to marshal manifest: %w", err)
+	}
+	desc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageManifest, body)
+	desc.ArtifactType = artifactType
+	desc.Annotations = annotations
+
+	if err := pushIfMissing(ctx, target, desc, body); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to push manifest: %w", err)
+	}
+	return desc, nil
+}
+
+// pushIfMissing pushes data only if the backend doesn't already have the
+// described content. Wraps the Exists/Push pair so the manifest dedup path
+// reads cleanly. ErrAlreadyExists from a concurrent push is swallowed —
+// we only care that the content is there at the end.
+func pushIfMissing(ctx context.Context, target destRepo, desc ocispec.Descriptor, data []byte) error {
+	exists, err := target.Exists(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("exists check: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if err := target.Push(ctx, desc, bytes.NewReader(data)); err != nil && !errors.Is(err, errdef.ErrAlreadyExists) {
+		return err
+	}
+	return nil
+}
+
+// manifestArtifactType fetches a manifest's body and returns its
+// artifactType field. Used by ensureVersionManifest, AppendRefs, and
+// ListFiles to discriminate version manifests from alias manifests
+// without relying on tag-name conventions. Exists at the cost of one
+// extra GET per discriminated tag — acceptable because no current code
+// path discriminates inside a tight loop on a hot read path.
+func manifestArtifactType(ctx context.Context, backend destRepo, desc ocispec.Descriptor) (string, error) {
+	if desc.ArtifactType != "" {
+		return desc.ArtifactType, nil
+	}
+	var m ocispec.Manifest
+	if err := fetchManifestJSON(ctx, backend, desc, &m); err != nil {
+		return "", err
+	}
+	return m.ArtifactType, nil
+}
+
+// fetchManifestJSON fetches and decodes a manifest body. The descriptor
+// must point at a manifest, not a generic blob — there is no media-type
+// guard here because every caller already knows what kind of manifest it
+// is asking for.
+func fetchManifestJSON(ctx context.Context, backend destRepo, desc ocispec.Descriptor, out *ocispec.Manifest) error {
+	rc, err := backend.Fetch(ctx, desc)
+	if err != nil {
+		return fmt.Errorf("failed to fetch manifest %s: %w", desc.Digest, err)
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("failed to read manifest %s: %w", desc.Digest, err)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("failed to parse manifest %s: %w", desc.Digest, err)
+	}
+	return nil
+}
+
+// fetchBlobDescriptor returns the single layer descriptor of a file
+// manifest. ReadFile uses it to translate "I want file X under version
+// Y" into "fetch this blob digest".
+func fetchBlobDescriptor(ctx context.Context, backend destRepo, fileManifestDesc ocispec.Descriptor) (ocispec.Descriptor, error) {
+	var m ocispec.Manifest
+	if err := fetchManifestJSON(ctx, backend, fileManifestDesc, &m); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to fetch file manifest: %w", err)
+	}
+	if len(m.Layers) != 1 {
+		return ocispec.Descriptor{}, fmt.Errorf("file manifest %s has %d layers, expected 1", fileManifestDesc.Digest, len(m.Layers))
+	}
+	return m.Layers[0], nil
 }
 
 // bufferUploadHead reads up to threshold+1 bytes from r into memory. It
@@ -422,116 +879,6 @@ func bufferUploadHead(r io.Reader, threshold int64) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("failed to buffer upload head: %w", err)
 	}
 	return buf.Bytes(), n <= threshold, nil
-}
-
-// ReadFile reads a file from the registry.
-// Returns the file descriptor and a reader for the file.
-// It's allowed to use a ref tag to read a file. Set it in the RepoFile.RefTag field.
-func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, io.ReadCloser, error) {
-	if f.OwningTag == "" && f.RefTag == "" {
-		return nil, nil, fmt.Errorf("either OwningTag or RefTag must be set")
-	}
-
-	t := f.OwningTag
-	if t == "" {
-		t = "ref_" + f.RefTag
-	}
-
-	backendRepo, err := r.newBackendFunc(ctx, f)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	manifestDesc, err := backendRepo.Resolve(ctx, t)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", t, err)
-	}
-
-	layers, err := manifestLayers(ctx, backendRepo, manifestDesc)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	for _, l := range layers {
-		if l.Annotations[FileNameAnnotation] == f.Name {
-			if f.Digest != "" && string(l.Digest) != f.Digest {
-				return nil, nil, fmt.Errorf("file digest mismatch: %q != %q", l.Digest, f.Digest)
-			}
-			rc, err := backendRepo.Fetch(ctx, l)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to fetch file: %w", err)
-			}
-			return &FileDescriptor{Manifest: manifestDesc, File: l}, rc, nil
-		}
-	}
-
-	return nil, nil, fmt.Errorf("file %q not found in manifest: %w", f.Name, errdef.ErrNotFound)
-}
-
-// ListTags lists the tags for a repository.
-func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) {
-	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
-	if err != nil {
-		return nil, err
-	}
-
-	return r.listTags(ctx, backendRepo)
-}
-
-func (r *Registry) listTags(ctx context.Context, backendRepo destRepo) ([]string, error) {
-	tags, err := registry.Tags(ctx, backendRepo)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list tags: %w", err)
-	}
-
-	var excludeRefs []string
-	for _, tag := range tags {
-		if !strings.HasPrefix(tag, "ref_") {
-			excludeRefs = append(excludeRefs, tag)
-		}
-	}
-
-	return excludeRefs, nil
-}
-
-// ListFiles lists the files in a repository.
-func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
-	backendRepo, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
-	if err != nil {
-		return nil, err
-	}
-
-	tags, err := r.listTags(ctx, backendRepo)
-	if err != nil {
-		return nil, err
-	}
-
-	var files []*RepoFile
-
-	for _, tag := range tags {
-		manifestDesc, err := backendRepo.Resolve(ctx, tag)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve manifest for tag %q: %w", tag, err)
-		}
-
-		layers, err := manifestLayers(ctx, backendRepo, manifestDesc)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get manifest layers: %w", err)
-		}
-
-		for _, l := range layers {
-			if l.Annotations != nil && l.Annotations[FileNameAnnotation] != "" {
-				files = append(files, &RepoFile{
-					Name:       l.Annotations[FileNameAnnotation],
-					OwningRepo: repo,
-					OwningTag:  tag,
-					Digest:     string(l.Digest),
-				})
-			}
-		}
-	}
-
-	return files, nil
 }
 
 // stagedUpload is the result of staging an upload body for a single push.
@@ -631,7 +978,15 @@ func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error
 		repo.Client = c
 	}
 
-	return repo, nil
+	return remoteRepo{Repository: repo}, nil
+}
+
+// remoteRepo adapts oras-go's *remote.Repository to our destRepo
+// interface. The wrapper exists only so the package compiles when oras-go
+// adds further methods that conflict with destRepo's surface; today it is
+// a thin pass-through.
+type remoteRepo struct {
+	*remote.Repository
 }
 
 // newStreamPusher constructs a streamPusher that talks directly to the
@@ -707,55 +1062,6 @@ type authCacheKey struct {
 	host     string
 	user     string
 	password string
-}
-
-// upsertFileLayer updates the layers list with the provided file descriptor.
-// If the file already exists in the layers list, it will be updated if the digest has changed.
-// Returns true if the file was added or updated, and the updated layers list.
-func upsertFileLayer(layers []ocispec.Descriptor, fileDesc ocispec.Descriptor) (bool, []ocispec.Descriptor) {
-	existingFileIdx := -1
-	for i, l := range layers {
-		if l.Annotations != nil && l.Annotations[FileNameAnnotation] == fileDesc.Annotations[FileNameAnnotation] {
-			existingFileIdx = i
-			break
-		}
-	}
-	if existingFileIdx != -1 {
-		// Update the layer if the digest has changed.
-		if layers[existingFileIdx].Digest != fileDesc.Digest {
-			layers[existingFileIdx] = fileDesc
-		} else {
-			return false, layers
-		}
-	} else {
-		// Add the layer if it doesn't exist.
-		layers = append(layers, fileDesc)
-	}
-	return true, layers
-}
-
-func manifestLayers(ctx context.Context, repo oras.Target, manifestDesc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-	var layers []ocispec.Descriptor
-	if manifestDesc.Digest != "" {
-		// Fetch the existing manifest
-		manifestReader, err := repo.Fetch(ctx, manifestDesc)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch manifest: %w", err)
-		}
-		defer manifestReader.Close()
-
-		manifestBytes, err := io.ReadAll(manifestReader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read manifest: %w", err)
-		}
-
-		var manifest ocispec.Manifest
-		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal manifest: %w", err)
-		}
-		layers = manifest.Layers
-	}
-	return layers, nil
 }
 
 func detectFileMediaType(f *RepoFile) string {
