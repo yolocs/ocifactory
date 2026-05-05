@@ -24,6 +24,7 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
+				authNone:       true,
 			},
 			wantErr: "",
 			wantRegistryURL: &url.URL{
@@ -36,6 +37,7 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
+				authNone:       true,
 			},
 			wantErr: "port is required",
 			wantRegistryURL: &url.URL{
@@ -48,6 +50,7 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:           "8080",
 				registryURLStr: "http://example.com",
+				authNone:       true,
 			},
 			wantErr: `repo-type "" is not supported`,
 			wantRegistryURL: &url.URL{
@@ -61,6 +64,7 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				registryURLStr: "http://example.com",
 				repoType:       "invalid",
+				authNone:       true,
 			},
 			wantErr: `repo-type "invalid" is not supported`,
 			wantRegistryURL: &url.URL{
@@ -73,6 +77,7 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:     "8080",
 				repoType: "maven",
+				authNone: true,
 			},
 			wantErr: "backend-registry is required",
 			// registryURL stays nil — Validate short-circuits before
@@ -84,6 +89,7 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "example.com",
+				authNone:       true,
 			},
 			wantErr: "",
 			wantRegistryURL: &url.URL{
@@ -97,12 +103,41 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "https://gar.example.com/project",
+				authNone:       true,
 			},
 			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "https",
 				Host:   "gar.example.com",
 				Path:   "/project",
+			},
+		},
+		{
+			name: "auth-config and disable-auth mutually exclusive",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "maven",
+				registryURLStr: "http://example.com",
+				authConfigPath: "/etc/auth.yaml",
+				authNone:       true,
+			},
+			wantErr: "mutually exclusive",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
+		},
+		{
+			name: "missing auth config and disable-auth not set",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "maven",
+				registryURLStr: "http://example.com",
+			},
+			wantErr: "either --auth-config or --disable-auth must be set",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
 			},
 		},
 	}
@@ -135,6 +170,8 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
 		{name: "backend-registry", flagName: "backend-registry"},
 		{name: "disable-streaming-push", flagName: "disable-streaming-push"},
+		{name: "auth-config", flagName: "auth-config"},
+		{name: "disable-auth", flagName: "disable-auth"},
 	}
 
 	for _, tc := range tests {

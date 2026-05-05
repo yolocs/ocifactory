@@ -11,9 +11,17 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yolocs/ocifactory/pkg/auth"
+	"github.com/yolocs/ocifactory/pkg/auth/chain"
+	// Importing oidc for the side effect of registering its
+	// "oidc" kind with the auth registry. The package's exported
+	// API isn't called from here; auth.Build resolves it through
+	// the registry lookup.
+	_ "github.com/yolocs/ocifactory/pkg/auth/oidc"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
+	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/metrics"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
@@ -33,6 +41,9 @@ type serveFlags struct {
 
 	enableMetrics bool
 	metricsPath   string
+
+	authConfigPath string
+	authNone       bool
 
 	registryURL *url.URL
 }
@@ -55,6 +66,12 @@ func (f *serveFlags) Validate() error {
 	if f.registryURLStr == "" {
 		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
 		return merr
+	}
+	if f.authConfigPath != "" && f.authNone {
+		merr = errors.Join(merr, fmt.Errorf("--auth-config and --disable-auth are mutually exclusive"))
+	}
+	if f.authConfigPath == "" && !f.authNone {
+		merr = errors.Join(merr, fmt.Errorf("either --auth-config or --disable-auth must be set"))
 	}
 	// Default to https when the user omits the scheme. Either way, parse
 	// unconditionally — the original code only assigned f.registryURL
@@ -112,6 +129,16 @@ func newServeCmd() *cobra.Command {
 		"Path on the main listener that serves Prometheus exposition. "+
 			"Operators wanting authn / network ACLs on metrics should "+
 			"front this with their own reverse proxy.")
+	cmd.Flags().StringVar(&flags.authConfigPath, "auth-config", os.Getenv("OCIFACTORY_AUTH_CONFIG"),
+		"Path to a YAML auth config file. Each entry instantiates an "+
+			"authenticator and they are tried in the order listed. "+
+			"Built-in kinds: oidc. See docs/auth.md for the schema "+
+			"and for adding out-of-tree kinds. Mutually exclusive "+
+			"with --disable-auth.")
+	cmd.Flags().BoolVar(&flags.authNone, "disable-auth", false,
+		"Disable authentication entirely. Wires AlwaysAnonymous and "+
+			"logs a loud warning at startup. For local development "+
+			"against unauthenticated zot only — never use in production.")
 
 	return cmd
 }
@@ -125,6 +152,12 @@ func envOr(key, fallback string) string {
 
 func runServe(ctx context.Context, flags *serveFlags) error {
 	rec, metricsHandler := buildRecorder(flags.enableMetrics)
+
+	authn, err := buildAuthenticator(ctx, flags)
+	if err != nil {
+		return fmt.Errorf("failed to build authenticator: %w", err)
+	}
+	authMW := auth.Middleware(authn)
 
 	var (
 		h      http.Handler
@@ -145,7 +178,7 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(r)
+		mh, err := maven.NewHandler(r, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -158,7 +191,10 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(r, python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL))
+		ph, err := python.NewHandler(r,
+			python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL),
+			python.WithAuthMiddleware(authMW),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}
@@ -179,9 +215,14 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	}
 	h = handler.ObservabilityHandler(h, reg, metricsHandler, metricsPath)
 
+	// Auth middleware is NOT installed at the server level —
+	// each format handler chains it on its own router (or
+	// sub-router). This leaves /healthz, /readyz, /metrics and
+	// any future public-by-default routes ungated, and lets
+	// formats like npm split public reads from authenticated
+	// writes per route.
 	srv, err := handler.NewServer(
 		flags.port,
-		handler.PassThroughAuth,
 		handler.Loggeer,
 		handler.MetricsMiddleware(rec),
 	)
@@ -190,6 +231,40 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	}
 
 	return srv.Start(ctx, h)
+}
+
+// buildAuthenticator constructs the auth.Authenticator the server
+// installs in front of every protected route. Two sources:
+//
+//  1. --disable-auth: AlwaysAnonymous, with a loud warning. Local
+//     dev only.
+//  2. --auth-config: load the YAML, instantiate one authenticator
+//     per entry through the auth-kind registry, chain them in
+//     declaration order.
+//
+// Validate() refuses to run with neither flag set, so any other
+// branch is unreachable in production.
+//
+// The auth-kind registry (pkg/auth.RegisterKind) is what makes the
+// surface pluggable: importing oidc registers "oidc"; an
+// out-of-tree fork can side-effect-import its own kind.
+func buildAuthenticator(ctx context.Context, flags *serveFlags) (auth.Authenticator, error) {
+	logger := logging.NewFromEnv("OCIFACTORY_")
+	if flags.authNone {
+		logger.WarnContext(ctx, "AUTHENTICATION DISABLED — every request authenticates as anonymous. "+
+			"Do not use --disable-auth in production.")
+		return auth.AlwaysAnonymous, nil
+	}
+
+	cfg, err := auth.LoadConfigFile(flags.authConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	children, err := auth.Build(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return chain.New(children...), nil
 }
 
 // buildRecorder returns the metrics recorder and the http.Handler that

@@ -25,13 +25,15 @@ Design pillars (in priority order):
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
-| `pkg/cred` — Auth credential context | Done (basic auth only) |
+| `pkg/cred` — Backend OCI credential context | Carries Basic creds for backend HTTP client; populated by future backend cred provider |
+| `pkg/auth` — Pluggable frontend authentication (Authenticator, Subject, Chain, OIDC, kind registry) | Done, tested. OIDC-only — static passwords are out-of-tree by design. |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven` |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
 | Vulnerability scanning | Not started |
-| Authn/Authz beyond pass-through basic auth | Not started |
+| Authorization (per-repo, per-op policy) | Not started |
+| Backend credential provider (how ocifactory talks to GAR/ECR/zot) | Not started |
 | Dockerfile / deployment | Not started |
 | CI: lint, test, build, image publish | Only `go-test` from `abcxyz/pkg` |
 
@@ -45,8 +47,8 @@ HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)    │
                      ┌────────────▼────────────────────────┐
                      │  pkg/handler                         │
                      │  • Server (port + middleware chain)  │
-                     │  • PassThroughAuth, Logger,          │
-                     │    MetricsMiddleware                 │
+                     │  • Logger, MetricsMiddleware         │
+                     │  • auth.Middleware (pkg/auth)        │
                      │  • /healthz, /readyz, /metrics       │
                      └────────────┬────────────────────────┘
                                   │ http.Handler
@@ -167,11 +169,12 @@ These are non-negotiable. Apply them to every test in the repo:
 
 1. Create `pkg/handler/<format>/` with `handler.go`, the `Mux()`, and translation logic.
 2. Define `RepoType` and `ArtifactType` constants.
-3. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`.
-4. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum).
-5. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
-6. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations.
-7. Update the status table in this file.
+3. **Accept `WithAuthMiddleware(func(http.Handler) http.Handler)` as an Option** and chain the middleware on whichever routes need authentication. The convention today (python, maven) is `router.Use(mux.MiddlewareFunc(h.authMW))` on the root router so every route is gated. Public-by-default formats (npm registry root, Go module proxy listings) chain on a sub-router and leave reads ungated; outlier endpoints with their own auth contract (npm login bootstrap, Docker token server) sit on a sub-router that doesn't chain it at all. **Do not add an open default**: in `pkg/commands/serve.go`, always pass `WithAuthMiddleware(authMW)` when constructing the handler. The handler-side option is permissive (omitting it leaves routes ungated, which is what tests want), so the gate against silent-no-auth lives in serve.go — verify it's wired before merging.
+4. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Pass `WithAuthMiddleware(authMW)` (built earlier in `runServe`) to the handler constructor.
+5. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs.
+6. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
+7. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations.
+8. Update the status table in this file.
 
 ## Roadmap (one step at a time)
 
