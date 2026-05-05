@@ -1,12 +1,32 @@
 # Authentication
 
-ocifactory authenticates every inbound request through a chain of
+ocifactory authenticates inbound requests through a chain of
 **OIDC** authenticators — one per trusted issuer. The only
 credential ocifactory accepts is a verifiable token issued by an
 OIDC provider; static passwords are not supported.
 
-The chain is configured via a YAML file passed to `--auth-config`.
-No other process state is involved; reload by restarting.
+The auth chain is configured via a YAML file passed to
+`--auth-config`. No other process state is involved; reload by
+restarting.
+
+## Where auth runs
+
+`pkg/auth` is a library; the middleware it exposes
+(`auth.Middleware(authn)`) is **not** installed at the server
+level. Each format handler chains the middleware on its own
+router, so:
+
+- Observability endpoints (`/healthz`, `/readyz`, `/metrics`) are
+  reachable without auth — they're served before any format
+  handler runs.
+- Today both built-in formats (python, maven) gate every route
+  via `router.Use(authMW)` on their root router.
+- Future formats with a public/private route split (npm registry
+  reads, Go module proxy listings) can chain the middleware on a
+  sub-router and leave public routes ungated.
+- Outlier endpoints that need their own auth contract (e.g. an
+  npm login bootstrap that mints a token) sit on a sub-router
+  that doesn't `Use(authMW)`.
 
 > **Note**: ocifactory authenticates **clients** (callers of the
 > ocifactory HTTP API). It does **not** speak any authentication

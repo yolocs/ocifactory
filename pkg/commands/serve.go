@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
@@ -152,6 +153,12 @@ func envOr(key, fallback string) string {
 func runServe(ctx context.Context, flags *serveFlags) error {
 	rec, metricsHandler := buildRecorder(flags.enableMetrics)
 
+	authn, err := buildAuthenticator(ctx, flags)
+	if err != nil {
+		return fmt.Errorf("failed to build authenticator: %w", err)
+	}
+	authMW := mux.MiddlewareFunc(auth.Middleware(authn))
+
 	var (
 		h      http.Handler
 		reg    *oci.Registry
@@ -171,7 +178,7 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(r)
+		mh, err := maven.NewHandler(r, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -184,7 +191,10 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(r, python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL))
+		ph, err := python.NewHandler(r,
+			python.WithSimpleIndexCacheTTL(flags.simpleIndexCacheTTL),
+			python.WithAuthMiddleware(authMW),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}
@@ -205,15 +215,15 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	}
 	h = handler.ObservabilityHandler(h, reg, metricsHandler, metricsPath)
 
-	authn, err := buildAuthenticator(ctx, flags)
-	if err != nil {
-		return fmt.Errorf("failed to build authenticator: %w", err)
-	}
-
+	// Auth middleware is NOT installed at the server level —
+	// each format handler chains it on its own router (or
+	// sub-router). This leaves /healthz, /readyz, /metrics and
+	// any future public-by-default routes ungated, and lets
+	// formats like npm split public reads from authenticated
+	// writes per route.
 	srv, err := handler.NewServer(
 		flags.port,
 		handler.Loggeer,
-		auth.Middleware(authn),
 		handler.MetricsMiddleware(rec),
 	)
 	if err != nil {

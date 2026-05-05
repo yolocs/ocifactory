@@ -76,6 +76,7 @@ type Handler struct {
 	registry   handler.Registry
 	renderer   *renderer.Renderer
 	indexCache *simpleIndexCache
+	authMW     mux.MiddlewareFunc
 }
 
 // Option configures optional Handler behaviour.
@@ -83,6 +84,7 @@ type Option func(*handlerConfig)
 
 type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
+	authMW              mux.MiddlewareFunc
 }
 
 // WithSimpleIndexCacheTTL sets the per-package simple-index cache TTL.
@@ -91,6 +93,23 @@ type handlerConfig struct {
 func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
 	return func(c *handlerConfig) {
 		c.simpleIndexCacheTTL = ttl
+	}
+}
+
+// WithAuthMiddleware installs an authentication middleware on
+// every route the handler exposes. Pass nil (or omit the option)
+// to leave the routes ungated — the serve command never does that
+// in production, but tests use it to construct a handler without
+// dragging in pkg/auth.
+//
+// The python handler chains the middleware on its root router so
+// every PyPI route requires a verified Subject. Public-by-default
+// formats (npm registry root, future Go module proxy reads) will
+// take a different shape: chain on a sub-router, or accept a
+// per-route policy.
+func WithAuthMiddleware(mw mux.MiddlewareFunc) Option {
+	return func(c *handlerConfig) {
+		c.authMW = mw
 	}
 }
 
@@ -108,6 +127,7 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 		registry:   registry,
 		renderer:   r,
 		indexCache: newSimpleIndexCache(cfg.simpleIndexCacheTTL),
+		authMW:     cfg.authMW,
 	}, nil
 }
 
@@ -124,6 +144,12 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
 	router.Use(mux.MiddlewareFunc(handler.RouteNameOpMiddleware))
+	if h.authMW != nil {
+		// Authentication gates every PyPI route. Public-read
+		// deployments would split this into sub-routers; for
+		// the python format every endpoint is private.
+		router.Use(h.authMW)
+	}
 
 	// Handle both pip and twine operations
 	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
