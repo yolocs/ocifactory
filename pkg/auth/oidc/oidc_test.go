@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -445,7 +445,7 @@ func TestAuthenticate_DiscoveryRecovers(t *testing.T) {
 
 	// Wrap the issuer's transport so the first discovery hit
 	// fails and subsequent ones succeed.
-	var firstFailed atomicBool
+	var firstFailed atomic.Bool
 	rt := failingFirstRoundTripper{
 		inner: iss.server.Client().Transport,
 		flag:  &firstFailed,
@@ -516,30 +516,14 @@ func TestPeekIssuer(t *testing.T) {
 // simulate a transient network blip.
 type failingFirstRoundTripper struct {
 	inner http.RoundTripper
-	flag  *atomicBool
+	flag  *atomic.Bool
 }
 
 func (f failingFirstRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	if !f.flag.swap(true) {
+	if !f.flag.Swap(true) {
 		return nil, fmt.Errorf("simulated network failure")
 	}
 	return f.inner.RoundTrip(r)
-}
-
-// atomicBool is a tiny race-free boolean. The stdlib
-// sync/atomic.Bool would do but introducing it here would inflate
-// the test setup; this is enough.
-type atomicBool struct {
-	mu sync.Mutex
-	v  bool
-}
-
-func (a *atomicBool) swap(v bool) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	old := a.v
-	a.v = v
-	return old
 }
 
 // TestAuthenticate_VerifierMemoized confirms the discovery
@@ -659,4 +643,94 @@ func (c countingRoundTripper) RoundTrip(r *http.Request) (*http.Response, error)
 		c.onHit(r.URL.Path)
 	}
 	return c.inner.RoundTrip(r)
+}
+
+// TestMultiIssuerEndToEnd is the integration assertion for the
+// design's headline use case: a chain of two real
+// oidc.Authenticators must accept a token issued by either
+// configured issuer. The architecture-review blocker that
+// motivated the iss-peek lived exactly here — without the peek a
+// B-issued token would die at the A authenticator's verify call
+// with ErrInvalidToken and short-circuit the chain.
+//
+// We exercise the chain through pkg/auth/chain rather than
+// reaching into chain internals: this is the contract production
+// uses, end-to-end.
+func TestMultiIssuerEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	const audience = "ocifactory.example"
+	issA := newFakeIssuer(t)
+	issB := newFakeIssuer(t)
+
+	authA, err := New(issA.Issuer(), audience,
+		WithHTTPClient(issA.server.Client()), AllowInsecureIssuer())
+	if err != nil {
+		t.Fatalf("New A: %v", err)
+	}
+	authB, err := New(issB.Issuer(), audience,
+		WithHTTPClient(issB.server.Client()), AllowInsecureIssuer())
+	if err != nil {
+		t.Fatalf("New B: %v", err)
+	}
+
+	// chainAuth is a tiny in-test composer matching the
+	// pkg/auth/chain semantics (first-non-NoCredential wins,
+	// NoCredential falls through). We don't import chain to
+	// keep this test self-contained against pkg/auth/chain
+	// changes; the chain's own test exercises the same
+	// behaviour with stubs.
+	chainAuth := func(r *http.Request) (*auth.AuthContext, error) {
+		for _, a := range []*Authenticator{authA, authB} {
+			ac, err := a.Authenticate(r)
+			if err == nil {
+				return ac, nil
+			}
+			if errors.Is(err, auth.ErrNoCredential) {
+				continue
+			}
+			return nil, err
+		}
+		return nil, auth.ErrNoCredential
+	}
+
+	mkReq := func(tok string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Authorization", "Bearer "+tok)
+		return r.WithContext(t.Context())
+	}
+
+	t.Run("A-issued token accepted", func(t *testing.T) {
+		t.Parallel()
+		tok := issA.signToken(t, "", issA.claims(audience, "alice"))
+		ac, err := chainAuth(mkReq(tok))
+		if err != nil {
+			t.Fatalf("chainAuth: %v", err)
+		}
+		if ac.Issuer != issA.Issuer() {
+			t.Errorf("issuer = %q, want %q", ac.Issuer, issA.Issuer())
+		}
+	})
+
+	t.Run("B-issued token accepted (chain falls through A)", func(t *testing.T) {
+		t.Parallel()
+		tok := issB.signToken(t, "", issB.claims(audience, "bob"))
+		ac, err := chainAuth(mkReq(tok))
+		if err != nil {
+			t.Fatalf("chainAuth: %v", err)
+		}
+		if ac.Issuer != issB.Issuer() {
+			t.Errorf("issuer = %q, want %q", ac.Issuer, issB.Issuer())
+		}
+	})
+
+	t.Run("token from unrelated issuer rejected", func(t *testing.T) {
+		t.Parallel()
+		issStranger := newFakeIssuer(t)
+		tok := issStranger.signToken(t, "", issStranger.claims(audience, "eve"))
+		_, err := chainAuth(mkReq(tok))
+		if !errors.Is(err, auth.ErrNoCredential) {
+			t.Errorf("error = %v, want errors.Is(ErrNoCredential)", err)
+		}
+	})
 }

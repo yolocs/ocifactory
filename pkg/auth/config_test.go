@@ -124,7 +124,7 @@ func TestLoadConfigFile(t *testing.T) {
 			}
 			gotKinds := make([]string, 0, len(got.Authenticators))
 			for i := range got.Authenticators {
-				gotKinds = append(gotKinds, got.Authenticators[i].Kind())
+				gotKinds = append(gotKinds, got.Authenticators[i].Kind)
 			}
 			if diff := cmp.Diff(tc.wantKinds, gotKinds); diff != "" {
 				t.Errorf("kinds mismatch (-want +got):\n%s", diff)

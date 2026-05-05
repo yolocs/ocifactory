@@ -26,34 +26,36 @@ type FileSchema struct {
 	Authenticators []AuthenticatorSpec `yaml:"authenticators"`
 }
 
-// AuthenticatorSpec is one entry in the auth-config file. It
-// captures the raw YAML node so each kind's factory can decode
-// implementation-specific fields without this package having to
-// know about them.
+// AuthenticatorSpec is one entry in the auth-config file. Kind
+// selects which factory handles the entry; the rest of the YAML
+// node is captured raw so each factory can decode its own shape
+// without this package having to know about it.
 //
 // This makes the schema extensible: an out-of-tree authenticator
 // (a static-password kind, GitHub PAT validator, mTLS, ...) only
 // needs to RegisterKind a factory in init() and operators add
 // `kind: <name>` entries to their YAML.
 type AuthenticatorSpec struct {
+	Kind string
+
+	// node holds the original YAML mapping for Decode. Not
+	// exported because the consumer interface is Decode(v).
 	node yaml.Node
 }
 
-// UnmarshalYAML captures the entire mapping node so factories can
-// decode their own shape.
+// UnmarshalYAML pulls Kind out of the mapping (so the registry
+// lookup in Build doesn't need to re-decode) and stores the whole
+// node so factories can read their own fields via Decode.
 func (s *AuthenticatorSpec) UnmarshalYAML(value *yaml.Node) error {
 	s.node = *value
-	return nil
-}
-
-// Kind returns the value of the spec's `kind` field, or "" if
-// missing.
-func (s *AuthenticatorSpec) Kind() string {
 	var k struct {
 		Kind string `yaml:"kind"`
 	}
-	_ = s.node.Decode(&k)
-	return k.Kind
+	if err := value.Decode(&k); err != nil {
+		return err
+	}
+	s.Kind = k.Kind
+	return nil
 }
 
 // Decode unmarshals the spec into v. Factories call this with
@@ -125,7 +127,7 @@ func LoadConfigFile(path string) (*FileSchema, error) {
 		return nil, fmt.Errorf("auth: %q: no authenticators configured", path)
 	}
 	for i, a := range s.Authenticators {
-		if a.Kind() == "" {
+		if a.Kind == "" {
 			return nil, fmt.Errorf("auth: authenticators[%d]: kind is required", i)
 		}
 	}
@@ -138,17 +140,16 @@ func LoadConfigFile(path string) (*FileSchema, error) {
 func Build(cfg *FileSchema) ([]Authenticator, error) {
 	out := make([]Authenticator, 0, len(cfg.Authenticators))
 	for i, spec := range cfg.Authenticators {
-		kind := spec.Kind()
 		registryMu.RLock()
-		f, ok := registry[kind]
+		f, ok := registry[spec.Kind]
 		registryMu.RUnlock()
 		if !ok {
 			return nil, fmt.Errorf("auth: authenticators[%d]: unknown kind %q (registered: %v)",
-				i, kind, RegisteredKinds())
+				i, spec.Kind, RegisteredKinds())
 		}
 		a, err := f(spec)
 		if err != nil {
-			return nil, fmt.Errorf("auth: authenticators[%d] (%s): %w", i, kind, err)
+			return nil, fmt.Errorf("auth: authenticators[%d] (%s): %w", i, spec.Kind, err)
 		}
 		out = append(out, a)
 	}

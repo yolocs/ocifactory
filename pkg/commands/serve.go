@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/spf13/cobra"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
@@ -132,9 +131,10 @@ func newServeCmd() *cobra.Command {
 			"front this with their own reverse proxy.")
 	cmd.Flags().StringVar(&flags.authConfigPath, "auth-config", os.Getenv("OCIFACTORY_AUTH_CONFIG"),
 		"Path to a YAML auth config file. Each entry instantiates an "+
-			"authenticator (oidc, basictoken) and they are tried in "+
-			"the order listed. See docs/auth.md for the schema. "+
-			"Mutually exclusive with --disable-auth.")
+			"authenticator and they are tried in the order listed. "+
+			"Built-in kinds: oidc. See docs/auth.md for the schema "+
+			"and for adding out-of-tree kinds. Mutually exclusive "+
+			"with --disable-auth.")
 	cmd.Flags().BoolVar(&flags.authNone, "disable-auth", false,
 		"Disable authentication entirely. Wires AlwaysAnonymous and "+
 			"logs a loud warning at startup. For local development "+
@@ -157,7 +157,7 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 	if err != nil {
 		return fmt.Errorf("failed to build authenticator: %w", err)
 	}
-	authMW := mux.MiddlewareFunc(auth.Middleware(authn))
+	authMW := auth.Middleware(authn)
 
 	var (
 		h      http.Handler

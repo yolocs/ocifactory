@@ -76,7 +76,7 @@ type Handler struct {
 	registry   handler.Registry
 	renderer   *renderer.Renderer
 	indexCache *simpleIndexCache
-	authMW     mux.MiddlewareFunc
+	authMW     func(http.Handler) http.Handler
 }
 
 // Option configures optional Handler behaviour.
@@ -84,7 +84,7 @@ type Option func(*handlerConfig)
 
 type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
-	authMW              mux.MiddlewareFunc
+	authMW              func(http.Handler) http.Handler
 }
 
 // WithSimpleIndexCacheTTL sets the per-package simple-index cache TTL.
@@ -107,7 +107,7 @@ func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
 // formats (npm registry root, future Go module proxy reads) will
 // take a different shape: chain on a sub-router, or accept a
 // per-route policy.
-func WithAuthMiddleware(mw mux.MiddlewareFunc) Option {
+func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	return func(c *handlerConfig) {
 		c.authMW = mw
 	}
@@ -148,7 +148,7 @@ func (h *Handler) Mux() http.Handler {
 		// Authentication gates every PyPI route. Public-read
 		// deployments would split this into sub-routers; for
 		// the python format every endpoint is private.
-		router.Use(h.authMW)
+		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
 	// Handle both pip and twine operations

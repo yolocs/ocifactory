@@ -36,6 +36,22 @@ const defaultHTTPTimeout = 10 * time.Second
 // discovery docs are <2 KiB) so legitimate issuers never trip it.
 const maxDiscoveryBytes = 1 << 20 // 1 MiB
 
+// maxJWTBytes is the largest token peekIssuer will inspect before
+// rejecting outright. JWTs of this size are pathological: a real
+// Google ID token is ~1 KiB, a GitHub Actions OIDC token ~2 KiB.
+// The cap exists to keep the unauthenticated-request path from
+// turning into a per-request CPU/memory pressure vector when an
+// attacker streams oversized Bearer values within Go's default
+// MaxHeaderBytes.
+const maxJWTBytes = 8 * 1024
+
+// supportedSigningAlgs pins the asymmetric algorithms the verifier
+// will accept. Pinning closes the door on a malicious discovery
+// document advertising a symmetric alg (e.g. HS256) wired to a
+// JWKS the attacker controls. RS256 + ES256 covers what every real
+// public OIDC issuer uses today.
+var supportedSigningAlgs = []string{"RS256", "ES256"}
+
 // Authenticator is an auth.Authenticator that verifies OIDC ID
 // tokens against one trusted issuer. Discovery (and JWKS fetch)
 // happens lazily on the first request — initialisation failure
@@ -156,6 +172,10 @@ func (a *Authenticator) ensureVerifier(ctx context.Context) (*gooidc.IDTokenVeri
 		SkipExpiryCheck:            false,
 		SkipIssuerCheck:            false,
 		InsecureSkipSignatureCheck: false,
+		// Pin the algorithm allowlist so a malicious
+		// discovery doc can't advertise (e.g.) HS256 paired
+		// with a JWKS the attacker controls.
+		SupportedSigningAlgs: supportedSigningAlgs,
 	})
 	return a.verifier, nil
 }
@@ -236,6 +256,9 @@ func (a *Authenticator) Authenticate(r *http.Request) (*auth.AuthContext, error)
 // that as "not my problem" and returns ErrNoCredential so the
 // chain keeps going.
 func peekIssuer(rawJWT string) (string, error) {
+	if len(rawJWT) > maxJWTBytes {
+		return "", fmt.Errorf("token exceeds %d bytes", maxJWTBytes)
+	}
 	parts := strings.Split(rawJWT, ".")
 	if len(parts) != 3 {
 		return "", errors.New("not a JWT")

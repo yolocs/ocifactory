@@ -1,4 +1,4 @@
-package python
+package maven
 
 import (
 	"net/http"
@@ -9,11 +9,10 @@ import (
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// TestMux_AuthGating wires a python handler with an auth
+// TestMux_AuthGating wires a maven handler with an auth
 // middleware that always 401s and confirms every route hits the
-// gate (i.e. the handler itself is NOT reached). This is the
-// happy-case proof that WithAuthMiddleware actually chains the
-// middleware on the python router.
+// gate. Mirrors the python equivalent — symmetric plumbing must
+// have symmetric tests.
 func TestMux_AuthGating(t *testing.T) {
 	t.Parallel()
 
@@ -35,10 +34,10 @@ func TestMux_AuthGating(t *testing.T) {
 		method string
 		path   string
 	}{
-		{name: "simple index", method: http.MethodGet, path: "/simple/"},
-		{name: "package index", method: http.MethodGet, path: "/simple/foo/"},
-		{name: "file get", method: http.MethodGet, path: "/packages/foo/1.0/foo-1.0.tar.gz"},
-		{name: "upload", method: http.MethodPost, path: "/"},
+		{name: "archetype catalog", method: http.MethodGet, path: "/archetype-catalog.xml"},
+		{name: "snapshot metadata", method: http.MethodGet, path: "/com/example/foo/1.0-SNAPSHOT/maven-metadata.xml"},
+		{name: "release metadata", method: http.MethodGet, path: "/com/example/foo/maven-metadata.xml"},
+		{name: "regular artifact", method: http.MethodPut, path: "/com/example/foo/1.0/foo-1.0.jar"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,8 +53,10 @@ func TestMux_AuthGating(t *testing.T) {
 }
 
 // TestMux_NoAuthMiddleware confirms that omitting WithAuthMiddleware
-// leaves the handler ungated — the default useful for tests that
-// don't care about auth and for future public-by-default formats.
+// leaves the handler ungated. Default useful for tests; production
+// wiring (cmd/ocifactory serve) always supplies a middleware. The
+// AGENTS.md rule for adding new format handlers reminds authors
+// to plumb WithAuthMiddleware on the serve.go side.
 func TestMux_NoAuthMiddleware(t *testing.T) {
 	t.Parallel()
 
@@ -66,7 +67,7 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 	}
 	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/archetype-catalog.xml", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, r)
 	if got := w.Code; got == http.StatusUnauthorized {
@@ -74,16 +75,13 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 	}
 }
 
-// TestMux_AuthChainsBeforeHandler proves the order: the auth
-// middleware sees the request before the format handler runs.
-// Confirms the AuthContext is on the context by the time the route's
-// handler is invoked.
+// TestMux_AuthChainsBeforeHandler proves the middleware sees the
+// request before any maven route handler runs.
 func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	t.Parallel()
 
-	const wantIssuer = "test-issuer"
 	installer := auth.Middleware(auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
-		return &auth.AuthContext{Issuer: wantIssuer, ID: "u"}, nil
+		return &auth.AuthContext{Issuer: "test-issuer", ID: "u"}, nil
 	}))
 
 	reg := oci.NewFakeRegistry()
@@ -93,12 +91,9 @@ func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	}
 	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/archetype-catalog.xml", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, r)
-	// The simple index handler returns 200 on an empty index;
-	// what we care about is the auth middleware was invoked
-	// without short-circuiting.
 	if w.Code == http.StatusUnauthorized || w.Code == http.StatusServiceUnavailable {
 		t.Errorf("status = %d; auth middleware unexpectedly rejected the request", w.Code)
 	}

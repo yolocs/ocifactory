@@ -47,20 +47,20 @@ var (
 
 type Handler struct {
 	registry handler.Registry
-	authMW   mux.MiddlewareFunc
+	authMW   func(http.Handler) http.Handler
 }
 
 // Option configures optional Handler behaviour.
 type Option func(*handlerConfig)
 
 type handlerConfig struct {
-	authMW mux.MiddlewareFunc
+	authMW func(http.Handler) http.Handler
 }
 
 // WithAuthMiddleware installs an authentication middleware on
 // every Maven route. Pass nil (or omit) to leave routes ungated;
 // production wiring always supplies a middleware.
-func WithAuthMiddleware(mw mux.MiddlewareFunc) Option {
+func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	return func(c *handlerConfig) {
 		c.authMW = mw
 	}
@@ -79,7 +79,7 @@ func (h *Handler) Mux() http.Handler {
 	if h.authMW != nil {
 		// Maven's whole route surface is private — every
 		// route requires a verified AuthContext.
-		router.Use(h.authMW)
+		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
 	// 1. Archetype Catalog
