@@ -261,7 +261,7 @@ func TestAuthenticate_HappyPaths(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Authenticate: %v", err)
 			}
-			want := &auth.Subject{
+			want := &auth.AuthContext{
 				Issuer: iss.Issuer(),
 				ID:     "subject-123",
 				Email:  tc.wantEmail,
@@ -588,7 +588,7 @@ func TestAuthenticate_VerifierMemoized(t *testing.T) {
 // constructed. Without this, every iat/exp comparison would fail
 // even though the values round-trip correctly.
 func claimsCmp() cmp.Option {
-	return cmp.Comparer(func(a, b *auth.Subject) bool {
+	return cmp.Comparer(func(a, b *auth.AuthContext) bool {
 		if a == nil || b == nil {
 			return a == b
 		}

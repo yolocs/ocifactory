@@ -77,14 +77,14 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 
 // TestMux_AuthChainsBeforeHandler proves the order: the auth
 // middleware sees the request before the format handler runs.
-// Confirms the Subject is on the context by the time the route's
+// Confirms the AuthContext is on the context by the time the route's
 // handler is invoked.
 func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	t.Parallel()
 
 	const wantIssuer = "test-issuer"
-	installer := auth.Middleware(auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
-		return &auth.Subject{Issuer: wantIssuer, ID: "u"}, nil
+	installer := auth.Middleware(auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
+		return &auth.AuthContext{Issuer: wantIssuer, ID: "u"}, nil
 	}))
 
 	reg := oci.NewFakeRegistry()

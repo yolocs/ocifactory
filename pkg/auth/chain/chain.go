@@ -2,9 +2,9 @@
 // child is tried in order; the first non-ErrNoCredential result
 // wins.
 //
-// Lets operators stack [oidc(google), oidc(github), basictoken] —
-// the OIDC verifiers see Bearer / sentinel-Basic, the basictoken
-// implementation sees regular Basic.
+// The canonical use is stacking multiple OIDC issuers, e.g.
+// [oidc(google), oidc(github)]. Out-of-tree authenticators slot
+// in the same way.
 package chain
 
 import (
@@ -47,11 +47,11 @@ func New(children ...auth.Authenticator) *Chain {
 //
 // When every child returns ErrNoCredential the chain returns
 // ErrNoCredential too. An empty chain behaves the same.
-func (c *Chain) Authenticate(r *http.Request) (*auth.Subject, error) {
+func (c *Chain) Authenticate(r *http.Request) (*auth.AuthContext, error) {
 	for i, child := range c.children {
-		subj, err := child.Authenticate(r)
+		ac, err := child.Authenticate(r)
 		if err == nil {
-			return subj, nil
+			return ac, nil
 		}
 		if errors.Is(err, auth.ErrNoCredential) {
 			continue

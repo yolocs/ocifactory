@@ -13,14 +13,14 @@ func TestSubjectContext(t *testing.T) {
 
 	tests := []struct {
 		name string
-		set  *Subject
-		want *Subject
+		set  *AuthContext
+		want *AuthContext
 		ok   bool
 	}{
 		{
 			name: "round trip",
-			set:  &Subject{Issuer: "https://example.com", ID: "abc"},
-			want: &Subject{Issuer: "https://example.com", ID: "abc"},
+			set:  &AuthContext{Issuer: "https://example.com", ID: "abc"},
+			want: &AuthContext{Issuer: "https://example.com", ID: "abc"},
 			ok:   true,
 		},
 		{
@@ -37,20 +37,20 @@ func TestSubjectContext(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			ctx := WithSubject(t.Context(), tc.set)
-			got, ok := SubjectFromContext(ctx)
+			ctx := WithAuthContext(t.Context(), tc.set)
+			got, ok := FromContext(ctx)
 			if ok != tc.ok {
-				t.Errorf("SubjectFromContext ok = %v, want %v", ok, tc.ok)
+				t.Errorf("FromContext ok = %v, want %v", ok, tc.ok)
 			}
 			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("SubjectFromContext mismatch (-want +got):\n%s", diff)
+				t.Errorf("FromContext mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 
 	t.Run("missing", func(t *testing.T) {
 		t.Parallel()
-		got, ok := SubjectFromContext(t.Context())
+		got, ok := FromContext(t.Context())
 		if ok {
 			t.Errorf("expected ok=false on empty context, got %v", got)
 		}
@@ -65,7 +65,7 @@ func TestAlwaysAnonymous(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AlwaysAnonymous error = %v", err)
 	}
-	want := &Subject{Issuer: "anonymous", ID: "anonymous"}
+	want := &AuthContext{Issuer: "anonymous", ID: "anonymous"}
 	if diff := cmp.Diff(want, subj); diff != "" {
 		t.Errorf("AlwaysAnonymous subject mismatch (-want +got):\n%s", diff)
 	}

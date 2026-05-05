@@ -181,7 +181,7 @@ func (a *Authenticator) ensureVerifier(ctx context.Context) (*gooidc.IDTokenVeri
 //   - auth.ErrInvalidToken on signature, audience, expiry, or
 //     not-yet-valid failures, OR on a malformed JWT that we can't
 //     even peek.
-func (a *Authenticator) Authenticate(r *http.Request) (*auth.Subject, error) {
+func (a *Authenticator) Authenticate(r *http.Request) (*auth.AuthContext, error) {
 	rawToken, ok := auth.ExtractOIDCToken(r)
 	if !ok {
 		return nil, auth.ErrNoCredential
@@ -214,7 +214,7 @@ func (a *Authenticator) Authenticate(r *http.Request) (*auth.Subject, error) {
 		return nil, fmt.Errorf("%w: claims decode: %w", auth.ErrInvalidToken, err)
 	}
 
-	subj := &auth.Subject{
+	subj := &auth.AuthContext{
 		Issuer: idToken.Issuer,
 		ID:     idToken.Subject,
 		Claims: claims,

@@ -13,7 +13,7 @@ import (
 const Realm = "ocifactory"
 
 // Middleware returns an http.Handler middleware that runs a on
-// every inbound request, installs the resulting Subject on the
+// every inbound request, installs the resulting AuthContext on the
 // request context, and rejects unauthenticated requests with a 401
 // (or 503 when the issuer is unavailable).
 //
@@ -25,25 +25,25 @@ func Middleware(a Authenticator) func(http.Handler) http.Handler {
 		// Wired with no authenticator means "deny everything",
 		// not "allow everything". The serve command must
 		// explicitly choose AlwaysAnonymous to opt out of authn.
-		a = AuthenticatorFunc(func(*http.Request) (*Subject, error) {
+		a = AuthenticatorFunc(func(*http.Request) (*AuthContext, error) {
 			return nil, ErrNoCredential
 		})
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			subject, err := a.Authenticate(r)
+			ac, err := a.Authenticate(r)
 			if err != nil {
 				writeAuthError(w, r, err)
 				return
 			}
-			if subject == nil {
+			if ac == nil {
 				// Defensive: an authenticator returning
 				// (nil, nil) is a contract violation but
 				// must not panic the server.
 				writeAuthError(w, r, ErrNoCredential)
 				return
 			}
-			r = r.WithContext(WithSubject(r.Context(), subject))
+			r = r.WithContext(WithAuthContext(r.Context(), ac))
 			next.ServeHTTP(w, r)
 		})
 	}

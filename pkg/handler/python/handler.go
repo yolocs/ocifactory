@@ -103,7 +103,7 @@ func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
 // dragging in pkg/auth.
 //
 // The python handler chains the middleware on its root router so
-// every PyPI route requires a verified Subject. Public-by-default
+// every PyPI route requires a verified AuthContext. Public-by-default
 // formats (npm registry root, future Go module proxy reads) will
 // take a different shape: chain on a sub-router, or accept a
 // per-route policy.

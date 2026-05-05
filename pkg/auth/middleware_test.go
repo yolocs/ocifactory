@@ -13,54 +13,54 @@ import (
 func TestMiddleware(t *testing.T) {
 	t.Parallel()
 
-	successSubject := &Subject{Issuer: "test", ID: "alice"}
+	successSubject := &AuthContext{Issuer: "test", ID: "alice"}
 
 	tests := []struct {
 		name           string
 		auth           Authenticator
 		wantStatus     int
 		wantWWWHeaders []string
-		wantSubject    *Subject
+		wantSubject    *AuthContext
 		wantBodyPart   string
 	}{
 		{
 			name:        "success",
-			auth:        AuthenticatorFunc(func(*http.Request) (*Subject, error) { return successSubject, nil }),
+			auth:        AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return successSubject, nil }),
 			wantStatus:  http.StatusOK,
 			wantSubject: successSubject,
 		},
 		{
 			name:           "no credential",
-			auth:           AuthenticatorFunc(func(*http.Request) (*Subject, error) { return nil, ErrNoCredential }),
+			auth:           AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return nil, ErrNoCredential }),
 			wantStatus:     http.StatusUnauthorized,
 			wantWWWHeaders: []string{`Bearer realm="ocifactory"`, `Basic realm="ocifactory"`},
 		},
 		{
 			name:           "invalid token",
-			auth:           AuthenticatorFunc(func(*http.Request) (*Subject, error) { return nil, ErrInvalidToken }),
+			auth:           AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return nil, ErrInvalidToken }),
 			wantStatus:     http.StatusUnauthorized,
 			wantWWWHeaders: []string{`Bearer realm="ocifactory"`, `Basic realm="ocifactory"`},
 		},
 		{
 			name:       "issuer unavailable",
-			auth:       AuthenticatorFunc(func(*http.Request) (*Subject, error) { return nil, ErrIssuerUnavailable }),
+			auth:       AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return nil, ErrIssuerUnavailable }),
 			wantStatus: http.StatusServiceUnavailable,
 		},
 		{
 			name: "wrapped issuer unavailable",
-			auth: AuthenticatorFunc(func(*http.Request) (*Subject, error) {
+			auth: AuthenticatorFunc(func(*http.Request) (*AuthContext, error) {
 				return nil, errors.Join(ErrIssuerUnavailable, errors.New("DNS"))
 			}),
 			wantStatus: http.StatusServiceUnavailable,
 		},
 		{
 			name:       "unexpected error",
-			auth:       AuthenticatorFunc(func(*http.Request) (*Subject, error) { return nil, errors.New("boom") }),
+			auth:       AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return nil, errors.New("boom") }),
 			wantStatus: http.StatusInternalServerError,
 		},
 		{
 			name:           "nil subject and nil error treated as no credential",
-			auth:           AuthenticatorFunc(func(*http.Request) (*Subject, error) { return nil, nil }),
+			auth:           AuthenticatorFunc(func(*http.Request) (*AuthContext, error) { return nil, nil }),
 			wantStatus:     http.StatusUnauthorized,
 			wantWWWHeaders: []string{`Bearer realm="ocifactory"`, `Basic realm="ocifactory"`},
 		},
@@ -74,9 +74,9 @@ func TestMiddleware(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			var seenSubject *Subject
+			var seenSubject *AuthContext
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if s, ok := SubjectFromContext(r.Context()); ok {
+				if s, ok := FromContext(r.Context()); ok {
 					seenSubject = s
 				}
 				w.WriteHeader(http.StatusOK)

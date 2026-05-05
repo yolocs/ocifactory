@@ -24,8 +24,8 @@ func (s *stubFactory) build(spec AuthenticatorSpec) (Authenticator, error) {
 	var raw map[string]any
 	_ = spec.Decode(&raw)
 	s.lastSpec = raw
-	return AuthenticatorFunc(func(*http.Request) (*Subject, error) {
-		return &Subject{Issuer: "stub", ID: "stub"}, nil
+	return AuthenticatorFunc(func(*http.Request) (*AuthContext, error) {
+		return &AuthContext{Issuer: "stub", ID: "stub"}, nil
 	}), nil
 }
 

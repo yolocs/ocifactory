@@ -78,7 +78,7 @@ func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
 	if h.authMW != nil {
 		// Maven's whole route surface is private — every
-		// route requires a verified Subject.
+		// route requires a verified AuthContext.
 		router.Use(h.authMW)
 	}
 

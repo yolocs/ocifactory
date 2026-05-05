@@ -1,9 +1,11 @@
 // Package auth defines the pluggable authentication surface for
 // ocifactory. Authenticators inspect an inbound *http.Request and
-// either return a *Subject (the verified caller identity) or one of
-// the sentinel errors so callers can map the failure mode to an HTTP
-// status. Concrete implementations live in sub-packages: chain, oidc,
-// basictoken.
+// either return an *AuthContext (the verified caller identity) or one
+// of the sentinel errors so callers can map the failure mode to an
+// HTTP status. The built-in OIDC implementation lives in the oidc
+// sub-package; the chain composer lives in chain. Out-of-tree
+// authenticators (static passwords, GitHub PAT, mTLS, ...) plug in
+// via the kind registry — see RegisterKind.
 package auth
 
 import (
@@ -13,7 +15,7 @@ import (
 )
 
 // Authenticator inspects a request and either resolves the caller
-// to a Subject or returns one of the sentinel errors so the
+// to a AuthContext or returns one of the sentinel errors so the
 // middleware can map the failure to a status code.
 //
 // Implementations MUST return ErrNoCredential when the request
@@ -22,24 +24,25 @@ import (
 // Hard errors (invalid token, unreachable JWKS) MUST be returned as
 // distinct error values so the middleware can return 401 vs 503.
 type Authenticator interface {
-	Authenticate(r *http.Request) (*Subject, error)
+	Authenticate(r *http.Request) (*AuthContext, error)
 }
 
-// Subject is the verified caller identity. It is what the
+// AuthContext is the verified caller identity. It is what the
 // authorizer (separate issue) consumes. Authenticators populate as
 // many fields as they can verify; consumers should treat absent
 // fields as "not asserted" rather than "asserted empty".
-type Subject struct {
+type AuthContext struct {
 	// Issuer identifies which authenticator vouched for the
 	// caller. For OIDC this is the iss claim
 	// ("https://accounts.google.com",
-	// "https://token.actions.githubusercontent.com"). For
-	// basictoken it is the literal "basictoken" so authorization
-	// policy can distinguish.
+	// "https://token.actions.githubusercontent.com"). Other
+	// authenticators set their own stable string so authorization
+	// policy can distinguish callers from different sources.
 	Issuer string
 
 	// ID is the stable subject identifier inside Issuer. For OIDC
-	// this is the sub claim. For basictoken it is the username.
+	// this is the sub claim. Other authenticators set whatever
+	// stable per-caller identifier they have.
 	ID string
 
 	// Email is the verified email address, when the issuer
@@ -49,9 +52,9 @@ type Subject struct {
 
 	// Claims is the raw verified claim set. For OIDC tokens it is
 	// the decoded JWT payload after signature, issuer, audience
-	// and lifetime checks have all passed. For non-JWT
-	// authenticators (basictoken) Claims may be nil or carry only
-	// authenticator-specific metadata.
+	// and lifetime checks have all passed. Non-JWT authenticators
+	// may leave it nil or fill it with implementation-specific
+	// metadata.
 	//
 	// Authorization policy reads Claims for fine-grained checks
 	// (GitHub Actions repo, Google email_verified, etc.).
@@ -84,38 +87,38 @@ var (
 // AuthenticatorFunc adapts a plain function to the Authenticator
 // interface. Useful in tests and for one-off authenticators that
 // don't carry state.
-type AuthenticatorFunc func(r *http.Request) (*Subject, error)
+type AuthenticatorFunc func(r *http.Request) (*AuthContext, error)
 
 // Authenticate calls f(r).
-func (f AuthenticatorFunc) Authenticate(r *http.Request) (*Subject, error) {
+func (f AuthenticatorFunc) Authenticate(r *http.Request) (*AuthContext, error) {
 	return f(r)
 }
 
 // AlwaysAnonymous is the dev-only authenticator wired up when the
 // operator runs with --auth=none or omits --auth-config. It returns
-// a Subject with Issuer="anonymous" and a fixed ID. Production
+// a AuthContext with Issuer="anonymous" and a fixed ID. Production
 // deployments must NOT use this — the serve command logs a loud
 // warning when it's in effect.
-var AlwaysAnonymous Authenticator = AuthenticatorFunc(func(_ *http.Request) (*Subject, error) {
-	return &Subject{Issuer: "anonymous", ID: "anonymous"}, nil
+var AlwaysAnonymous Authenticator = AuthenticatorFunc(func(_ *http.Request) (*AuthContext, error) {
+	return &AuthContext{Issuer: "anonymous", ID: "anonymous"}, nil
 })
 
 // contextKey is unexported to prevent collisions with other
 // packages' context values.
 type contextKey string
 
-const subjectKey contextKey = "subject"
+const authContextKey contextKey = "authcontext"
 
-// WithSubject stores s on ctx so downstream handlers can read the
-// authenticated identity via SubjectFromContext.
-func WithSubject(ctx context.Context, s *Subject) context.Context {
-	return context.WithValue(ctx, subjectKey, s)
+// WithAuthContext stores ac on ctx so downstream handlers can read the
+// authenticated identity via FromContext.
+func WithAuthContext(ctx context.Context, ac *AuthContext) context.Context {
+	return context.WithValue(ctx, authContextKey, ac)
 }
 
-// SubjectFromContext returns the Subject installed by the
-// middleware, if any. The boolean is false when no subject is
+// FromContext returns the AuthContext installed by the
+// middleware, if any. The boolean is false when no AuthContext is
 // present.
-func SubjectFromContext(ctx context.Context) (*Subject, bool) {
-	s, ok := ctx.Value(subjectKey).(*Subject)
-	return s, ok
+func FromContext(ctx context.Context) (*AuthContext, bool) {
+	ac, ok := ctx.Value(authContextKey).(*AuthContext)
+	return ac, ok
 }

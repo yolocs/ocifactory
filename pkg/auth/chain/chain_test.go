@@ -10,20 +10,20 @@ import (
 	"github.com/yolocs/ocifactory/pkg/auth"
 )
 
-func fixed(subj *auth.Subject, err error) auth.Authenticator {
-	return auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) { return subj, err })
+func fixed(subj *auth.AuthContext, err error) auth.Authenticator {
+	return auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) { return subj, err })
 }
 
 func TestChain_Authenticate(t *testing.T) {
 	t.Parallel()
 
-	subjA := &auth.Subject{Issuer: "a", ID: "a-user"}
-	subjB := &auth.Subject{Issuer: "b", ID: "b-user"}
+	subjA := &auth.AuthContext{Issuer: "a", ID: "a-user"}
+	subjB := &auth.AuthContext{Issuer: "b", ID: "b-user"}
 
 	tests := []struct {
 		name        string
 		children    []auth.Authenticator
-		wantSubject *auth.Subject
+		wantSubject *auth.AuthContext
 		wantErrIs   error
 	}{
 		{
@@ -113,13 +113,13 @@ func TestChain_Authenticate(t *testing.T) {
 func TestChain_MultiIssuerFallthrough(t *testing.T) {
 	t.Parallel()
 
-	issuerA := auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
+	issuerA := auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
 		// Pretends to be Google's authenticator: doesn't
 		// recognise this token's issuer, falls through.
 		return nil, auth.ErrNoCredential
 	})
-	issuerB := auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
-		return &auth.Subject{Issuer: "B", ID: "user"}, nil
+	issuerB := auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
+		return &auth.AuthContext{Issuer: "B", ID: "user"}, nil
 	})
 
 	c := New(issuerA, issuerB)
@@ -140,12 +140,12 @@ func TestChain_OrderingPreserved(t *testing.T) {
 
 	var calls []string
 	probe := func(name string, ret error) auth.Authenticator {
-		return auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
+		return auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
 			calls = append(calls, name)
 			if ret != nil {
 				return nil, ret
 			}
-			return &auth.Subject{Issuer: name}, nil
+			return &auth.AuthContext{Issuer: name}, nil
 		})
 	}
 
