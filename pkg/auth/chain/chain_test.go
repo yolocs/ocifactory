@@ -103,6 +103,35 @@ func TestChain_Authenticate(t *testing.T) {
 	}
 }
 
+// TestChain_MultiIssuerFallthrough is the integration assertion
+// for the multi-OIDC use case the auth design specifies:
+// [oidc(A), oidc(B)] must accept a B-issued token by skipping A.
+// The chain alone doesn't know how to peek issuers — that's
+// pkg/auth/oidc's responsibility — but the contract enforced
+// here (ErrNoCredential falls through, ErrInvalidToken
+// short-circuits) is what makes the dispatch work.
+func TestChain_MultiIssuerFallthrough(t *testing.T) {
+	t.Parallel()
+
+	issuerA := auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
+		// Pretends to be Google's authenticator: doesn't
+		// recognise this token's issuer, falls through.
+		return nil, auth.ErrNoCredential
+	})
+	issuerB := auth.AuthenticatorFunc(func(*http.Request) (*auth.Subject, error) {
+		return &auth.Subject{Issuer: "B", ID: "user"}, nil
+	})
+
+	c := New(issuerA, issuerB)
+	subj, err := c.Authenticate(httptest.NewRequest(http.MethodGet, "/", nil))
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if subj == nil || subj.Issuer != "B" {
+		t.Errorf("subject.Issuer = %v, want B", subj)
+	}
+}
+
 // TestChain_OrderingPreserved guarantees that callers can rely on the
 // declaration-order semantics — once a child accepts, no later child
 // runs. Two side-effecting children make the assertion trivial.

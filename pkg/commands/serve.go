@@ -12,9 +12,12 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yolocs/ocifactory/pkg/auth"
-	"github.com/yolocs/ocifactory/pkg/auth/basictoken"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
-	"github.com/yolocs/ocifactory/pkg/auth/oidc"
+	// Importing oidc for the side effect of registering its
+	// "oidc" kind with the auth registry. The package's exported
+	// API isn't called from here; auth.Build resolves it through
+	// the registry lookup.
+	_ "github.com/yolocs/ocifactory/pkg/auth/oidc"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
@@ -221,15 +224,20 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 }
 
 // buildAuthenticator constructs the auth.Authenticator the server
-// installs in front of every protected route. Three sources, in
-// precedence order:
+// installs in front of every protected route. Two sources:
 //
 //  1. --disable-auth: AlwaysAnonymous, with a loud warning. Local
 //     dev only.
 //  2. --auth-config: load the YAML, instantiate one authenticator
-//     per entry, chain them in declaration order.
-//  3. Otherwise Validate() refuses to run, so this branch is
-//     unreachable in production.
+//     per entry through the auth-kind registry, chain them in
+//     declaration order.
+//
+// Validate() refuses to run with neither flag set, so any other
+// branch is unreachable in production.
+//
+// The auth-kind registry (pkg/auth.RegisterKind) is what makes the
+// surface pluggable: importing oidc registers "oidc"; an
+// out-of-tree fork can side-effect-import its own kind.
 func buildAuthenticator(ctx context.Context, flags *serveFlags) (auth.Authenticator, error) {
 	logger := logging.NewFromEnv("OCIFACTORY_")
 	if flags.authNone {
@@ -242,26 +250,9 @@ func buildAuthenticator(ctx context.Context, flags *serveFlags) (auth.Authentica
 	if err != nil {
 		return nil, err
 	}
-
-	children := make([]auth.Authenticator, 0, len(cfg.Authenticators))
-	for i, spec := range cfg.Authenticators {
-		switch spec.Kind {
-		case "oidc":
-			a, err := oidc.New(spec.Issuer, spec.Audience)
-			if err != nil {
-				return nil, fmt.Errorf("authenticators[%d] (oidc): %w", i, err)
-			}
-			children = append(children, a)
-		case "basictoken":
-			a, err := basictoken.LoadFile(spec.File)
-			if err != nil {
-				return nil, fmt.Errorf("authenticators[%d] (basictoken): %w", i, err)
-			}
-			children = append(children, a)
-		default:
-			// LoadConfigFile already validates this; defensive.
-			return nil, fmt.Errorf("authenticators[%d]: unknown kind %q", i, spec.Kind)
-		}
+	children, err := auth.Build(cfg)
+	if err != nil {
+		return nil, err
 	}
 	return chain.New(children...), nil
 }

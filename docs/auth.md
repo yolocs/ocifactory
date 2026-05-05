@@ -1,12 +1,9 @@
 # Authentication
 
-ocifactory authenticates every inbound request through a pluggable
-chain of authenticators. Out of the box it ships:
-
-- **OIDC** — verify ID tokens issued by any RFC-7591 compliant
-  issuer. Worked examples below for Google and GitHub Actions.
-- **Basictoken** — static `(username, bcrypt-hashed-password)` list
-  for environments where OIDC isn't viable.
+ocifactory authenticates every inbound request through a chain of
+**OIDC** authenticators — one per trusted issuer. The only
+credential ocifactory accepts is a verifiable token issued by an
+OIDC provider; static passwords are not supported.
 
 The chain is configured via a YAML file passed to `--auth-config`.
 No other process state is involved; reload by restarting.
@@ -27,8 +24,6 @@ authenticators:
   - kind: oidc
     issuer: https://token.actions.githubusercontent.com
     audience: https://ocifactory.your-domain
-  - kind: basictoken
-    file: /etc/ocifactory/tokens.yaml
 ```
 
 Run with:
@@ -41,11 +36,13 @@ ocifactory serve \
   --port=8080
 ```
 
-Authenticators are tried in declaration order. The first one that
-recognises the request's credential format gets to verify it; if
-verification fails, the request is rejected (later authenticators
-don't get a second pass at a credential one of them already
-rejected).
+Authenticators are tried in declaration order. Each authenticator
+peeks the unverified `iss` claim of the incoming token; only the
+authenticator whose configured issuer matches will run full
+verification. Mismatched issuers fall through silently to the next
+authenticator. This is what lets a multi-issuer chain (Google +
+GitHub Actions + ...) accept tokens from any of its members
+without short-circuiting on the first one.
 
 ### Required vs optional
 
@@ -57,7 +54,7 @@ startup.
 
 ## How clients send credentials
 
-Two presentations are supported, in this order:
+Two presentations are supported:
 
 1. **`Authorization: Bearer <token>`** — preferred. Modern `pip`
    (twine), `npm`, and direct `curl` flows.
@@ -71,6 +68,9 @@ Two presentations are supported, in this order:
 
    When a request uses any of these sentinels, the `password`
    field is treated as an OIDC bearer token, not a password.
+
+A regular Basic header with a non-sentinel username (e.g.
+`alice:hunter2`) is rejected — there is no static-password path.
 
 ## Worked example: Google ID tokens
 
@@ -134,29 +134,64 @@ The structured `sub` is the strong point — once authorization
 lands (separate issue), policy can match on it precisely (e.g.
 "`repo:owner/repo:environment:prod` may publish to `myproject`").
 
-## Basictoken (static list)
+## Why no static passwords
 
-Tokens are stored as bcrypt hashes; plaintext is rejected at load
-time so a malformed config can't silently allow weaker auth.
+Static passwords are a recurring source of operational pain
+(rotation, sharing, leakage in logs and CI configs) and add a
+class of attack surface (offline cracking of the hash file,
+username enumeration via timing, etc.) that an OIDC-only design
+sidesteps.
 
-Generate hashes with `htpasswd -nbB` (Apache utils) or any bcrypt
-CLI:
+In 2026 every realistic ocifactory deployment has access to an
+OIDC issuer:
+- Cloud-issued: Google service accounts, GitHub Actions, AWS STS
+  via Workload Identity Federation, Azure AD.
+- Self-hosted: dex, keycloak, ory hydra, or even a tiny in-house
+  issuer that signs short-lived JWTs from a static key.
 
-```bash
-htpasswd -nbB -C 12 alice mypassword
-# alice:$2y$12$LkJ4FJ7yh3.f.../...
+Air-gapped or fully-offline deployments where no IDP exists at
+all can still run with `--disable-auth` behind a network ACL.
+
+## Adding your own authenticator (out-of-tree)
+
+The `Authenticator` interface and its YAML kind registry are
+public. To add an authenticator (static password, GitHub PAT,
+mTLS, anything else) without forking ocifactory:
+
+```go
+// example.com/ocifactory-myauth/myauth.go
+package myauth
+
+import (
+    "github.com/yolocs/ocifactory/pkg/auth"
+)
+
+func init() {
+    auth.RegisterKind("myauth", func(spec auth.AuthenticatorSpec) (auth.Authenticator, error) {
+        var cfg struct {
+            // ... your fields
+        }
+        if err := spec.Decode(&cfg); err != nil {
+            return nil, err
+        }
+        return newAuthenticator(cfg)
+    })
+}
 ```
 
-```yaml
-# /etc/ocifactory/tokens.yaml
-users:
-  alice: $2y$12$LkJ4FJ7yh3.f.../...
-  bob:   $2y$12$3NyXQbJ8ABCD.../...
+Then build a custom ocifactory binary that imports your package
+for side effects:
+
+```go
+// cmd/myocifactory/main.go
+import (
+    _ "example.com/ocifactory-myauth"
+    // ...
+)
 ```
 
-The sentinel usernames (`_oidc`, `oauth2accesstoken`, `_token`)
-are reserved and cannot appear in this file. Loading a config with
-any of them returns an error.
+Operators get a new `kind: myauth` they can put in their
+auth-config YAML.
 
 ## What's behind the load balancer
 
@@ -173,7 +208,9 @@ have callers use it when they request tokens.
 - **No credential** → `401 Unauthorized` with
   `WWW-Authenticate: Bearer realm="ocifactory"` and
   `WWW-Authenticate: Basic realm="ocifactory"`.
-- **Bad token** (signature / issuer / audience / expiry) →
+- **Wrong issuer / unparseable JWT** → falls through to the next
+  authenticator; if none accepts the request, `401 Unauthorized`.
+- **Wrong audience / expired / not-yet-valid / bad signature** →
   `401 Unauthorized`. Body is intentionally generic; details are
   in the server log at debug level.
 - **Issuer unreachable** (JWKS endpoint down, discovery doc
@@ -181,34 +218,8 @@ have callers use it when they request tokens.
   distinguish "your credential is bad" from "I can't even check
   your credential right now". JWKS state is cached after the first
   successful fetch; transient network blips don't kick everything
-  to 503.
-
-## Multi-issuer chains
-
-Stack as many `oidc` entries as you trust:
-
-```yaml
-authenticators:
-  - kind: oidc
-    issuer: https://accounts.google.com
-    audience: https://ocifactory.your-domain
-  - kind: oidc
-    issuer: https://token.actions.githubusercontent.com
-    audience: https://ocifactory.your-domain
-  - kind: basictoken
-    file: /etc/ocifactory/tokens.yaml
-```
-
-The chain's request-parsing semantics:
-
-- A Bearer header reaches each `oidc` authenticator in order; the
-  first one that accepts the issuer wins. If none does, the chain
-  returns 401.
-- A regular Basic header (non-sentinel username) skips every
-  `oidc` authenticator (they return `ErrNoCredential`) and lands
-  on `basictoken`.
-- A sentinel-Basic header (`_oidc:<token>`, etc.) is treated as a
-  Bearer presentation by `oidc` and ignored by `basictoken`.
+  to 503, and the next request after recovery succeeds (lazy
+  re-discovery on the failure path).
 
 ## What's out of scope (for now)
 
@@ -219,7 +230,9 @@ The chain's request-parsing semantics:
   zot. Tracked separately; today the backend must accept whatever
   identity the runtime provides (typically Cloud Run's service
   account against GAR).
-- **GitHub PATs / App tokens** — opaque, not OIDC. Future
-  authenticator.
+- **GitHub PATs / App tokens** — opaque, not OIDC. A future
+  authenticator could validate them via `api.github.com/user`,
+  but it has different perf characteristics; meanwhile the
+  out-of-tree pattern above is the supported path.
 - **Token revocation lists / introspection endpoints** — punt.
 - **Web UI / login flows** — API-only product.

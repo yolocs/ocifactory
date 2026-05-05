@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,6 +102,30 @@ func (f *fakeIssuer) signToken(t *testing.T, kid string, claims map[string]any) 
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: sk.key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", sk.kid),
+	)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	return raw
+}
+
+// signWithUnknownKey signs claims using an RSA key that is NOT
+// published in the issuer's JWKS, so the verifier rejects the
+// signature even though iss/aud/exp are otherwise valid. Used to
+// exercise the bad-signature failure path.
+func (f *fakeIssuer) signWithUnknownKey(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	stranger, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	signer, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: stranger},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "stranger-kid"),
 	)
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
@@ -220,7 +245,7 @@ func TestAuthenticate_HappyPaths(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()))
+			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()), AllowInsecureIssuer())
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -283,11 +308,27 @@ func TestAuthenticate_Failures(t *testing.T) {
 			wantErrIs: auth.ErrInvalidToken,
 		},
 		{
-			name: "wrong issuer",
+			// Wrong-iss is the multi-OIDC-chain case: the
+			// authenticator MUST return ErrNoCredential
+			// (not ErrInvalidToken) so chain dispatch can
+			// try the next configured issuer. See
+			// peekIssuer in oidc.go.
+			name: "wrong issuer falls through",
 			header: func(t *testing.T) string {
 				c := iss.claims(audience, "u")
 				c["iss"] = "https://attacker"
 				return "Bearer " + iss.signToken(t, "", c)
+			},
+			wantErrIs: auth.ErrNoCredential,
+		},
+		{
+			// Bad signature: iss matches, but the signing
+			// key isn't published in JWKS. Verifier
+			// rejects → ErrInvalidToken.
+			name: "bad signature",
+			header: func(t *testing.T) string {
+				c := iss.claims(audience, "u")
+				return "Bearer " + iss.signWithUnknownKey(t, c)
 			},
 			wantErrIs: auth.ErrInvalidToken,
 		},
@@ -311,18 +352,23 @@ func TestAuthenticate_Failures(t *testing.T) {
 			wantErrIs: auth.ErrInvalidToken,
 		},
 		{
+			// Garbage that isn't even parseable as a JWT
+			// (no `iss` to peek) → ErrNoCredential so the
+			// chain can give a later authenticator a
+			// chance. The middleware still emits 401 if
+			// nothing else accepts.
 			name: "garbage token",
 			header: func(t *testing.T) string {
 				return "Bearer not-a-jwt"
 			},
-			wantErrIs: auth.ErrInvalidToken,
+			wantErrIs: auth.ErrNoCredential,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()))
+			a, err := New(iss.Issuer(), audience, WithHTTPClient(iss.server.Client()), AllowInsecureIssuer())
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -344,18 +390,37 @@ func TestAuthenticate_Failures(t *testing.T) {
 // initialization path turns an unreachable issuer into
 // ErrIssuerUnavailable rather than ErrInvalidToken — the operator
 // can tell the difference between "credential is bad" and "I can't
-// even check this credential right now".
+// even check this credential right now". To reach the verifier the
+// presented token's iss must match the configured issuer (otherwise
+// the iss-peek short-circuits with ErrNoCredential before
+// discovery is even attempted), so the test signs a real token
+// against the unreachable issuer URL.
 func TestAuthenticate_DiscoveryFailureSurfaces503(t *testing.T) {
 	t.Parallel()
 
-	// Point at a port that is guaranteed not to answer.
-	a, err := New("http://127.0.0.1:1/issuer", "aud")
+	const issuerURL = "http://127.0.0.1:1/issuer"
+	a, err := New(issuerURL, "aud", AllowInsecureIssuer())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
+	// Mint a token whose iss matches the configured issuer.
+	// Signature won't matter because discovery never completes.
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	signer, _ := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.RS256, Key: priv},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "k"),
+	)
+	tok, _ := jwt.Signed(signer).Claims(map[string]any{
+		"iss": issuerURL,
+		"aud": "aud",
+		"sub": "u",
+		"exp": time.Now().Add(5 * time.Minute).Unix(),
+		"iat": time.Now().Unix(),
+	}).Serialize()
+
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.Header.Set("Authorization", "Bearer abc")
+	r.Header.Set("Authorization", "Bearer "+tok)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	r = r.WithContext(ctx)
@@ -364,6 +429,117 @@ func TestAuthenticate_DiscoveryFailureSurfaces503(t *testing.T) {
 	if !errors.Is(err, auth.ErrIssuerUnavailable) {
 		t.Errorf("error = %v, want errors.Is(ErrIssuerUnavailable)", err)
 	}
+}
+
+// TestAuthenticate_DiscoveryRecovers verifies that a transient
+// discovery failure does NOT poison the verifier — the next
+// request after the issuer comes back retries discovery and
+// succeeds. The design at oidc.go:ensureVerifier explicitly
+// requires this; without it a single boot-time blip would brick
+// auth until restart.
+func TestAuthenticate_DiscoveryRecovers(t *testing.T) {
+	t.Parallel()
+
+	iss := newFakeIssuer(t)
+	const audience = "ocifactory.example"
+
+	// Wrap the issuer's transport so the first discovery hit
+	// fails and subsequent ones succeed.
+	var firstFailed atomicBool
+	rt := failingFirstRoundTripper{
+		inner: iss.server.Client().Transport,
+		flag:  &firstFailed,
+	}
+	hc := &http.Client{Transport: rt}
+
+	a, err := New(iss.Issuer(), audience, WithHTTPClient(hc), AllowInsecureIssuer())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tok := iss.signToken(t, "", iss.claims(audience, "u"))
+	mkReq := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Authorization", "Bearer "+tok)
+		return r.WithContext(t.Context())
+	}
+
+	// First attempt: round tripper fails the discovery probe.
+	if _, err := a.Authenticate(mkReq()); !errors.Is(err, auth.ErrIssuerUnavailable) {
+		t.Fatalf("first attempt error = %v, want errors.Is(ErrIssuerUnavailable)", err)
+	}
+	// Second attempt: discovery succeeds, verifier built,
+	// token verifies.
+	if _, err := a.Authenticate(mkReq()); err != nil {
+		t.Fatalf("second attempt unexpected error: %v", err)
+	}
+}
+
+// TestPeekIssuer covers the unverified-iss extraction used by the
+// chain-dispatch fast path. Bad inputs return errors so the
+// caller falls through; structural success returns the iss
+// regardless of signature.
+func TestPeekIssuer(t *testing.T) {
+	t.Parallel()
+
+	iss := newFakeIssuer(t)
+	good := iss.signToken(t, "", iss.claims("aud", "u"))
+
+	tests := []struct {
+		name    string
+		token   string
+		wantIss string
+		wantErr bool
+	}{
+		{name: "well-formed token", token: good, wantIss: iss.Issuer()},
+		{name: "not three parts", token: "a.b", wantErr: true},
+		{name: "bad base64", token: "aaa.!!!.bbb", wantErr: true},
+		{name: "bad json", token: "aaa." + base64.RawURLEncoding.EncodeToString([]byte("not-json")) + ".bbb", wantErr: true},
+		{name: "missing iss", token: "aaa." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x"}`)) + ".bbb", wantIss: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := peekIssuer(tc.token)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if got != tc.wantIss {
+				t.Errorf("iss = %q, want %q", got, tc.wantIss)
+			}
+		})
+	}
+}
+
+// failingFirstRoundTripper fails the first request, succeeds on
+// subsequent ones. Used by TestAuthenticate_DiscoveryRecovers to
+// simulate a transient network blip.
+type failingFirstRoundTripper struct {
+	inner http.RoundTripper
+	flag  *atomicBool
+}
+
+func (f failingFirstRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !f.flag.swap(true) {
+		return nil, fmt.Errorf("simulated network failure")
+	}
+	return f.inner.RoundTrip(r)
+}
+
+// atomicBool is a tiny race-free boolean. The stdlib
+// sync/atomic.Bool would do but introducing it here would inflate
+// the test setup; this is enough.
+type atomicBool struct {
+	mu sync.Mutex
+	v  bool
+}
+
+func (a *atomicBool) swap(v bool) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	old := a.v
+	a.v = v
+	return old
 }
 
 // TestAuthenticate_VerifierMemoized confirms the discovery
@@ -388,7 +564,7 @@ func TestAuthenticate_VerifierMemoized(t *testing.T) {
 	}
 	hc := &http.Client{Transport: rt}
 
-	a, err := New(iss.Issuer(), audience, WithHTTPClient(hc))
+	a, err := New(iss.Issuer(), audience, WithHTTPClient(hc), AllowInsecureIssuer())
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

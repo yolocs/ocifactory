@@ -26,7 +26,7 @@ Design pillars (in priority order):
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/cred` — Backend OCI credential context | Carries Basic creds for backend HTTP client; populated by future backend cred provider |
-| `pkg/auth` — Pluggable frontend authentication (Authenticator, Subject, Chain, OIDC, basictoken) | Done, tested |
+| `pkg/auth` — Pluggable frontend authentication (Authenticator, Subject, Chain, OIDC, kind registry) | Done, tested. OIDC-only — static passwords are out-of-tree by design. |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven` |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
