@@ -26,8 +26,9 @@ Design pillars (in priority order):
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/cred` — Backend OCI credential context | Carries Basic creds for backend HTTP client; populated by future backend cred provider |
-| `pkg/auth` — Pluggable frontend authentication (Authenticator, Subject, Chain, OIDC, kind registry) | Done, tested. OIDC-only — static passwords are out-of-tree by design. |
-| `cmd/ocifactory serve` | Works for `--repo-type=python|maven` |
+| `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC, kind registry) | Done, tested. OIDC-only — static passwords are out-of-tree by design. |
+| `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
+| `cmd/ocifactory serve` | Works for `--repo-type=python|maven|echo` (echo runs without `--backend-registry`) |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
@@ -35,7 +36,7 @@ Design pillars (in priority order):
 | Authorization (per-repo, per-op policy) | Not started |
 | Backend credential provider (how ocifactory talks to GAR/ECR/zot) | Not started |
 | Dockerfile / deployment | Not started |
-| CI: lint, test, build, image publish | Only `go-test` from `abcxyz/pkg` |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`. |
 
 ## Architecture (read this before changing things)
 

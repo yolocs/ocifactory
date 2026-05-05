@@ -140,6 +140,34 @@ func TestServeFlagsValidate(t *testing.T) {
 				Host:   "example.com",
 			},
 		},
+		{
+			// echo is the no-op CI auth target — it never talks to
+			// an OCI backend, so --backend-registry is optional.
+			name: "echo without backend-registry is allowed",
+			flags: serveFlags{
+				port:     "8080",
+				repoType: "echo",
+				authNone: true,
+			},
+			wantErr: "",
+		},
+		{
+			// echo still accepts --backend-registry if the operator
+			// supplies one (it just won't be used). Make sure the URL
+			// parsing still happens so any malformed value is caught.
+			name: "echo with backend-registry parses URL",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "echo",
+				registryURLStr: "https://example.com",
+				authNone:       true,
+			},
+			wantErr: "",
+			wantRegistryURL: &url.URL{
+				Scheme: "https",
+				Host:   "example.com",
+			},
+		},
 	}
 
 	for _, tc := range cases {

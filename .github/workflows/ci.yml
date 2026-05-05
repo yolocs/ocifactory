@@ -18,3 +18,170 @@ jobs:
   # spin up zot without any extra setup steps here.
   go-test:
     uses: 'abcxyz/pkg/.github/workflows/go-test.yml@main' # ratchet:exclude
+
+  # oidc-e2e proves the auth chain end-to-end against a real OIDC
+  # issuer. GitHub Actions mints us an ID token for an audience we
+  # pick, ocifactory verifies it against the live GitHub JWKS, and
+  # the echo handler (no OCI backend, see pkg/handler/echo) returns
+  # the AuthContext so we can confirm the verified subject matched.
+  #
+  # This catches regressions the unit tests can't: discovery
+  # document layout drift at GitHub, JWKS fetch behaviour,
+  # signing-algorithm pinning, the entire serve.go wiring path.
+  oidc-e2e:
+    name: 'oidc-e2e'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      id-token: 'write'
+      contents: 'read'
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+
+      - uses: 'actions/setup-go@v5' # ratchet:exclude
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: 'Build ocifactory'
+        run: 'go build -o ./bin/ocifactory ./cmd/ocifactory'
+
+      - name: 'Write auth config'
+        run: |
+          mkdir -p ./run
+          cat > ./run/auth.yaml <<'EOF'
+          authenticators:
+            - kind: oidc
+              issuer: https://token.actions.githubusercontent.com
+              audience: ocifactory-ci
+          EOF
+
+      - name: 'Start ocifactory (echo handler)'
+        run: |
+          ./bin/ocifactory serve \
+            --repo-type=echo \
+            --auth-config=./run/auth.yaml \
+            --port=8080 \
+            > ./run/ocifactory.log 2>&1 &
+          echo $! > ./run/ocifactory.pid
+
+      - name: 'Wait for /healthz'
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+              echo "ocifactory is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ocifactory did not become healthy in time"
+          cat ./run/ocifactory.log
+          exit 1
+
+      - name: 'Mint OIDC token (correct audience)'
+        id: 'mint_good'
+        run: |
+          TOKEN=$(curl -fsSL \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ocifactory-ci" \
+            | jq -r .value)
+          if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+            echo "failed to mint token"
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      - name: 'Mint OIDC token (wrong audience)'
+        id: 'mint_bad_aud'
+        run: |
+          TOKEN=$(curl -fsSL \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=not-ocifactory-ci" \
+            | jq -r .value)
+          if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+            echo "failed to mint token"
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "${GITHUB_OUTPUT}"
+
+      - name: 'Assert: valid token → 200, body contains expected issuer/sub'
+        env:
+          TOKEN: '${{ steps.mint_good.outputs.token }}'
+        run: |
+          set -e
+          BODY=$(curl -fsS -H "Authorization: Bearer ${TOKEN}" \
+            http://127.0.0.1:8080/whoami)
+          echo "body: ${BODY}"
+          ISSUER=$(echo "${BODY}" | jq -r '.caller.issuer')
+          ID=$(echo "${BODY}" | jq -r '.caller.id')
+          if [ "${ISSUER}" != "https://token.actions.githubusercontent.com" ]; then
+            echo "wrong issuer in /whoami: got ${ISSUER}"
+            exit 1
+          fi
+          # ID for GHA tokens looks like: repo:owner/repo:ref:refs/heads/main
+          # We just assert the prefix to keep this robust to ref changes.
+          case "${ID}" in
+            repo:${GITHUB_REPOSITORY}:*) ;;
+            *) echo "wrong id in /whoami: got ${ID}, want prefix repo:${GITHUB_REPOSITORY}:"
+               exit 1 ;;
+          esac
+
+      - name: 'Assert: echo route returns the message'
+        env:
+          TOKEN: '${{ steps.mint_good.outputs.token }}'
+        run: |
+          set -e
+          BODY=$(curl -fsS -H "Authorization: Bearer ${TOKEN}" \
+            http://127.0.0.1:8080/echo/hello)
+          echo "body: ${BODY}"
+          MSG=$(echo "${BODY}" | jq -r '.message')
+          if [ "${MSG}" != "hello" ]; then
+            echo "wrong echo message: got ${MSG}"
+            exit 1
+          fi
+
+      - name: 'Assert: missing credential → 401'
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/whoami)
+          if [ "${STATUS}" != "401" ]; then
+            echo "expected 401, got ${STATUS}"
+            exit 1
+          fi
+
+      - name: 'Assert: garbage token → 401'
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer not-a-real-token" \
+            http://127.0.0.1:8080/whoami)
+          if [ "${STATUS}" != "401" ]; then
+            echo "expected 401, got ${STATUS}"
+            exit 1
+          fi
+
+      - name: 'Assert: wrong audience → 401'
+        env:
+          TOKEN: '${{ steps.mint_bad_aud.outputs.token }}'
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            http://127.0.0.1:8080/whoami)
+          if [ "${STATUS}" != "401" ]; then
+            echo "expected 401, got ${STATUS}"
+            exit 1
+          fi
+
+      - name: 'Stop ocifactory'
+        if: 'always()'
+        run: |
+          if [ -f ./run/ocifactory.pid ]; then
+            kill "$(cat ./run/ocifactory.pid)" || true
+          fi
+
+      - name: 'Dump server log'
+        if: 'always()'
+        run: |
+          if [ -f ./run/ocifactory.log ]; then
+            echo "=== ocifactory.log ==="
+            cat ./run/ocifactory.log
+          fi

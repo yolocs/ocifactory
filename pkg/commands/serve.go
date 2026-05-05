@@ -19,6 +19,7 @@ import (
 	// the registry lookup.
 	_ "github.com/yolocs/ocifactory/pkg/auth/oidc"
 	"github.com/yolocs/ocifactory/pkg/handler"
+	"github.com/yolocs/ocifactory/pkg/handler/echo"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/logging"
@@ -29,6 +30,16 @@ import (
 var supportedRepoTypes = []string{
 	maven.RepoType,
 	python.RepoType,
+	echo.RepoType,
+}
+
+// repoTypesNeedingBackend lists the repo types that talk to an OCI
+// backend. Anything not in this set runs without --backend-registry —
+// echo is the only such type today and exists purely as an auth
+// target for CI.
+var repoTypesNeedingBackend = map[string]bool{
+	maven.RepoType:  true,
+	python.RepoType: true,
 }
 
 type serveFlags struct {
@@ -63,8 +74,9 @@ func (f *serveFlags) Validate() error {
 	if !repoSupported {
 		merr = errors.Join(merr, fmt.Errorf("repo-type %q is not supported", f.repoType))
 	}
-	if f.registryURLStr == "" {
-		merr = errors.Join(merr, fmt.Errorf("backend-registry is required"))
+	needsBackend := repoTypesNeedingBackend[f.repoType]
+	if needsBackend && f.registryURLStr == "" {
+		merr = errors.Join(merr, fmt.Errorf("backend-registry is required for --repo-type=%s", f.repoType))
 		return merr
 	}
 	if f.authConfigPath != "" && f.authNone {
@@ -73,18 +85,20 @@ func (f *serveFlags) Validate() error {
 	if f.authConfigPath == "" && !f.authNone {
 		merr = errors.Join(merr, fmt.Errorf("either --auth-config or --disable-auth must be set"))
 	}
-	// Default to https when the user omits the scheme. Either way, parse
-	// unconditionally — the original code only assigned f.registryURL
-	// inside the prepend branch, leaving registryURL nil when the user
-	// passed an http:// or https:// URL directly.
-	if !strings.HasPrefix(f.registryURLStr, "http://") && !strings.HasPrefix(f.registryURLStr, "https://") {
-		f.registryURLStr = "https://" + f.registryURLStr
-	}
-	u, err := url.Parse(f.registryURLStr)
-	if err != nil {
-		merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
-	} else {
-		f.registryURL = u
+	if f.registryURLStr != "" {
+		// Default to https when the user omits the scheme. Either way,
+		// parse unconditionally — the original code only assigned
+		// f.registryURL inside the prepend branch, leaving registryURL
+		// nil when the user passed an http:// or https:// URL directly.
+		if !strings.HasPrefix(f.registryURLStr, "http://") && !strings.HasPrefix(f.registryURLStr, "https://") {
+			f.registryURLStr = "https://" + f.registryURLStr
+		}
+		u, err := url.Parse(f.registryURLStr)
+		if err != nil {
+			merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
+		} else {
+			f.registryURL = u
+		}
 	}
 	return merr
 }
@@ -199,6 +213,13 @@ func runServe(ctx context.Context, flags *serveFlags) error {
 			return fmt.Errorf("failed to create python handler: %w", err)
 		}
 		reg, format, h = r, python.RepoType, ph.Mux()
+	case echo.RepoType:
+		// echo is a no-op test format that does not talk to an OCI
+		// backend, so reg stays nil — ObservabilityHandler treats a
+		// nil pinger as "no backend configured" and /readyz collapses
+		// to liveness, which is what we want.
+		eh := echo.NewHandler(echo.WithAuthMiddleware(authMW))
+		format, h = echo.RepoType, eh.Mux()
 	default:
 		return fmt.Errorf("repo-type %q is not supported", flags.repoType)
 	}
