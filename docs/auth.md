@@ -223,6 +223,24 @@ audience the **caller** specified must match the audience
 (`https://ocifactory.your-domain`), put it in the auth config, and
 have callers use it when they request tokens.
 
+## CI: end-to-end OIDC test
+
+`.github/workflows/ci.yml` includes an `oidc-e2e` job that mints a
+real GitHub Actions OIDC token (audience `ocifactory-ci`), starts
+ocifactory with `--repo-type=echo` in front of an OIDC
+authenticator pointed at `https://token.actions.githubusercontent.com`,
+and asserts:
+
+| Case | Expected |
+|---|---|
+| Valid token, correct audience | 200; `/whoami` echoes the verified `iss` and `sub` |
+| Missing `Authorization` | 401 |
+| Garbage bearer token | 401 |
+| Valid token, wrong audience | 401 |
+
+The `echo` repo type is a no-op format that exists for this job — no
+OCI backend, no real artifacts. See `pkg/handler/echo`.
+
 ## Failure modes
 
 - **No credential** → `401 Unauthorized` with
