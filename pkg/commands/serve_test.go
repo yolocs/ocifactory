@@ -13,118 +13,76 @@ import (
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
-// authnDisabled is a convenience preset for the validation cases
-// that aren't exercising the authn-config branches; it sidesteps
-// the "either --authn-kind or --disable-authn" guard.
-var validAuthnDisabled = func(f *serveFlags) { f.authnDisabled = true }
-
-// validAuthnOIDC populates flags so the oidc branch passes
-// validation, used by the cases that aren't exercising authn.
-var validAuthnOIDC = func(f *serveFlags) {
-	f.authnKind = "oidc"
-	f.authnOIDCIssuers = []string{"https://accounts.google.com"}
-	f.authnOIDCAudience = "https://ocifactory.example"
+// minimalServeViper builds a viper.Viper preloaded with the minimum
+// to pass every Validate guard except the one each case is
+// exercising. Tests override specific keys with v.Set; everything
+// else stays at the safe default.
+func minimalServeViper(t *testing.T) *viper.Viper {
+	t.Helper()
+	v := viper.New()
+	v.Set(flagPort, "8080")
+	v.Set(flagRepoType, "maven")
+	v.Set(flagBackendRegistry, "http://example.com")
+	v.Set(flagDisableAuthn, true)
+	return v
 }
 
-func TestServeFlagsValidate(t *testing.T) {
+func TestValidateServeConfig(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name            string
-		flags           serveFlags
-		mut             func(*serveFlags) // applied before Validate to centralise authn presets
-		wantErr         string
-		wantRegistryURL *url.URL
+		name    string
+		setup   func(v *viper.Viper)
+		wantErr string
+		wantURL *url.URL
 	}{
 		{
-			name: "all fields set",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "http://example.com",
-			},
-			mut:     validAuthnDisabled,
-			wantErr: "",
-			wantRegistryURL: &url.URL{
+			name:  "all fields set",
+			setup: func(v *viper.Viper) {},
+			wantURL: &url.URL{
 				Scheme: "http",
 				Host:   "example.com",
 			},
 		},
 		{
-			name: "missing port",
-			flags: serveFlags{
-				repoType:       "maven",
-				registryURLStr: "http://example.com",
-			},
-			mut:     validAuthnDisabled,
+			name:    "missing port",
+			setup:   func(v *viper.Viper) { v.Set(flagPort, "") },
 			wantErr: "port is required",
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
-			name: "missing repo type",
-			flags: serveFlags{
-				port:           "8080",
-				registryURLStr: "http://example.com",
-			},
-			mut:     validAuthnDisabled,
+			name:    "missing repo type",
+			setup:   func(v *viper.Viper) { v.Set(flagRepoType, "") },
 			wantErr: `repo-type "" is not supported`,
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
-			name: "invalid repo type",
-			flags: serveFlags{
-				port:           "8080",
-				registryURLStr: "http://example.com",
-				repoType:       "invalid",
-			},
-			mut:     validAuthnDisabled,
+			name:    "invalid repo type",
+			setup:   func(v *viper.Viper) { v.Set(flagRepoType, "invalid") },
 			wantErr: `repo-type "invalid" is not supported`,
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "missing registry URL",
-			flags: serveFlags{
-				port:     "8080",
-				repoType: "maven",
+			setup: func(v *viper.Viper) {
+				v.Set(flagBackendRegistry, "")
 			},
-			mut:     validAuthnDisabled,
 			wantErr: "backend-registry is required",
-			// registryURL stays nil — Validate short-circuits before
-			// touching it when the user didn't pass --backend-registry.
+			// validateServeConfig short-circuits before parsing the URL.
 		},
 		{
 			name: "registry URL without protocol prefix",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "example.com",
+			setup: func(v *viper.Viper) {
+				v.Set(flagBackendRegistry, "example.com")
 			},
-			mut:     validAuthnDisabled,
-			wantErr: "",
-			wantRegistryURL: &url.URL{
-				Scheme: "https",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "https", Host: "example.com"},
 		},
 		{
 			name: "https registry URL passed directly",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "https://gar.example.com/project",
+			setup: func(v *viper.Viper) {
+				v.Set(flagBackendRegistry, "https://gar.example.com/project")
 			},
-			mut:     validAuthnDisabled,
-			wantErr: "",
-			wantRegistryURL: &url.URL{
+			wantURL: &url.URL{
 				Scheme: "https",
 				Host:   "gar.example.com",
 				Path:   "/project",
@@ -132,118 +90,86 @@ func TestServeFlagsValidate(t *testing.T) {
 		},
 		{
 			name: "missing authn config rejects",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "http://example.com",
+			setup: func(v *viper.Viper) {
+				v.Set(flagDisableAuthn, false)
+				v.Set(flagAuthnKind, "")
 			},
 			wantErr: "either --authn-kind",
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "unsupported authn kind",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "http://example.com",
-				authnKind:      "saml",
+			setup: func(v *viper.Viper) {
+				v.Set(flagDisableAuthn, false)
+				v.Set(flagAuthnKind, "saml")
 			},
 			wantErr: `authn-kind "saml" is not supported`,
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind missing issuers",
-			flags: serveFlags{
-				port:              "8080",
-				repoType:          "maven",
-				registryURLStr:    "http://example.com",
-				authnKind:         "oidc",
-				authnOIDCAudience: "https://ocifactory.example",
+			setup: func(v *viper.Viper) {
+				v.Set(flagDisableAuthn, false)
+				v.Set(flagAuthnKind, "oidc")
+				v.Set(flagAuthnOIDCAudience, "https://ocifactory.example")
 			},
 			wantErr: "authn-oidc-issuers",
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind missing audience",
-			flags: serveFlags{
-				port:             "8080",
-				repoType:         "maven",
-				registryURLStr:   "http://example.com",
-				authnKind:        "oidc",
-				authnOIDCIssuers: []string{"https://accounts.google.com"},
+			setup: func(v *viper.Viper) {
+				v.Set(flagDisableAuthn, false)
+				v.Set(flagAuthnKind, "oidc")
+				v.Set(flagAuthnOIDCIssuers, []string{"https://accounts.google.com"})
 			},
 			wantErr: "authn-oidc-audience",
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind fully configured",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "maven",
-				registryURLStr: "http://example.com",
+			setup: func(v *viper.Viper) {
+				v.Set(flagDisableAuthn, false)
+				v.Set(flagAuthnKind, "oidc")
+				v.Set(flagAuthnOIDCIssuers, []string{"https://accounts.google.com"})
+				v.Set(flagAuthnOIDCAudience, "https://ocifactory.example")
 			},
-			mut:     validAuthnOIDC,
-			wantErr: "",
-			wantRegistryURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
-			// echo is the no-op CI auth target — it never talks to
-			// an OCI backend, so --backend-registry is optional.
+			// echo never talks to an OCI backend, so --backend-registry
+			// is optional.
 			name: "echo without backend-registry is allowed",
-			flags: serveFlags{
-				port:     "8080",
-				repoType: "echo",
+			setup: func(v *viper.Viper) {
+				v.Set(flagRepoType, "echo")
+				v.Set(flagBackendRegistry, "")
 			},
-			mut:     validAuthnDisabled,
-			wantErr: "",
 		},
 		{
-			// echo still accepts --backend-registry if the operator
-			// supplies one (it just won't be used). Make sure the URL
-			// parsing still happens so any malformed value is caught.
+			// echo accepts --backend-registry too — make sure URL parsing
+			// still happens so a malformed value would be caught.
 			name: "echo with backend-registry parses URL",
-			flags: serveFlags{
-				port:           "8080",
-				repoType:       "echo",
-				registryURLStr: "https://example.com",
+			setup: func(v *viper.Viper) {
+				v.Set(flagRepoType, "echo")
+				v.Set(flagBackendRegistry, "https://example.com")
 			},
-			mut:     validAuthnDisabled,
-			wantErr: "",
-			wantRegistryURL: &url.URL{
-				Scheme: "https",
-				Host:   "example.com",
-			},
+			wantURL: &url.URL{Scheme: "https", Host: "example.com"},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			f := tc.flags
-			if tc.mut != nil {
-				tc.mut(&f)
+			v := minimalServeViper(t)
+			if tc.setup != nil {
+				tc.setup(v)
 			}
-			err := f.Validate()
+			gotURL, err := validateServeConfig(v)
 			if diff := testutil.DiffErrString(err, tc.wantErr); diff != "" {
-				t.Errorf("Validate() returned unexpected error (-got, +want): %s", diff)
+				t.Errorf("validateServeConfig() error: %s", diff)
 			}
-			if diff := cmp.Diff(tc.wantRegistryURL, f.registryURL, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("Validate() registryURL mismatch (-want +got):\n%s", diff)
+			if diff := cmp.Diff(tc.wantURL, gotURL, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("validateServeConfig() URL mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -259,19 +185,19 @@ func TestServeCmd_Flags(t *testing.T) {
 		flagName  string
 		shorthand string
 	}{
-		{name: "port", flagName: "port"},
-		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
-		{name: "backend-registry", flagName: "backend-registry"},
-		{name: "disable-streaming-push", flagName: "disable-streaming-push"},
-		{name: "disable-authn", flagName: "disable-authn"},
-		{name: "authn-kind", flagName: "authn-kind"},
-		{name: "authn-oidc-issuers", flagName: "authn-oidc-issuers"},
-		{name: "authn-oidc-audience", flagName: "authn-oidc-audience"},
-		{name: "backend-auth-kind", flagName: "backend-auth-kind"},
-		{name: "backend-auth-gcpadc-scopes", flagName: "backend-auth-gcpadc-scopes"},
-		{name: "backend-auth-staticenv-user-env", flagName: "backend-auth-staticenv-user-env"},
-		{name: "backend-auth-staticenv-password-env", flagName: "backend-auth-staticenv-password-env"},
-		{name: "backend-auth-dockerconfig-path", flagName: "backend-auth-dockerconfig-path"},
+		{name: flagPort, flagName: flagPort},
+		{name: flagRepoType, flagName: flagRepoType, shorthand: "t"},
+		{name: flagBackendRegistry, flagName: flagBackendRegistry},
+		{name: flagDisableStreamingPush, flagName: flagDisableStreamingPush},
+		{name: flagDisableAuthn, flagName: flagDisableAuthn},
+		{name: flagAuthnKind, flagName: flagAuthnKind},
+		{name: flagAuthnOIDCIssuers, flagName: flagAuthnOIDCIssuers},
+		{name: flagAuthnOIDCAudience, flagName: flagAuthnOIDCAudience},
+		{name: flagBackendAuthKind, flagName: flagBackendAuthKind},
+		{name: flagBackendAuthGCPADCScopes, flagName: flagBackendAuthGCPADCScopes},
+		{name: flagBackendAuthStaticEnvUserEnv, flagName: flagBackendAuthStaticEnvUserEnv},
+		{name: flagBackendAuthStaticEnvPasswordEnv, flagName: flagBackendAuthStaticEnvPasswordEnv},
+		{name: flagBackendAuthDockerConfigPath, flagName: flagBackendAuthDockerConfigPath},
 	}
 
 	for _, tc := range tests {
@@ -288,12 +214,11 @@ func TestServeCmd_Flags(t *testing.T) {
 	}
 }
 
-// TestServeCmd_EnvVarBindings exercises the viper precedence chain
-// — env var > flag default — for representative scalar, bool,
-// duration, and string-slice flags. CLI flag override is not
-// covered here because cobra parsing only fires under cmd.Execute,
-// which would actually start the server; we trust the standard
-// viper.BindPFlags / pflag.Changed contract for that side.
+// TestServeCmd_EnvVarBindings exercises viper's resolution chain end
+// to end: with no CLI args and only OCIFACTORY_* / PORT in env,
+// every flag must surface the env value via v.GetString / GetBool /
+// GetDuration / stringSliceCSV. This guards the env-only deployment
+// path that Cloud Run / k8s rely on.
 //
 // Mutates process-global env, so cannot t.Parallel.
 func TestServeCmd_EnvVarBindings(t *testing.T) {
@@ -312,28 +237,16 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 	t.Setenv("OCIFACTORY_SIMPLE_INDEX_CACHE_TTL", "13s")
 	t.Setenv("PORT", "9090")
 
-	captured := &serveFlags{}
-	cmd := buildServeCmd(captured)
-	// Stop before runServe — applyEnvOverrides and Validate will have
-	// run by the time the production RunE returns, but we don't want
-	// to actually start the server. Override Validate's outcome too:
-	// the env-only configuration above is internally consistent, so
-	// Validate must pass; if it doesn't the assertions below will
-	// surface the real reason.
-	cmd.RunE = func(c *cobra.Command, _ []string) error {
-		// applyEnvOverrides is captured in the closure of newServeCmd's
-		// own RunE; rebuild the same precedence here to exercise the
-		// production path end-to-end without starting the server.
-		v := viper.New()
-		v.SetEnvPrefix(envPrefix)
-		v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
-		v.AutomaticEnv()
-		_ = v.BindEnv("port", "PORT")
-		if err := v.BindPFlags(c.Flags()); err != nil {
-			return err
-		}
-		return applyEnvOverrides(c, v)
-	}
+	v := viper.New()
+	v.SetEnvPrefix(envPrefix)
+	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	v.AutomaticEnv()
+	_ = v.BindEnv(flagPort, "PORT")
+
+	cmd := buildServeCmd(v)
+	// Stop short of starting the server: replace RunE with a no-op
+	// so we only exercise flag parsing + viper binding.
+	cmd.RunE = func(c *cobra.Command, _ []string) error { return nil }
 
 	cmd.SetArgs(nil) // no CLI args — env vars must be the only source
 	if err := cmd.Execute(); err != nil {
@@ -354,18 +267,18 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		got  any
 		want any
 	}{
-		{"port", captured.port, "9090"},
-		{"repoType", captured.repoType, "python"},
-		{"registryURLStr", captured.registryURLStr, "zot.example.com:5000/ocifactory"},
-		{"authnKind", captured.authnKind, "oidc"},
-		{"authnOIDCIssuers", captured.authnOIDCIssuers, wantIssuers},
-		{"authnOIDCAudience", captured.authnOIDCAudience, "https://ocifactory.example"},
-		{"backendAuthKind", captured.backendAuthKind, "staticenv"},
-		{"backendAuthStaticEnvUserEnv", captured.backendAuthStaticEnvUserEnv, "REG_USER"},
-		{"backendAuthStaticEnvPasswordEnv", captured.backendAuthStaticEnvPasswordEnv, "REG_PASS"},
-		{"backendAuthGCPADCScopes", captured.backendAuthGCPADCScopes, wantScopes},
-		{"authnDisabled", captured.authnDisabled, true},
-		{"simpleIndexCacheTTL", captured.simpleIndexCacheTTL, 13 * time.Second},
+		{flagPort, v.GetString(flagPort), "9090"},
+		{flagRepoType, v.GetString(flagRepoType), "python"},
+		{flagBackendRegistry, v.GetString(flagBackendRegistry), "zot.example.com:5000/ocifactory"},
+		{flagAuthnKind, v.GetString(flagAuthnKind), "oidc"},
+		{flagAuthnOIDCIssuers, stringSliceCSV(v, flagAuthnOIDCIssuers), wantIssuers},
+		{flagAuthnOIDCAudience, v.GetString(flagAuthnOIDCAudience), "https://ocifactory.example"},
+		{flagBackendAuthKind, v.GetString(flagBackendAuthKind), "staticenv"},
+		{flagBackendAuthStaticEnvUserEnv, v.GetString(flagBackendAuthStaticEnvUserEnv), "REG_USER"},
+		{flagBackendAuthStaticEnvPasswordEnv, v.GetString(flagBackendAuthStaticEnvPasswordEnv), "REG_PASS"},
+		{flagBackendAuthGCPADCScopes, stringSliceCSV(v, flagBackendAuthGCPADCScopes), wantScopes},
+		{flagDisableAuthn, v.GetBool(flagDisableAuthn), true},
+		{flagSimpleIndexCacheTTL, v.GetDuration(flagSimpleIndexCacheTTL), 13 * time.Second},
 	}
 	for _, c := range checks {
 		if diff := cmp.Diff(c.want, c.got); diff != "" {
