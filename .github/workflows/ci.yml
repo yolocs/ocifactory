@@ -45,21 +45,14 @@ jobs:
       - name: 'Build ocifactory'
         run: 'go build -o ./bin/ocifactory ./cmd/ocifactory'
 
-      - name: 'Write auth config'
-        run: |
-          mkdir -p ./run
-          cat > ./run/auth.yaml <<'EOF'
-          authenticators:
-            - kind: oidc
-              issuer: https://token.actions.githubusercontent.com
-              audience: ocifactory-ci
-          EOF
-
       - name: 'Start ocifactory (echo handler)'
         run: |
+          mkdir -p ./run
           ./bin/ocifactory serve \
             --repo-type=echo \
-            --auth-config=./run/auth.yaml \
+            --authn-kind=oidc \
+            --authn-oidc-issuers=https://token.actions.githubusercontent.com \
+            --authn-oidc-audience=ocifactory-ci \
             --port=8080 \
             > ./run/ocifactory.log 2>&1 &
           echo $! > ./run/ocifactory.pid

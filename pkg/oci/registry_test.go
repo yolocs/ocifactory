@@ -17,10 +17,11 @@ import (
 	"github.com/google/go-cmp/cmp"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/yolocs/ocifactory/pkg/cred"
+	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 	"oras.land/oras-go/v2/content/memory"
 	"oras.land/oras-go/v2/errdef"
+	"oras.land/oras-go/v2/registry/remote/auth"
 )
 
 func TestNewRegistry(t *testing.T) {
@@ -844,53 +845,74 @@ func TestBufferUploadHead(t *testing.T) {
 	}
 }
 
-// TestAuthClientMemoization locks in the per-credentials caching behaviour
-// in authClientFromContext: two calls with the same basic-auth context
-// must return the same *auth.Client (so the per-client token cache is
-// shared across PATCHes and across the pusher/backend split inside one
-// AddFile call), and calls with different credentials must NOT share.
+// TestAuthClient_BackendProviderPlumbed locks in the contract for
+// Registry.authClient: NewRegistry constructs one authenticated
+// client at construction time, wraps the operator's backend.Provider,
+// and shares it across every AddFile / ReadFile / streaming-PATCH
+// call so bearer-token fetches are amortised.
 //
-// The bearer-token re-fetch storm this guards against was the #1 finding
-// from the pre-merge memory-leak audit; do not delete this test without
-// a replacement.
-func TestAuthClientMemoization(t *testing.T) {
+// The bearer-token re-fetch storm this guards against (auth.Cache
+// must be non-nil so PATCH-chunked uploads of large blobs don't pay
+// for one token per chunk) was the #1 finding from the pre-merge
+// memory-leak audit; do not delete this test without a replacement.
+func TestAuthClient_BackendProviderPlumbed(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	provider := backend.ProviderFunc(func(_ context.Context, _ string) (backend.Credential, error) {
+		calls++
+		return backend.Credential{Username: "u", Password: "p"}, nil
+	})
+
+	r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"},
+		WithBackendAuth(provider))
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+
+	if r.authClient == nil {
+		t.Fatal("authClient is nil; expected NewRegistry to construct one")
+	}
+	if r.authClient.Cache == nil {
+		t.Error("authClient.Cache is nil; bearer-token fetches must be cached so PATCH-chunked uploads don't refetch per chunk")
+	}
+	if r.authClient.Credential == nil {
+		t.Error("authClient.Credential is nil; expected the supplied provider to be wired")
+	}
+
+	got, err := r.authClient.Credential(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("authClient.Credential() error = %v", err)
+	}
+	want := auth.Credential{Username: "u", Password: "p"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("authClient.Credential() mismatch (-want +got):\n%s", diff)
+	}
+	if calls != 1 {
+		t.Errorf("Provider.Credential calls = %d, want 1", calls)
+	}
+}
+
+// TestAuthClient_AnonymousDefault confirms that without
+// WithBackendAuth, the registry defaults to anonymous (the empty
+// Credential) — the safe default that fails closed against private
+// backends.
+func TestAuthClient_AnonymousDefault(t *testing.T) {
 	t.Parallel()
 
 	r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"})
 	if err != nil {
 		t.Fatalf("NewRegistry() error = %v", err)
 	}
-
-	ctx1 := cred.WithCred(t.Context(), &cred.Cred{
-		Basic: &cred.BasicCred{User: "alice", Password: "p1"},
-	})
-	ctx2 := cred.WithCred(t.Context(), &cred.Cred{
-		Basic: &cred.BasicCred{User: "alice", Password: "p1"},
-	})
-	ctx3 := cred.WithCred(t.Context(), &cred.Cred{
-		Basic: &cred.BasicCred{User: "bob", Password: "p2"},
-	})
-
-	c1 := r.authClientFromContext(ctx1)
-	c2 := r.authClientFromContext(ctx2)
-	c3 := r.authClientFromContext(ctx3)
-
-	if c1 == nil || c2 == nil || c3 == nil {
-		t.Fatalf("authClientFromContext returned nil for credentialled contexts: %v %v %v", c1, c2, c3)
+	if r.authClient == nil {
+		t.Fatal("authClient is nil; expected anonymous fallback")
 	}
-	if c1 != c2 {
-		t.Errorf("same credentials produced different clients: %p vs %p", c1, c2)
+	got, err := r.authClient.Credential(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("authClient.Credential() error = %v", err)
 	}
-	if c1 == c3 {
-		t.Errorf("different credentials produced the same client: %p", c1)
-	}
-	if c1.Cache == nil {
-		t.Errorf("auth.Client.Cache must be set so token fetches are amortised across PATCHes; got nil")
-	}
-
-	// No credentials -> nil client (auth-free request path).
-	if got := r.authClientFromContext(t.Context()); got != nil {
-		t.Errorf("expected nil client for no-credentials context, got %v", got)
+	if got != auth.EmptyCredential {
+		t.Errorf("authClient.Credential() = %+v, want EmptyCredential", got)
 	}
 }
 

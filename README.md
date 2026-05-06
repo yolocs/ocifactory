@@ -48,8 +48,11 @@ go run ./cmd/ocifactory serve \
 pip install --index-url http://localhost:8080/simple/ requests
 ```
 
-Runtime config is also available via env vars: `PORT`, `OCIFACTORY_REPO_TYPE`,
-`OCIFACTORY_BACKEND_REGISTRY`, `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`.
+Every runtime knob is a CLI flag with a matching env var — no config files.
+Common ones: `PORT`, `OCIFACTORY_REPO_TYPE`, `OCIFACTORY_BACKEND_REGISTRY`,
+`OCIFACTORY_AUTHN_*`, `OCIFACTORY_BACKEND_AUTH_*`, `OCIFACTORY_LOG_LEVEL`,
+`OCIFACTORY_LOG_FORMAT`. See [`docs/auth.md`](docs/auth.md) for the auth
+options.
 
 ## Architecture
 

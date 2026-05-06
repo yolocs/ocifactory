@@ -25,8 +25,8 @@ Design pillars (in priority order):
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
-| `pkg/cred` — Backend OCI credential context | Carries Basic creds for backend HTTP client; populated by future backend cred provider |
-| `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC, kind registry) | Done, tested. OIDC-only — static passwords are out-of-tree by design. |
+| `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC) | Done, tested. OIDC-only — static passwords are out-of-tree by design. Configured via `OCIFACTORY_AUTHN_*` flags / env vars. |
+| `pkg/auth/backend` — Pluggable backend credential `Provider` interface and in-tree adapters (`anonymous`, `gcpadc`, `staticenv`, `dockerconfig`) | Done, tested. Wired into `oci.Registry` via `WithBackendAuth`. Configured via `OCIFACTORY_BACKEND_AUTH_*` flags / env vars. |
 | `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven|echo` (echo runs without `--backend-registry`) |
 | Go module proxy support | Not started |
@@ -34,7 +34,6 @@ Design pillars (in priority order):
 | Pull-through proxy / caching | Not started |
 | Vulnerability scanning | Not started |
 | Authorization (per-repo, per-op policy) | Not started |
-| Backend credential provider (how ocifactory talks to GAR/ECR/zot) | Not started |
 | Dockerfile / deployment | Not started |
 | CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`. |
 

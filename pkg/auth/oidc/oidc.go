@@ -19,9 +19,6 @@ import (
 	"github.com/yolocs/ocifactory/pkg/auth"
 )
 
-// Kind is the YAML `kind` value that selects this authenticator.
-const Kind = "oidc"
-
 // defaultHTTPTimeout is the per-request timeout applied to the
 // default http.Client used for OIDC discovery and JWKS fetch. A
 // slow or malicious issuer can otherwise hang the first auth
@@ -325,20 +322,3 @@ func (c *cappedReadCloser) Read(p []byte) (int, error) {
 }
 
 func (c *cappedReadCloser) Close() error { return c.rc.Close() }
-
-// init self-registers this kind so callers only need to import
-// pkg/auth/oidc for the side effect (most do via direct use of
-// oidc.New in tests/wiring; the registration covers operators who
-// build the chain from a YAML config).
-func init() {
-	auth.RegisterKind(Kind, func(spec auth.AuthenticatorSpec) (auth.Authenticator, error) {
-		var s struct {
-			Issuer   string `yaml:"issuer"`
-			Audience string `yaml:"audience"`
-		}
-		if err := spec.Decode(&s); err != nil {
-			return nil, fmt.Errorf("decode oidc spec: %w", err)
-		}
-		return New(s.Issuer, s.Audience)
-	})
-}
