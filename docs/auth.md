@@ -1,13 +1,17 @@
 # Authentication
 
-ocifactory authenticates inbound requests through a chain of
-**OIDC** authenticators — one per trusted issuer. The only
-credential ocifactory accepts is a verifiable token issued by an
-OIDC provider; static passwords are not supported.
+ocifactory has two independent identities:
 
-The auth chain is configured via a YAML file passed to
-`--auth-config`. No other process state is involved; reload by
-restarting.
+- **Frontend** — how callers of the ocifactory HTTP API authenticate
+  to ocifactory. OIDC only; configured via `OCIFACTORY_AUTHN_*`.
+- **Backend** — how ocifactory authenticates to the backend OCI
+  registry. Pluggable `backend.Provider` interface with in-tree
+  adapters for ADC, env vars, and docker config; configured via
+  `OCIFACTORY_BACKEND_AUTH_*`.
+
+There is no config file. Every knob is a CLI flag or environment
+variable so deployments on Cloud Run / k8s / docker compose stay a
+single deployable unit with no extra mounts.
 
 ## Where auth runs
 
@@ -28,49 +32,101 @@ router, so:
   npm login bootstrap that mints a token) sit on a sub-router
   that doesn't `Use(authMW)`.
 
-> **Note**: ocifactory authenticates **clients** (callers of the
-> ocifactory HTTP API). It does **not** speak any authentication
-> for the backend OCI registry — that's a separate concern handled
-> by the backend credential provider (see roadmap).
+## Frontend: authenticating clients
 
-## Configuration
+| Flag | Env var | Meaning |
+|---|---|---|
+| `--disable-authn` | `OCIFACTORY_AUTHN_DISABLED=true` | Wire `AlwaysAnonymous`. Local dev only — logs a loud warning. Mutually exclusive with `--authn-kind`. |
+| `--authn-kind` | `OCIFACTORY_AUTHN_KIND` | Authenticator kind. Allowed: `oidc`. |
+| `--authn-oidc-issuers` | `OCIFACTORY_AUTHN_OIDC_ISSUERS` | Comma-separated trusted OIDC issuer URLs. One authenticator per entry. |
+| `--authn-oidc-audience` | `OCIFACTORY_AUTHN_OIDC_AUDIENCE` | Required audience claim every accepted token must carry. |
 
-```yaml
-# /etc/ocifactory/auth.yaml
-authenticators:
-  - kind: oidc
-    issuer: https://accounts.google.com
-    audience: https://ocifactory.your-domain
-  - kind: oidc
-    issuer: https://token.actions.githubusercontent.com
-    audience: https://ocifactory.your-domain
-```
-
-Run with:
+Either `--authn-kind` or `--disable-authn` must be set. The server
+refuses to start without one — **no implicit "allow everything"
+mode**.
 
 ```bash
 ocifactory serve \
   --repo-type=python \
   --backend-registry=zot.local:5000/ocifactory \
-  --auth-config=/etc/ocifactory/auth.yaml \
+  --authn-kind=oidc \
+  --authn-oidc-issuers=https://accounts.google.com,https://token.actions.githubusercontent.com \
+  --authn-oidc-audience=https://ocifactory.your-domain \
   --port=8080
 ```
 
-Authenticators are tried in declaration order. Each authenticator
-peeks the unverified `iss` claim of the incoming token; only the
+Issuers are tried in declaration order. Each authenticator peeks
+the unverified `iss` claim of the incoming token; only the
 authenticator whose configured issuer matches will run full
 verification. Mismatched issuers fall through silently to the next
-authenticator. This is what lets a multi-issuer chain (Google +
-GitHub Actions + ...) accept tokens from any of its members
-without short-circuiting on the first one.
+authenticator, so a multi-issuer chain (Google + GitHub Actions +
+...) accepts tokens from any of its members without
+short-circuiting on the first one.
 
-### Required vs optional
+## Backend: how ocifactory talks to the OCI registry
 
-Either `--auth-config` or `--disable-auth` must be set. The server
-refuses to start without one or the other — **no implicit
-"allow everything" mode**. `--disable-auth` exists for local
-development against zot-with-no-auth and prints a loud warning at
-startup.
+`pkg/auth/backend.Provider` is the swap point:
+
+```go
+type Provider interface {
+    Credential(ctx context.Context, host string) (Credential, error)
+}
+```
+
+Out-of-tree credential providers (Vault, IAM Roles Anywhere,
+SPIFFE-issued certs, ...) implement this directly and pass an
+instance through `oci.WithBackendAuth`. They never touch oras-go's
+auth client — that wiring is private to `pkg/oci`.
+
+In-tree adapters are selected via flag / env var:
+
+| Flag | Env var | Meaning |
+|---|---|---|
+| `--backend-auth-kind` | `OCIFACTORY_BACKEND_AUTH_KIND` | `anonymous` (default) \| `gcpadc` \| `staticenv` \| `dockerconfig` |
+| `--backend-auth-gcpadc-scopes` | `OCIFACTORY_BACKEND_AUTH_GCPADC_SCOPES` | Comma-separated OAuth2 scopes for `gcpadc`. Empty = `cloud-platform`. |
+| `--backend-auth-staticenv-user-env` | `OCIFACTORY_BACKEND_AUTH_STATICENV_USER_ENV` | Name of the env var holding the username for `staticenv`. |
+| `--backend-auth-staticenv-password-env` | `OCIFACTORY_BACKEND_AUTH_STATICENV_PASSWORD_ENV` | Name of the env var holding the password for `staticenv`. |
+| `--backend-auth-dockerconfig-path` | `OCIFACTORY_BACKEND_AUTH_DOCKERCONFIG_PATH` | Path to a docker-format `config.json` for `dockerconfig`. Empty = `~/.docker/config.json`. |
+
+### `gcpadc` — Google Application Default Credentials
+
+Works on Cloud Run / GCE / GKE via the metadata server, locally
+via `gcloud auth application-default login`, and via Workload
+Identity Federation when the environment is set. ocifactory mints
+short-lived access tokens via `oauth2.TokenSource`; refresh is
+handled by the upstream library.
+
+The `host` argument to `Credential` is ignored — ADC issues bearer
+tokens for any GCP service the credential has access to, so the
+same token works against any GAR location.
+
+### `staticenv` — username/password from env vars
+
+```
+--backend-auth-kind=staticenv \
+--backend-auth-staticenv-user-env=REGISTRY_USERNAME \
+--backend-auth-staticenv-password-env=REGISTRY_PASSWORD
+```
+
+Reads the named environment variables on **every** call so
+operators can rotate secrets via Vault Agent / SOPS / External
+Secrets without restarting. If either variable is unset or empty,
+the adapter returns the empty credential and the backend's
+`WWW-Authenticate` response surfaces the failure.
+
+### `dockerconfig` — `~/.docker/config.json` (with credential helpers)
+
+Wraps oras-go's `credentials.Store`. Credential helpers
+(`docker-credential-gcr`, `docker-credential-ecr-login`,
+`docker-credential-acr`, …) are honoured. Operators who already run
+`gcloud auth configure-docker` or `aws ecr get-login-password` get
+working credentials with no further configuration.
+
+### `anonymous` — no credential
+
+Default when `--backend-auth-kind` is unset. Every call presents
+the empty credential. Fine for public read-only registries; fails
+closed against any private backend, which is the safe shape.
 
 ## How clients send credentials
 
@@ -170,48 +226,33 @@ OIDC issuer:
   issuer that signs short-lived JWTs from a static key.
 
 Air-gapped or fully-offline deployments where no IDP exists at
-all can still run with `--disable-auth` behind a network ACL.
+all can still run with `--disable-authn` behind a network ACL.
 
 ## Adding your own authenticator (out-of-tree)
 
-The `Authenticator` interface and its YAML kind registry are
-public. To add an authenticator (static password, GitHub PAT,
-mTLS, anything else) without forking ocifactory:
+The `Authenticator` interface is public. To add an authenticator
+(static password, GitHub PAT, mTLS, anything else), implement it
+in a fork of `cmd/ocifactory` that wires the new authenticator
+into the chain:
 
 ```go
-// example.com/ocifactory-myauth/myauth.go
-package myauth
+// example.com/myocifactory/main.go
+package main
 
 import (
+    "github.com/spf13/cobra"
     "github.com/yolocs/ocifactory/pkg/auth"
+    "github.com/yolocs/ocifactory/pkg/auth/chain"
+    // ... and the rest of the ocifactory wiring
 )
 
-func init() {
-    auth.RegisterKind("myauth", func(spec auth.AuthenticatorSpec) (auth.Authenticator, error) {
-        var cfg struct {
-            // ... your fields
-        }
-        if err := spec.Decode(&cfg); err != nil {
-            return nil, err
-        }
-        return newAuthenticator(cfg)
-    })
-}
+type myAuth struct{ /* ... */ }
+func (a *myAuth) Authenticate(r *http.Request) (*auth.AuthContext, error) { /* ... */ }
 ```
 
-Then build a custom ocifactory binary that imports your package
-for side effects:
-
-```go
-// cmd/myocifactory/main.go
-import (
-    _ "example.com/ocifactory-myauth"
-    // ...
-)
-```
-
-Operators get a new `kind: myauth` they can put in their
-auth-config YAML.
+Backend credential providers slot in the same way: implement
+`backend.Provider` and pass it through `oci.WithBackendAuth` from
+your custom main.
 
 ## What's behind the load balancer
 
@@ -220,8 +261,9 @@ told to mint a token for. Behind a reverse proxy this means: the
 audience the **caller** specified must match the audience
 **ocifactory** is configured to accept — not whatever
 `X-Forwarded-Host` happens to say. Pick one canonical public URL
-(`https://ocifactory.your-domain`), put it in the auth config, and
-have callers use it when they request tokens.
+(`https://ocifactory.your-domain`), put it in
+`--authn-oidc-audience`, and have callers use it when they request
+tokens.
 
 ## CI: end-to-end OIDC test
 
@@ -264,10 +306,6 @@ OCI backend, no real artifacts. See `pkg/handler/echo`.
 - **Authorization** — what a verified caller is allowed to do.
   Tracked separately; today every authenticated caller can
   read/write everything.
-- **Backend credentials** — how ocifactory talks to GAR / ECR /
-  zot. Tracked separately; today the backend must accept whatever
-  identity the runtime provides (typically Cloud Run's service
-  account against GAR).
 - **GitHub PATs / App tokens** — opaque, not OIDC. A future
   authenticator could validate them via `api.github.com/user`,
   but it has different perf characteristics; meanwhile the

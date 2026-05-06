@@ -10,12 +10,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/yolocs/ocifactory/pkg/cred"
+	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/metrics"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
@@ -114,12 +113,19 @@ type Registry struct {
 	// recorder via WithMetrics.
 	rec metrics.Recorder
 
-	// authClients caches *auth.Client per credential hash so concurrent
-	// AddFile calls share the same bearer-token cache. Without this each
-	// PATCH of a chunked upload would round-trip the registry's auth
-	// endpoint — a 200 MB jar at 4 MiB chunks would issue ~50 token
-	// fetches per upload and saturate the auth path under load.
-	authClients sync.Map // map[authCacheKey]*auth.Client
+	// backendProvider supplies credentials for every call to the
+	// backend OCI registry. nil means "anonymous" (the empty
+	// Credential for every host) — fine for public read-only
+	// backends, fails closed against any private backend.
+	backendProvider backend.Provider
+
+	// authClient is the single authenticated HTTP client every
+	// backend call shares. Constructed once in NewRegistry around
+	// backendProvider (or anonymous when nil). The wrapped
+	// auth.Cache amortises bearer-token fetches across every PATCH
+	// chunk and every manifest write, so a 200 MB upload pays for
+	// one token round-trip rather than ~50.
+	authClient *auth.Client
 
 	// Used in unit tests to stub with in-memory backend.
 	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
@@ -149,6 +155,28 @@ func WithMetrics(rec metrics.Recorder) RegistryOption {
 			rec = metrics.NoOp()
 		}
 		r.rec = rec
+		return nil
+	}
+}
+
+// WithBackendAuth sets the credential provider the Registry presents
+// to the backend OCI registry on every call. Construction wraps the
+// provider in an auth.Client with a shared auth.Cache so bearer-token
+// fetches are amortised across every PATCH chunk and every manifest
+// write.
+//
+// Default when no option is supplied: backend.Anonymous() — the empty
+// Credential for every host. Fine for public read-only backends (a
+// public zot, docker-style anonymous mirrors); fails closed against
+// any private backend, which is the safe shape for a library default.
+//
+// The interface is intentionally ours (backend.Provider), not oras-go's
+// auth.CredentialFunc, so out-of-tree credential providers depend only
+// on ocifactory's typed interface and the upstream type doesn't show up
+// in our public API.
+func WithBackendAuth(p backend.Provider) RegistryOption {
+	return func(r *Registry) error {
+		r.backendProvider = p
 		return nil
 	}
 }
@@ -216,6 +244,26 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	r.versionArtifactType = r.artifactType + versionArtifactSuffix
 	r.fileArtifactType = r.artifactType + fileArtifactSuffix
 	r.aliasArtifactType = r.artifactType + aliasArtifactSuffix
+
+	provider := r.backendProvider
+	if provider == nil {
+		provider = backend.Anonymous()
+	}
+	r.authClient = &auth.Client{
+		Client: retry.DefaultClient,
+		Cache:  auth.NewCache(),
+		Credential: func(ctx context.Context, host string) (auth.Credential, error) {
+			c, err := provider.Credential(ctx, host)
+			if err != nil {
+				return auth.EmptyCredential, err
+			}
+			return auth.Credential{
+				Username:    c.Username,
+				Password:    c.Password,
+				AccessToken: c.AccessToken,
+			}, nil
+		},
+	}
 
 	return r, nil
 }
@@ -996,10 +1044,7 @@ func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error
 	if r.baseURL.Scheme == "http" {
 		repo.PlainHTTP = true
 	}
-
-	if c := r.authClientFromContext(ctx); c != nil {
-		repo.Client = c
-	}
+	repo.Client = r.authClient
 
 	return newInstrumentedRepo(remoteRepo{Repository: repo}, r.rec), nil
 }
@@ -1025,66 +1070,8 @@ func (r *Registry) newStreamPusher(ctx context.Context, f *RepoFile) (streamingP
 		return nil, fmt.Errorf("invalid repository name %q: %w", ref.Repository, err)
 	}
 
-	var client httpDoer
-	if c := r.authClientFromContext(ctx); c != nil {
-		client = c
-	} else {
-		client = retry.DefaultClient
-	}
-
 	plainHTTP := r.baseURL.Scheme == "http"
-	return newInstrumentedStreamPusher(newStreamPusher(client, ref, plainHTTP), r.rec), nil
-}
-
-// authClientFromContext returns an *auth.Client wired with the basic-auth
-// credentials carried in ctx, or nil if no credentials are present.
-//
-// Clients are memoized on the Registry per (host, user, password) tuple
-// so concurrent AddFile calls share the same bearer-token cache. The two
-// reasons this matters:
-//
-//  1. Each constructed *auth.Client carries its own auth.NewCache(); a
-//     fresh client would fall back to noCache{} and trigger a fresh token
-//     round-trip on every Do() — multiplying auth load by the number of
-//     PATCH chunks in a single upload.
-//  2. addFileStreaming asks for a client twice in a row (once for the
-//     pusher, once for the manifest write). With memoization both legs
-//     hit the same cache; without it they re-fetch tokens independently.
-func (r *Registry) authClientFromContext(ctx context.Context) *auth.Client {
-	c, ok := cred.FromContext(ctx)
-	if !ok || c.Basic == nil {
-		return nil
-	}
-
-	// Comparable struct as the map key — Go's runtime hashes it
-	// internally for sync.Map's bucketing, so no application-level hash
-	// is involved. The password lives in heap via cred.Cred regardless,
-	// so storing it as a key value adds no incremental exposure.
-	key := authCacheKey{host: r.baseURL.Host, user: c.Basic.User, password: c.Basic.Password}
-	if v, ok := r.authClients.Load(key); ok {
-		return v.(*auth.Client)
-	}
-
-	client := &auth.Client{
-		Client: retry.DefaultClient,
-		Cache:  auth.NewCache(),
-		Credential: auth.StaticCredential(r.baseURL.Host, auth.Credential{
-			Username: c.Basic.User,
-			Password: c.Basic.Password,
-		}),
-	}
-	actual, _ := r.authClients.LoadOrStore(key, client)
-	return actual.(*auth.Client)
-}
-
-// authCacheKey is the lookup key for Registry.authClients. It is a plain
-// comparable struct rather than a derived hash so static analyzers don't
-// flag the password as flowing into a fast-hash function — and so we
-// don't need a per-process pepper or any crypto at all.
-type authCacheKey struct {
-	host     string
-	user     string
-	password string
+	return newInstrumentedStreamPusher(newStreamPusher(r.authClient, ref, plainHTTP), r.rec), nil
 }
 
 func detectFileMediaType(f *RepoFile) string {

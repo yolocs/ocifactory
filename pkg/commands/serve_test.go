@@ -9,12 +9,26 @@ import (
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
+// authnDisabled is a convenience preset for the validation cases
+// that aren't exercising the authn-config branches; it sidesteps
+// the "either --authn-kind or --disable-authn" guard.
+var validAuthnDisabled = func(f *serveFlags) { f.authnDisabled = true }
+
+// validAuthnOIDC populates flags so the oidc branch passes
+// validation, used by the cases that aren't exercising authn.
+var validAuthnOIDC = func(f *serveFlags) {
+	f.authnKind = "oidc"
+	f.authnOIDCIssuers = []string{"https://accounts.google.com"}
+	f.authnOIDCAudience = "https://ocifactory.example"
+}
+
 func TestServeFlagsValidate(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name            string
 		flags           serveFlags
+		mut             func(*serveFlags) // applied before Validate to centralise authn presets
 		wantErr         string
 		wantRegistryURL *url.URL
 	}{
@@ -24,8 +38,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
@@ -37,8 +51,8 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "port is required",
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
@@ -50,8 +64,8 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:           "8080",
 				registryURLStr: "http://example.com",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: `repo-type "" is not supported`,
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
@@ -64,8 +78,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				registryURLStr: "http://example.com",
 				repoType:       "invalid",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: `repo-type "invalid" is not supported`,
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
@@ -77,8 +91,8 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:     "8080",
 				repoType: "maven",
-				authNone: true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "backend-registry is required",
 			// registryURL stays nil — Validate short-circuits before
 			// touching it when the user didn't pass --backend-registry.
@@ -89,8 +103,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "example.com",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "https",
@@ -103,8 +117,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "https://gar.example.com/project",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "https",
@@ -113,28 +127,71 @@ func TestServeFlagsValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "auth-config and disable-auth mutually exclusive",
+			name: "missing authn config rejects",
 			flags: serveFlags{
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
-				authConfigPath: "/etc/auth.yaml",
-				authNone:       true,
 			},
-			wantErr: "mutually exclusive",
+			wantErr: "either --authn-kind",
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
 				Host:   "example.com",
 			},
 		},
 		{
-			name: "missing auth config and disable-auth not set",
+			name: "unsupported authn kind",
+			flags: serveFlags{
+				port:           "8080",
+				repoType:       "maven",
+				registryURLStr: "http://example.com",
+				authnKind:      "saml",
+			},
+			wantErr: `authn-kind "saml" is not supported`,
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
+		},
+		{
+			name: "oidc kind missing issuers",
+			flags: serveFlags{
+				port:              "8080",
+				repoType:          "maven",
+				registryURLStr:    "http://example.com",
+				authnKind:         "oidc",
+				authnOIDCAudience: "https://ocifactory.example",
+			},
+			wantErr: "authn-oidc-issuers",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
+		},
+		{
+			name: "oidc kind missing audience",
+			flags: serveFlags{
+				port:             "8080",
+				repoType:         "maven",
+				registryURLStr:   "http://example.com",
+				authnKind:        "oidc",
+				authnOIDCIssuers: []string{"https://accounts.google.com"},
+			},
+			wantErr: "authn-oidc-audience",
+			wantRegistryURL: &url.URL{
+				Scheme: "http",
+				Host:   "example.com",
+			},
+		},
+		{
+			name: "oidc kind fully configured",
 			flags: serveFlags{
 				port:           "8080",
 				repoType:       "maven",
 				registryURLStr: "http://example.com",
 			},
-			wantErr: "either --auth-config or --disable-auth must be set",
+			mut:     validAuthnOIDC,
+			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "http",
 				Host:   "example.com",
@@ -147,8 +204,8 @@ func TestServeFlagsValidate(t *testing.T) {
 			flags: serveFlags{
 				port:     "8080",
 				repoType: "echo",
-				authNone: true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "",
 		},
 		{
@@ -160,8 +217,8 @@ func TestServeFlagsValidate(t *testing.T) {
 				port:           "8080",
 				repoType:       "echo",
 				registryURLStr: "https://example.com",
-				authNone:       true,
 			},
+			mut:     validAuthnDisabled,
 			wantErr: "",
 			wantRegistryURL: &url.URL{
 				Scheme: "https",
@@ -173,11 +230,15 @@ func TestServeFlagsValidate(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := tc.flags.Validate()
+			f := tc.flags
+			if tc.mut != nil {
+				tc.mut(&f)
+			}
+			err := f.Validate()
 			if diff := testutil.DiffErrString(err, tc.wantErr); diff != "" {
 				t.Errorf("Validate() returned unexpected error (-got, +want): %s", diff)
 			}
-			if diff := cmp.Diff(tc.wantRegistryURL, tc.flags.registryURL, cmpopts.EquateEmpty()); diff != "" {
+			if diff := cmp.Diff(tc.wantRegistryURL, f.registryURL, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("Validate() registryURL mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -198,8 +259,15 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: "repo-type", flagName: "repo-type", shorthand: "t"},
 		{name: "backend-registry", flagName: "backend-registry"},
 		{name: "disable-streaming-push", flagName: "disable-streaming-push"},
-		{name: "auth-config", flagName: "auth-config"},
-		{name: "disable-auth", flagName: "disable-auth"},
+		{name: "disable-authn", flagName: "disable-authn"},
+		{name: "authn-kind", flagName: "authn-kind"},
+		{name: "authn-oidc-issuers", flagName: "authn-oidc-issuers"},
+		{name: "authn-oidc-audience", flagName: "authn-oidc-audience"},
+		{name: "backend-auth-kind", flagName: "backend-auth-kind"},
+		{name: "backend-auth-gcpadc-scopes", flagName: "backend-auth-gcpadc-scopes"},
+		{name: "backend-auth-staticenv-user-env", flagName: "backend-auth-staticenv-user-env"},
+		{name: "backend-auth-staticenv-password-env", flagName: "backend-auth-staticenv-password-env"},
+		{name: "backend-auth-dockerconfig-path", flagName: "backend-auth-dockerconfig-path"},
 	}
 
 	for _, tc := range tests {

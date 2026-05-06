@@ -5,7 +5,7 @@
 // HTTP status. The built-in OIDC implementation lives in the oidc
 // sub-package; the chain composer lives in chain. Out-of-tree
 // authenticators (static passwords, GitHub PAT, mTLS, ...) plug in
-// via the kind registry — see RegisterKind.
+// by implementing Authenticator and being wired up in a custom main.
 package auth
 
 import (
@@ -95,10 +95,10 @@ func (f AuthenticatorFunc) Authenticate(r *http.Request) (*AuthContext, error) {
 }
 
 // AlwaysAnonymous is the dev-only authenticator wired up when the
-// operator runs with --auth=none or omits --auth-config. It returns
-// a AuthContext with Issuer="anonymous" and a fixed ID. Production
-// deployments must NOT use this — the serve command logs a loud
-// warning when it's in effect.
+// operator runs with --disable-authn (OCIFACTORY_AUTHN_DISABLED=true).
+// It returns an AuthContext with Issuer="anonymous" and a fixed ID.
+// Production deployments must NOT use this — the serve command logs
+// a loud warning when it's in effect.
 var AlwaysAnonymous Authenticator = AuthenticatorFunc(func(_ *http.Request) (*AuthContext, error) {
 	return &AuthContext{Issuer: "anonymous", ID: "anonymous"}, nil
 })
