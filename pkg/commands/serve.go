@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
@@ -146,8 +147,14 @@ func (f *serveFlags) Validate() error {
 }
 
 func newServeCmd() *cobra.Command {
-	flags := &serveFlags{}
+	return buildServeCmd(&serveFlags{})
+}
 
+// buildServeCmd is the shared constructor newServeCmd and the
+// env-binding test use. Tests pass in their own *serveFlags so they
+// can read the post-env values directly without reaching into the
+// command's closure.
+func buildServeCmd(flags *serveFlags) *cobra.Command {
 	// Per-command viper instance so each test (and future
 	// sub-commands) get isolated state. AutomaticEnv + the
 	// dash→underscore replacer turns every flag-name into the
@@ -166,8 +173,8 @@ func newServeCmd() *cobra.Command {
 		Use:   "serve",
 		Short: "Run the server to serve a specific artifact type.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := loadServeFlags(v, cmd, flags); err != nil {
-				return err
+			if err := applyEnvOverrides(cmd, v); err != nil {
+				return fmt.Errorf("apply env overrides: %w", err)
 			}
 			if err := flags.Validate(); err != nil {
 				return fmt.Errorf("invalid flags: %w", err)
@@ -241,7 +248,7 @@ func newServeCmd() *cobra.Command {
 		"Path to a docker-format config.json for the dockerconfig backend "+
 			"auth kind. Empty = ~/.docker/config.json.")
 
-	// Bind every flag to viper so an env-only deployment works. The
+	// Bind every flag to viper so AutomaticEnv covers them all. The
 	// only error path here is "flag set is nil", which is impossible
 	// — newServeCmd just defined every flag above.
 	if err := v.BindPFlags(cmd.Flags()); err != nil {
@@ -251,74 +258,32 @@ func newServeCmd() *cobra.Command {
 	return cmd
 }
 
-// loadServeFlags pulls the post-precedence (CLI flag > env var >
-// default) values out of viper and writes them back into the
-// serveFlags struct. Necessary because cobra's flag parser already
-// populated the struct with the defaults; viper holds the final
-// values once env vars are layered in.
+// applyEnvOverrides pushes each env-supplied viper value back
+// through the matching pflag's Set method so pflag's per-type
+// parser handles strings, bools, durations, and comma-separated
+// StringSlices uniformly. The serveFlags struct is populated by
+// pflag's setters at parse time, so once Set runs the right value
+// lands in the right field with no per-flag wiring here.
 //
-// Slice flags go through the bound pflag value rather than
-// viper.GetStringSlice so a comma-separated env var (e.g.
-// OCIFACTORY_AUTHN_OIDC_ISSUERS=a,b,c) is parsed by pflag's
-// StringSlice machinery into ["a","b","c"] — viper's own decoder
-// returns ["a,b,c"] for env-supplied slices, which is the wrong
-// shape.
-func loadServeFlags(v *viper.Viper, cmd *cobra.Command, f *serveFlags) error {
-	f.port = v.GetString("port")
-	f.repoType = v.GetString("repo-type")
-	f.registryURLStr = v.GetString("backend-registry")
-	f.disableStreamingPush = v.GetBool("disable-streaming-push")
-	f.simpleIndexCacheTTL = v.GetDuration("simple-index-cache-ttl")
-	f.enableMetrics = v.GetBool("enable-metrics")
-	f.metricsPath = v.GetString("metrics-path")
-
-	f.authnDisabled = v.GetBool("disable-authn")
-	f.authnKind = v.GetString("authn-kind")
-	f.authnOIDCAudience = v.GetString("authn-oidc-audience")
-
-	f.backendAuthKind = v.GetString("backend-auth-kind")
-	f.backendAuthStaticEnvUserEnv = v.GetString("backend-auth-staticenv-user-env")
-	f.backendAuthStaticEnvPasswordEnv = v.GetString("backend-auth-staticenv-password-env")
-	f.backendAuthDockerConfigPath = v.GetString("backend-auth-dockerconfig-path")
-
-	var err error
-	if f.authnOIDCIssuers, err = readStringSlice(cmd, v, "authn-oidc-issuers"); err != nil {
-		return err
-	}
-	if f.backendAuthGCPADCScopes, err = readStringSlice(cmd, v, "backend-auth-gcpadc-scopes"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// readStringSlice resolves a string-slice value following the
-// CLI > env > default precedence, parsing comma-separated env vars
-// through pflag's StringSlice (which is what handles quoting and
-// trimming for the CLI form too).
-func readStringSlice(cmd *cobra.Command, v *viper.Viper, name string) ([]string, error) {
-	// CLI wins outright — viper.IsSet is true for explicit pflag set
-	// even when the same value would also come from env.
-	flag := cmd.Flags().Lookup(name)
-	if flag != nil && flag.Changed {
-		return cmd.Flags().GetStringSlice(name)
-	}
-	raw := v.GetString(name)
-	if raw == "" {
-		// Fall back to the flag's default (typically nil), preserving
-		// the cobra-set value rather than returning an empty slice.
-		if flag != nil {
-			return cmd.Flags().GetStringSlice(name)
+// Precedence:
+//   - flag.Changed — the user passed it on the CLI; leave as-is.
+//   - viper.IsSet  — env var (or any other override layer) wins
+//     over the flag's default.
+//   - otherwise    — the cobra-applied default stands.
+func applyEnvOverrides(cmd *cobra.Command, v *viper.Viper) error {
+	var setErr error
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if setErr != nil || f.Changed {
+			return
 		}
-		return nil, nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
+		if !v.IsSet(f.Name) {
+			return
 		}
-	}
-	return out, nil
+		if err := f.Value.Set(v.GetString(f.Name)); err != nil {
+			setErr = fmt.Errorf("flag %q: %w", f.Name, err)
+		}
+	})
+	return setErr
 }
 
 func runServe(ctx context.Context, flags *serveFlags) error {

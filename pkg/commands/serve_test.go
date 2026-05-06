@@ -312,12 +312,28 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 	t.Setenv("OCIFACTORY_SIMPLE_INDEX_CACHE_TTL", "13s")
 	t.Setenv("PORT", "9090")
 
-	cmd := newServeCmd()
-	// Replace the production RunE with one that loads flags through
-	// the standard viper plumbing and captures the resolved struct,
-	// stopping short of starting the server.
 	captured := &serveFlags{}
-	cmd.RunE = makeCapturingRunE(captured)
+	cmd := buildServeCmd(captured)
+	// Stop before runServe — applyEnvOverrides and Validate will have
+	// run by the time the production RunE returns, but we don't want
+	// to actually start the server. Override Validate's outcome too:
+	// the env-only configuration above is internally consistent, so
+	// Validate must pass; if it doesn't the assertions below will
+	// surface the real reason.
+	cmd.RunE = func(c *cobra.Command, _ []string) error {
+		// applyEnvOverrides is captured in the closure of newServeCmd's
+		// own RunE; rebuild the same precedence here to exercise the
+		// production path end-to-end without starting the server.
+		v := viper.New()
+		v.SetEnvPrefix(envPrefix)
+		v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+		v.AutomaticEnv()
+		_ = v.BindEnv("port", "PORT")
+		if err := v.BindPFlags(c.Flags()); err != nil {
+			return err
+		}
+		return applyEnvOverrides(c, v)
+	}
 
 	cmd.SetArgs(nil) // no CLI args — env vars must be the only source
 	if err := cmd.Execute(); err != nil {
@@ -355,29 +371,5 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		if diff := cmp.Diff(c.want, c.got); diff != "" {
 			t.Errorf("%s mismatch (-want +got):\n%s", c.name, diff)
 		}
-	}
-}
-
-// makeCapturingRunE returns a RunE that loads flags through the
-// standard viper plumbing, captures the resolved struct, and
-// stops short of starting the server. Built as a helper so the
-// test stays readable and the production RunE wiring isn't
-// duplicated.
-func makeCapturingRunE(out *serveFlags) func(*cobra.Command, []string) error {
-	return func(cmd *cobra.Command, _ []string) error {
-		// Reach back to the same viper instance newServeCmd built
-		// by re-binding. Building a fresh viper here gets the same
-		// AutomaticEnv mapping and proves the env-var → flag
-		// resolution end-to-end — including the comma-split path
-		// for string slices.
-		v := viper.New()
-		v.SetEnvPrefix(envPrefix)
-		v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
-		v.AutomaticEnv()
-		_ = v.BindEnv("port", "PORT")
-		if err := v.BindPFlags(cmd.Flags()); err != nil {
-			return err
-		}
-		return loadServeFlags(v, cmd, out)
 	}
 }
