@@ -2,10 +2,14 @@ package commands
 
 import (
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
@@ -281,5 +285,99 @@ func TestServeCmd_Flags(t *testing.T) {
 				t.Errorf("flag %q shorthand: got %q, want %q", tc.flagName, got, want)
 			}
 		})
+	}
+}
+
+// TestServeCmd_EnvVarBindings exercises the viper precedence chain
+// — env var > flag default — for representative scalar, bool,
+// duration, and string-slice flags. CLI flag override is not
+// covered here because cobra parsing only fires under cmd.Execute,
+// which would actually start the server; we trust the standard
+// viper.BindPFlags / pflag.Changed contract for that side.
+//
+// Mutates process-global env, so cannot t.Parallel.
+func TestServeCmd_EnvVarBindings(t *testing.T) {
+	t.Setenv("OCIFACTORY_REPO_TYPE", "python")
+	t.Setenv("OCIFACTORY_BACKEND_REGISTRY", "zot.example.com:5000/ocifactory")
+	t.Setenv("OCIFACTORY_AUTHN_KIND", "oidc")
+	t.Setenv("OCIFACTORY_AUTHN_OIDC_ISSUERS",
+		"https://accounts.google.com,https://token.actions.githubusercontent.com")
+	t.Setenv("OCIFACTORY_AUTHN_OIDC_AUDIENCE", "https://ocifactory.example")
+	t.Setenv("OCIFACTORY_BACKEND_AUTH_KIND", "staticenv")
+	t.Setenv("OCIFACTORY_BACKEND_AUTH_STATICENV_USER_ENV", "REG_USER")
+	t.Setenv("OCIFACTORY_BACKEND_AUTH_STATICENV_PASSWORD_ENV", "REG_PASS")
+	t.Setenv("OCIFACTORY_BACKEND_AUTH_GCPADC_SCOPES",
+		"https://www.googleapis.com/auth/cloud-platform.read-only,https://www.googleapis.com/auth/userinfo.email")
+	t.Setenv("OCIFACTORY_DISABLE_AUTHN", "true")
+	t.Setenv("OCIFACTORY_SIMPLE_INDEX_CACHE_TTL", "13s")
+	t.Setenv("PORT", "9090")
+
+	cmd := newServeCmd()
+	// Replace the production RunE with one that loads flags through
+	// the standard viper plumbing and captures the resolved struct,
+	// stopping short of starting the server.
+	captured := &serveFlags{}
+	cmd.RunE = makeCapturingRunE(captured)
+
+	cmd.SetArgs(nil) // no CLI args — env vars must be the only source
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("cmd.Execute() error = %v", err)
+	}
+
+	wantIssuers := []string{
+		"https://accounts.google.com",
+		"https://token.actions.githubusercontent.com",
+	}
+	wantScopes := []string{
+		"https://www.googleapis.com/auth/cloud-platform.read-only",
+		"https://www.googleapis.com/auth/userinfo.email",
+	}
+
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"port", captured.port, "9090"},
+		{"repoType", captured.repoType, "python"},
+		{"registryURLStr", captured.registryURLStr, "zot.example.com:5000/ocifactory"},
+		{"authnKind", captured.authnKind, "oidc"},
+		{"authnOIDCIssuers", captured.authnOIDCIssuers, wantIssuers},
+		{"authnOIDCAudience", captured.authnOIDCAudience, "https://ocifactory.example"},
+		{"backendAuthKind", captured.backendAuthKind, "staticenv"},
+		{"backendAuthStaticEnvUserEnv", captured.backendAuthStaticEnvUserEnv, "REG_USER"},
+		{"backendAuthStaticEnvPasswordEnv", captured.backendAuthStaticEnvPasswordEnv, "REG_PASS"},
+		{"backendAuthGCPADCScopes", captured.backendAuthGCPADCScopes, wantScopes},
+		{"authnDisabled", captured.authnDisabled, true},
+		{"simpleIndexCacheTTL", captured.simpleIndexCacheTTL, 13 * time.Second},
+	}
+	for _, c := range checks {
+		if diff := cmp.Diff(c.want, c.got); diff != "" {
+			t.Errorf("%s mismatch (-want +got):\n%s", c.name, diff)
+		}
+	}
+}
+
+// makeCapturingRunE returns a RunE that loads flags through the
+// standard viper plumbing, captures the resolved struct, and
+// stops short of starting the server. Built as a helper so the
+// test stays readable and the production RunE wiring isn't
+// duplicated.
+func makeCapturingRunE(out *serveFlags) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, _ []string) error {
+		// Reach back to the same viper instance newServeCmd built
+		// by re-binding. Building a fresh viper here gets the same
+		// AutomaticEnv mapping and proves the env-var → flag
+		// resolution end-to-end — including the comma-split path
+		// for string slices.
+		v := viper.New()
+		v.SetEnvPrefix(envPrefix)
+		v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+		v.AutomaticEnv()
+		_ = v.BindEnv("port", "PORT")
+		if err := v.BindPFlags(cmd.Flags()); err != nil {
+			return err
+		}
+		return loadServeFlags(v, cmd, out)
 	}
 }

@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
@@ -23,6 +23,13 @@ import (
 	"github.com/yolocs/ocifactory/pkg/metrics"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
+
+// envPrefix is the namespace every OCIFACTORY_* env var sits under.
+// Combined with the dash→underscore key replacer, viper maps each
+// flag-name to its env var automatically: --authn-oidc-issuers ↔
+// OCIFACTORY_AUTHN_OIDC_ISSUERS, --backend-auth-kind ↔
+// OCIFACTORY_BACKEND_AUTH_KIND, etc.
+const envPrefix = "OCIFACTORY"
 
 var supportedRepoTypes = []string{
 	maven.RepoType,
@@ -141,10 +148,27 @@ func (f *serveFlags) Validate() error {
 func newServeCmd() *cobra.Command {
 	flags := &serveFlags{}
 
+	// Per-command viper instance so each test (and future
+	// sub-commands) get isolated state. AutomaticEnv + the
+	// dash→underscore replacer turns every flag-name into the
+	// matching OCIFACTORY_* env var, so adding a new flag never
+	// needs a separate env-var lookup line.
+	v := viper.New()
+	v.SetEnvPrefix(envPrefix)
+	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	v.AutomaticEnv()
+	// PORT is the PaaS convention (Cloud Run, Heroku, …) and lives
+	// outside the OCIFACTORY_* namespace; bind it explicitly so
+	// viper picks it up.
+	_ = v.BindEnv("port", "PORT")
+
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the server to serve a specific artifact type.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := loadServeFlags(v, cmd, flags); err != nil {
+				return err
+			}
 			if err := flags.Validate(); err != nil {
 				return fmt.Errorf("invalid flags: %w", err)
 			}
@@ -152,11 +176,11 @@ func newServeCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&flags.port, "port", envOr("PORT", "8080"),
+	cmd.Flags().StringVar(&flags.port, "port", "8080",
 		"The port the server listens to.")
-	cmd.Flags().StringVarP(&flags.repoType, "repo-type", "t", os.Getenv("OCIFACTORY_REPO_TYPE"),
+	cmd.Flags().StringVarP(&flags.repoType, "repo-type", "t", "",
 		fmt.Sprintf("Type of repository to serve. Allowed: %v", supportedRepoTypes))
-	cmd.Flags().StringVar(&flags.registryURLStr, "backend-registry", os.Getenv("OCIFACTORY_BACKEND_REGISTRY"),
+	cmd.Flags().StringVar(&flags.registryURLStr, "backend-registry", "",
 		"The URL to the backend OCI registry.")
 	cmd.Flags().BoolVar(&flags.disableStreamingPush, "disable-streaming-push", false,
 		"Force every blob upload through the buffered + monolithic path. "+
@@ -182,77 +206,110 @@ func newServeCmd() *cobra.Command {
 	// Frontend authentication flags. Single kind today (oidc); the
 	// flag exists so adding mTLS / GitHub PAT / static passwords later
 	// fits without an env-var-shape change.
-	cmd.Flags().BoolVar(&flags.authnDisabled, "disable-authn", envBool("OCIFACTORY_AUTHN_DISABLED"),
+	cmd.Flags().BoolVar(&flags.authnDisabled, "disable-authn", false,
 		"Disable inbound authentication entirely. Wires AlwaysAnonymous "+
 			"and logs a loud warning at startup. For local development "+
 			"against unauthenticated zot only — never use in production. "+
 			"Mutually exclusive with --authn-kind.")
-	cmd.Flags().StringVar(&flags.authnKind, "authn-kind", os.Getenv("OCIFACTORY_AUTHN_KIND"),
+	cmd.Flags().StringVar(&flags.authnKind, "authn-kind", "",
 		fmt.Sprintf("Authenticator kind. Allowed: %v.", supportedAuthnKinds))
-	cmd.Flags().StringSliceVar(&flags.authnOIDCIssuers, "authn-oidc-issuers", envCSV("OCIFACTORY_AUTHN_OIDC_ISSUERS"),
+	cmd.Flags().StringSliceVar(&flags.authnOIDCIssuers, "authn-oidc-issuers", nil,
 		"Comma-separated list of trusted OIDC issuer URLs. One authenticator "+
 			"is built per issuer and they are tried in declaration order — a "+
 			"token whose iss matches any entry is accepted. Required when "+
 			"--authn-kind=oidc.")
-	cmd.Flags().StringVar(&flags.authnOIDCAudience, "authn-oidc-audience", os.Getenv("OCIFACTORY_AUTHN_OIDC_AUDIENCE"),
+	cmd.Flags().StringVar(&flags.authnOIDCAudience, "authn-oidc-audience", "",
 		"Required audience claim every accepted OIDC token must carry. "+
 			"Required when --authn-kind=oidc.")
 
 	// Backend OCI registry credentials.
-	cmd.Flags().StringVar(&flags.backendAuthKind, "backend-auth-kind", envOr("OCIFACTORY_BACKEND_AUTH_KIND", backend.KindAnonymous),
+	cmd.Flags().StringVar(&flags.backendAuthKind, "backend-auth-kind", backend.KindAnonymous,
 		fmt.Sprintf("Credential provider for the backend OCI registry. "+
 			"Allowed: %v. Defaults to %q (empty credential, fine for public "+
 			"read-only registries; fails closed against private ones).",
 			backend.AllKinds, backend.KindAnonymous))
-	cmd.Flags().StringSliceVar(&flags.backendAuthGCPADCScopes, "backend-auth-gcpadc-scopes",
-		envCSV("OCIFACTORY_BACKEND_AUTH_GCPADC_SCOPES"),
+	cmd.Flags().StringSliceVar(&flags.backendAuthGCPADCScopes, "backend-auth-gcpadc-scopes", nil,
 		"Comma-separated OAuth2 scopes for the gcpadc backend auth kind. "+
 			"Empty = cloud-platform.")
-	cmd.Flags().StringVar(&flags.backendAuthStaticEnvUserEnv, "backend-auth-staticenv-user-env",
-		os.Getenv("OCIFACTORY_BACKEND_AUTH_STATICENV_USER_ENV"),
+	cmd.Flags().StringVar(&flags.backendAuthStaticEnvUserEnv, "backend-auth-staticenv-user-env", "",
 		"Name of the env var holding the username for the staticenv backend "+
 			"auth kind. Required when --backend-auth-kind=staticenv.")
-	cmd.Flags().StringVar(&flags.backendAuthStaticEnvPasswordEnv, "backend-auth-staticenv-password-env",
-		os.Getenv("OCIFACTORY_BACKEND_AUTH_STATICENV_PASSWORD_ENV"),
+	cmd.Flags().StringVar(&flags.backendAuthStaticEnvPasswordEnv, "backend-auth-staticenv-password-env", "",
 		"Name of the env var holding the password for the staticenv backend "+
 			"auth kind. Required when --backend-auth-kind=staticenv.")
-	cmd.Flags().StringVar(&flags.backendAuthDockerConfigPath, "backend-auth-dockerconfig-path",
-		os.Getenv("OCIFACTORY_BACKEND_AUTH_DOCKERCONFIG_PATH"),
+	cmd.Flags().StringVar(&flags.backendAuthDockerConfigPath, "backend-auth-dockerconfig-path", "",
 		"Path to a docker-format config.json for the dockerconfig backend "+
 			"auth kind. Empty = ~/.docker/config.json.")
+
+	// Bind every flag to viper so an env-only deployment works. The
+	// only error path here is "flag set is nil", which is impossible
+	// — newServeCmd just defined every flag above.
+	if err := v.BindPFlags(cmd.Flags()); err != nil {
+		panic(fmt.Errorf("bind flags to viper: %w", err))
+	}
 
 	return cmd
 }
 
-// envOr returns the value of the named env var, or fallback when
-// it's unset.
-func envOr(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
+// loadServeFlags pulls the post-precedence (CLI flag > env var >
+// default) values out of viper and writes them back into the
+// serveFlags struct. Necessary because cobra's flag parser already
+// populated the struct with the defaults; viper holds the final
+// values once env vars are layered in.
+//
+// Slice flags go through the bound pflag value rather than
+// viper.GetStringSlice so a comma-separated env var (e.g.
+// OCIFACTORY_AUTHN_OIDC_ISSUERS=a,b,c) is parsed by pflag's
+// StringSlice machinery into ["a","b","c"] — viper's own decoder
+// returns ["a,b,c"] for env-supplied slices, which is the wrong
+// shape.
+func loadServeFlags(v *viper.Viper, cmd *cobra.Command, f *serveFlags) error {
+	f.port = v.GetString("port")
+	f.repoType = v.GetString("repo-type")
+	f.registryURLStr = v.GetString("backend-registry")
+	f.disableStreamingPush = v.GetBool("disable-streaming-push")
+	f.simpleIndexCacheTTL = v.GetDuration("simple-index-cache-ttl")
+	f.enableMetrics = v.GetBool("enable-metrics")
+	f.metricsPath = v.GetString("metrics-path")
+
+	f.authnDisabled = v.GetBool("disable-authn")
+	f.authnKind = v.GetString("authn-kind")
+	f.authnOIDCAudience = v.GetString("authn-oidc-audience")
+
+	f.backendAuthKind = v.GetString("backend-auth-kind")
+	f.backendAuthStaticEnvUserEnv = v.GetString("backend-auth-staticenv-user-env")
+	f.backendAuthStaticEnvPasswordEnv = v.GetString("backend-auth-staticenv-password-env")
+	f.backendAuthDockerConfigPath = v.GetString("backend-auth-dockerconfig-path")
+
+	var err error
+	if f.authnOIDCIssuers, err = readStringSlice(cmd, v, "authn-oidc-issuers"); err != nil {
+		return err
 	}
-	return fallback
+	if f.backendAuthGCPADCScopes, err = readStringSlice(cmd, v, "backend-auth-gcpadc-scopes"); err != nil {
+		return err
+	}
+	return nil
 }
 
-// envBool returns true iff the named env var is set to a truthy
-// value. Anything not in the truthy set (including empty / unset)
-// returns false.
-func envBool(key string) bool {
-	switch strings.ToLower(os.Getenv(key)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+// readStringSlice resolves a string-slice value following the
+// CLI > env > default precedence, parsing comma-separated env vars
+// through pflag's StringSlice (which is what handles quoting and
+// trimming for the CLI form too).
+func readStringSlice(cmd *cobra.Command, v *viper.Viper, name string) ([]string, error) {
+	// CLI wins outright — viper.IsSet is true for explicit pflag set
+	// even when the same value would also come from env.
+	flag := cmd.Flags().Lookup(name)
+	if flag != nil && flag.Changed {
+		return cmd.Flags().GetStringSlice(name)
 	}
-}
-
-// envCSV returns the named env var split on commas, with empty
-// entries dropped and surrounding whitespace trimmed. Returns nil
-// when the var is unset so cobra's StringSliceVar default-value
-// semantics are preserved.
-func envCSV(key string) []string {
-	raw, ok := os.LookupEnv(key)
-	if !ok || raw == "" {
-		return nil
+	raw := v.GetString(name)
+	if raw == "" {
+		// Fall back to the flag's default (typically nil), preserving
+		// the cobra-set value rather than returning an empty slice.
+		if flag != nil {
+			return cmd.Flags().GetStringSlice(name)
+		}
+		return nil, nil
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
@@ -261,7 +318,7 @@ func envCSV(key string) []string {
 			out = append(out, t)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func runServe(ctx context.Context, flags *serveFlags) error {
