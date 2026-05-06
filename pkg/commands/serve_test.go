@@ -13,126 +13,110 @@ import (
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
-// minimalServeViper builds a viper.Viper preloaded with the minimum
-// to pass every Validate guard except the one each case is
-// exercising. Tests override specific keys with v.Set; everything
-// else stays at the safe default.
-func minimalServeViper(t *testing.T) *viper.Viper {
-	t.Helper()
-	v := viper.New()
-	v.Set(flagPort, "8080")
-	v.Set(flagRepoType, "maven")
-	v.Set(flagBackendRegistry, "http://example.com")
-	v.Set(flagDisableAuthn, true)
-	return v
+// minimalServeConfig returns a serveConfig pre-populated with the
+// minimum fields needed to pass every Validate guard except the one
+// each case is exercising. Tests override specific fields.
+func minimalServeConfig() serveConfig {
+	return serveConfig{
+		Port:            "8080",
+		RepoType:        "maven",
+		BackendRegistry: "http://example.com",
+		DisableAuthn:    true,
+	}
 }
 
-func TestValidateServeConfig(t *testing.T) {
+func TestServeConfig_Validate(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		name    string
-		setup   func(v *viper.Viper)
+		mut     func(c *serveConfig)
 		wantErr string
 		wantURL *url.URL
 	}{
 		{
-			name:  "all fields set",
-			setup: func(v *viper.Viper) {},
-			wantURL: &url.URL{
-				Scheme: "http",
-				Host:   "example.com",
-			},
+			name:    "all fields set",
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name:    "missing port",
-			setup:   func(v *viper.Viper) { v.Set(flagPort, "") },
+			mut:     func(c *serveConfig) { c.Port = "" },
 			wantErr: "port is required",
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name:    "missing repo type",
-			setup:   func(v *viper.Viper) { v.Set(flagRepoType, "") },
+			mut:     func(c *serveConfig) { c.RepoType = "" },
 			wantErr: `repo-type "" is not supported`,
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name:    "invalid repo type",
-			setup:   func(v *viper.Viper) { v.Set(flagRepoType, "invalid") },
+			mut:     func(c *serveConfig) { c.RepoType = "invalid" },
 			wantErr: `repo-type "invalid" is not supported`,
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
-			name: "missing registry URL",
-			setup: func(v *viper.Viper) {
-				v.Set(flagBackendRegistry, "")
-			},
+			name:    "missing registry URL",
+			mut:     func(c *serveConfig) { c.BackendRegistry = "" },
 			wantErr: "backend-registry is required",
-			// validateServeConfig short-circuits before parsing the URL.
+			// Validate short-circuits before parsing the URL.
 		},
 		{
-			name: "registry URL without protocol prefix",
-			setup: func(v *viper.Viper) {
-				v.Set(flagBackendRegistry, "example.com")
-			},
+			name:    "registry URL without protocol prefix",
+			mut:     func(c *serveConfig) { c.BackendRegistry = "example.com" },
 			wantURL: &url.URL{Scheme: "https", Host: "example.com"},
 		},
 		{
-			name: "https registry URL passed directly",
-			setup: func(v *viper.Viper) {
-				v.Set(flagBackendRegistry, "https://gar.example.com/project")
-			},
-			wantURL: &url.URL{
-				Scheme: "https",
-				Host:   "gar.example.com",
-				Path:   "/project",
-			},
+			name:    "https registry URL passed directly",
+			mut:     func(c *serveConfig) { c.BackendRegistry = "https://gar.example.com/project" },
+			wantURL: &url.URL{Scheme: "https", Host: "gar.example.com", Path: "/project"},
 		},
 		{
 			name: "missing authn config rejects",
-			setup: func(v *viper.Viper) {
-				v.Set(flagDisableAuthn, false)
-				v.Set(flagAuthnKind, "")
+			mut: func(c *serveConfig) {
+				c.DisableAuthn = false
+				c.AuthnKind = ""
 			},
 			wantErr: "either --authn-kind",
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "unsupported authn kind",
-			setup: func(v *viper.Viper) {
-				v.Set(flagDisableAuthn, false)
-				v.Set(flagAuthnKind, "saml")
+			mut: func(c *serveConfig) {
+				c.DisableAuthn = false
+				c.AuthnKind = "saml"
 			},
 			wantErr: `authn-kind "saml" is not supported`,
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind missing issuers",
-			setup: func(v *viper.Viper) {
-				v.Set(flagDisableAuthn, false)
-				v.Set(flagAuthnKind, "oidc")
-				v.Set(flagAuthnOIDCAudience, "https://ocifactory.example")
+			mut: func(c *serveConfig) {
+				c.DisableAuthn = false
+				c.AuthnKind = "oidc"
+				c.AuthnOIDCAudience = "https://ocifactory.example"
 			},
 			wantErr: "authn-oidc-issuers",
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind missing audience",
-			setup: func(v *viper.Viper) {
-				v.Set(flagDisableAuthn, false)
-				v.Set(flagAuthnKind, "oidc")
-				v.Set(flagAuthnOIDCIssuers, []string{"https://accounts.google.com"})
+			mut: func(c *serveConfig) {
+				c.DisableAuthn = false
+				c.AuthnKind = "oidc"
+				c.AuthnOIDCIssuers = []string{"https://accounts.google.com"}
 			},
 			wantErr: "authn-oidc-audience",
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
 		{
 			name: "oidc kind fully configured",
-			setup: func(v *viper.Viper) {
-				v.Set(flagDisableAuthn, false)
-				v.Set(flagAuthnKind, "oidc")
-				v.Set(flagAuthnOIDCIssuers, []string{"https://accounts.google.com"})
-				v.Set(flagAuthnOIDCAudience, "https://ocifactory.example")
+			mut: func(c *serveConfig) {
+				c.DisableAuthn = false
+				c.AuthnKind = "oidc"
+				c.AuthnOIDCIssuers = []string{"https://accounts.google.com"}
+				c.AuthnOIDCAudience = "https://ocifactory.example"
 			},
 			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
 		},
@@ -140,18 +124,18 @@ func TestValidateServeConfig(t *testing.T) {
 			// echo never talks to an OCI backend, so --backend-registry
 			// is optional.
 			name: "echo without backend-registry is allowed",
-			setup: func(v *viper.Viper) {
-				v.Set(flagRepoType, "echo")
-				v.Set(flagBackendRegistry, "")
+			mut: func(c *serveConfig) {
+				c.RepoType = "echo"
+				c.BackendRegistry = ""
 			},
 		},
 		{
 			// echo accepts --backend-registry too — make sure URL parsing
 			// still happens so a malformed value would be caught.
 			name: "echo with backend-registry parses URL",
-			setup: func(v *viper.Viper) {
-				v.Set(flagRepoType, "echo")
-				v.Set(flagBackendRegistry, "https://example.com")
+			mut: func(c *serveConfig) {
+				c.RepoType = "echo"
+				c.BackendRegistry = "https://example.com"
 			},
 			wantURL: &url.URL{Scheme: "https", Host: "example.com"},
 		},
@@ -160,16 +144,16 @@ func TestValidateServeConfig(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			v := minimalServeViper(t)
-			if tc.setup != nil {
-				tc.setup(v)
+			c := minimalServeConfig()
+			if tc.mut != nil {
+				tc.mut(&c)
 			}
-			gotURL, err := validateServeConfig(v)
+			err := c.Validate()
 			if diff := testutil.DiffErrString(err, tc.wantErr); diff != "" {
-				t.Errorf("validateServeConfig() error: %s", diff)
+				t.Errorf("Validate() error: %s", diff)
 			}
-			if diff := cmp.Diff(tc.wantURL, gotURL, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("validateServeConfig() URL mismatch (-want +got):\n%s", diff)
+			if diff := cmp.Diff(tc.wantURL, c.RegistryURL, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("Validate() RegistryURL mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -216,9 +200,9 @@ func TestServeCmd_Flags(t *testing.T) {
 
 // TestServeCmd_EnvVarBindings exercises viper's resolution chain end
 // to end: with no CLI args and only OCIFACTORY_* / PORT in env,
-// every flag must surface the env value via v.GetString / GetBool /
-// GetDuration / stringSliceCSV. This guards the env-only deployment
-// path that Cloud Run / k8s rely on.
+// every flag must surface the env value in the unmarshaled
+// serveConfig — including comma-split slices and parsed durations,
+// which viper.Unmarshal handles via its default DecodeHook.
 //
 // Mutates process-global env, so cannot t.Parallel.
 func TestServeCmd_EnvVarBindings(t *testing.T) {
@@ -244,45 +228,42 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 	_ = v.BindEnv(flagPort, "PORT")
 
 	cmd := buildServeCmd(v)
-	// Stop short of starting the server: replace RunE with a no-op
-	// so we only exercise flag parsing + viper binding.
-	cmd.RunE = func(c *cobra.Command, _ []string) error { return nil }
+	// Stop short of starting the server: capture the unmarshaled
+	// config and return.
+	var got serveConfig
+	cmd.RunE = func(c *cobra.Command, _ []string) error {
+		return v.Unmarshal(&got)
+	}
 
 	cmd.SetArgs(nil) // no CLI args — env vars must be the only source
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("cmd.Execute() error = %v", err)
 	}
 
-	wantIssuers := []string{
-		"https://accounts.google.com",
-		"https://token.actions.githubusercontent.com",
+	want := serveConfig{
+		Port:            "9090",
+		RepoType:        "python",
+		BackendRegistry: "zot.example.com:5000/ocifactory",
+		// Defaults the production binary advertises in --help.
+		EnableMetrics:       true,
+		MetricsPath:         "/metrics",
+		SimpleIndexCacheTTL: 13 * time.Second,
+		DisableAuthn:        true,
+		AuthnKind:           "oidc",
+		AuthnOIDCIssuers: []string{
+			"https://accounts.google.com",
+			"https://token.actions.githubusercontent.com",
+		},
+		AuthnOIDCAudience: "https://ocifactory.example",
+		BackendAuthKind:   "staticenv",
+		BackendAuthGCPADCScopes: []string{
+			"https://www.googleapis.com/auth/cloud-platform.read-only",
+			"https://www.googleapis.com/auth/userinfo.email",
+		},
+		BackendAuthStaticEnvUserEnv:     "REG_USER",
+		BackendAuthStaticEnvPasswordEnv: "REG_PASS",
 	}
-	wantScopes := []string{
-		"https://www.googleapis.com/auth/cloud-platform.read-only",
-		"https://www.googleapis.com/auth/userinfo.email",
-	}
-
-	checks := []struct {
-		name string
-		got  any
-		want any
-	}{
-		{flagPort, v.GetString(flagPort), "9090"},
-		{flagRepoType, v.GetString(flagRepoType), "python"},
-		{flagBackendRegistry, v.GetString(flagBackendRegistry), "zot.example.com:5000/ocifactory"},
-		{flagAuthnKind, v.GetString(flagAuthnKind), "oidc"},
-		{flagAuthnOIDCIssuers, stringSliceCSV(v, flagAuthnOIDCIssuers), wantIssuers},
-		{flagAuthnOIDCAudience, v.GetString(flagAuthnOIDCAudience), "https://ocifactory.example"},
-		{flagBackendAuthKind, v.GetString(flagBackendAuthKind), "staticenv"},
-		{flagBackendAuthStaticEnvUserEnv, v.GetString(flagBackendAuthStaticEnvUserEnv), "REG_USER"},
-		{flagBackendAuthStaticEnvPasswordEnv, v.GetString(flagBackendAuthStaticEnvPasswordEnv), "REG_PASS"},
-		{flagBackendAuthGCPADCScopes, stringSliceCSV(v, flagBackendAuthGCPADCScopes), wantScopes},
-		{flagDisableAuthn, v.GetBool(flagDisableAuthn), true},
-		{flagSimpleIndexCacheTTL, v.GetDuration(flagSimpleIndexCacheTTL), 13 * time.Second},
-	}
-	for _, c := range checks {
-		if diff := cmp.Diff(c.want, c.got); diff != "" {
-			t.Errorf("%s mismatch (-want +got):\n%s", c.name, diff)
-		}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Unmarshal mismatch (-want +got):\n%s", diff)
 	}
 }

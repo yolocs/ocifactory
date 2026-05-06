@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -55,8 +56,9 @@ var supportedAuthnKinds = []string{authnKindOIDC}
 
 // Flag-name constants. Used as both the cobra flag name and the
 // viper key (with the env-prefix and dash→underscore mapping
-// adding the OCIFACTORY_* env-var form). Centralised so the
-// validation, runServe, and test paths share one source of truth.
+// adding the OCIFACTORY_* env-var form). The matching mapstructure
+// tags on serveConfig fields below MUST stay in sync — there's no
+// compile-time check that the strings line up.
 const (
 	flagPort                            = "port"
 	flagRepoType                        = "repo-type"
@@ -76,100 +78,96 @@ const (
 	flagBackendAuthDockerConfigPath     = "backend-auth-dockerconfig-path"
 )
 
-// validateServeConfig checks that v's resolved values (CLI > env >
-// default, per viper's documented precedence) are internally
-// consistent. Returns the parsed backend-registry URL — nil when
-// the operator didn't supply one — so runServe doesn't have to
-// re-parse it.
-//
-// Any URL the operator gave without an http(s):// scheme is
-// rewritten to https:// in v itself, so a downstream Get of
-// backend-registry sees the canonical form.
-func validateServeConfig(v *viper.Viper) (*url.URL, error) {
+// serveConfig is the typed view of the resolved CLI/env/default
+// configuration. Populated by viper.Unmarshal, which uses viper's
+// default DecodeHook to comma-split env-supplied slices and parse
+// time.Duration strings. Validation runs against this struct;
+// runServe and the build* helpers consume it directly.
+type serveConfig struct {
+	Port                 string        `mapstructure:"port"`
+	RepoType             string        `mapstructure:"repo-type"`
+	BackendRegistry      string        `mapstructure:"backend-registry"`
+	DisableStreamingPush bool          `mapstructure:"disable-streaming-push"`
+	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
+	EnableMetrics        bool          `mapstructure:"enable-metrics"`
+	MetricsPath          string        `mapstructure:"metrics-path"`
+
+	DisableAuthn      bool     `mapstructure:"disable-authn"`
+	AuthnKind         string   `mapstructure:"authn-kind"`
+	AuthnOIDCIssuers  []string `mapstructure:"authn-oidc-issuers"`
+	AuthnOIDCAudience string   `mapstructure:"authn-oidc-audience"`
+
+	BackendAuthKind                 string   `mapstructure:"backend-auth-kind"`
+	BackendAuthGCPADCScopes         []string `mapstructure:"backend-auth-gcpadc-scopes"`
+	BackendAuthStaticEnvUserEnv     string   `mapstructure:"backend-auth-staticenv-user-env"`
+	BackendAuthStaticEnvPasswordEnv string   `mapstructure:"backend-auth-staticenv-password-env"`
+	BackendAuthDockerConfigPath     string   `mapstructure:"backend-auth-dockerconfig-path"`
+
+	// RegistryURL is computed by Validate from BackendRegistry. Not
+	// populated by Unmarshal — the `-` tag tells mapstructure to
+	// skip it.
+	RegistryURL *url.URL `mapstructure:"-"`
+}
+
+// Validate checks that c is internally consistent and populates
+// c.RegistryURL by parsing c.BackendRegistry. Returns the joined
+// validation errors. Any URL the operator gave without an
+// http(s):// scheme is rewritten to https:// in c itself.
+func (c *serveConfig) Validate() error {
 	var merr error
-	if v.GetString(flagPort) == "" {
+	if c.Port == "" {
 		merr = errors.Join(merr, fmt.Errorf("port is required"))
 	}
-	repoType := v.GetString(flagRepoType)
 	repoSupported := false
 	for _, t := range supportedRepoTypes {
-		if t == repoType {
+		if t == c.RepoType {
 			repoSupported = true
 			break
 		}
 	}
 	if !repoSupported {
-		merr = errors.Join(merr, fmt.Errorf("repo-type %q is not supported", repoType))
+		merr = errors.Join(merr, fmt.Errorf("repo-type %q is not supported", c.RepoType))
 	}
-
-	registryURLStr := v.GetString(flagBackendRegistry)
-	if repoTypesNeedingBackend[repoType] && registryURLStr == "" {
-		merr = errors.Join(merr, fmt.Errorf("backend-registry is required for --repo-type=%s", repoType))
-		return nil, merr
+	if repoTypesNeedingBackend[c.RepoType] && c.BackendRegistry == "" {
+		merr = errors.Join(merr, fmt.Errorf("backend-registry is required for --repo-type=%s", c.RepoType))
+		return merr
 	}
-
-	if !v.GetBool(flagDisableAuthn) {
-		kind := v.GetString(flagAuthnKind)
-		if kind == "" {
+	if !c.DisableAuthn {
+		if c.AuthnKind == "" {
 			merr = errors.Join(merr, fmt.Errorf("either --authn-kind (OCIFACTORY_AUTHN_KIND) or --disable-authn must be set"))
 		} else {
 			supported := false
 			for _, k := range supportedAuthnKinds {
-				if k == kind {
+				if k == c.AuthnKind {
 					supported = true
 					break
 				}
 			}
 			if !supported {
-				merr = errors.Join(merr, fmt.Errorf("authn-kind %q is not supported (allowed: %v)", kind, supportedAuthnKinds))
+				merr = errors.Join(merr, fmt.Errorf("authn-kind %q is not supported (allowed: %v)", c.AuthnKind, supportedAuthnKinds))
 			}
-			if kind == authnKindOIDC {
-				if len(stringSliceCSV(v, flagAuthnOIDCIssuers)) == 0 {
+			if c.AuthnKind == authnKindOIDC {
+				if len(c.AuthnOIDCIssuers) == 0 {
 					merr = errors.Join(merr, fmt.Errorf("--authn-oidc-issuers (OCIFACTORY_AUTHN_OIDC_ISSUERS) is required for --authn-kind=oidc"))
 				}
-				if v.GetString(flagAuthnOIDCAudience) == "" {
+				if c.AuthnOIDCAudience == "" {
 					merr = errors.Join(merr, fmt.Errorf("--authn-oidc-audience (OCIFACTORY_AUTHN_OIDC_AUDIENCE) is required for --authn-kind=oidc"))
 				}
 			}
 		}
 	}
-
-	var registryURL *url.URL
-	if registryURLStr != "" {
-		// Default to https when the user omits the scheme.
-		if !strings.HasPrefix(registryURLStr, "http://") && !strings.HasPrefix(registryURLStr, "https://") {
-			registryURLStr = "https://" + registryURLStr
-			v.Set(flagBackendRegistry, registryURLStr)
+	if c.BackendRegistry != "" {
+		if !strings.HasPrefix(c.BackendRegistry, "http://") && !strings.HasPrefix(c.BackendRegistry, "https://") {
+			c.BackendRegistry = "https://" + c.BackendRegistry
 		}
-		u, err := url.Parse(registryURLStr)
+		u, err := url.Parse(c.BackendRegistry)
 		if err != nil {
 			merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
 		} else {
-			registryURL = u
+			c.RegistryURL = u
 		}
 	}
-	return registryURL, merr
-}
-
-// stringSliceCSV reads a string slice from v while accommodating
-// viper's known gap: GetStringSlice doesn't comma-split env-supplied
-// values. pflag's StringSlice handles the CLI form (returning a
-// real []string), and SetDefault preserves slice defaults verbatim;
-// only the env path needs explicit splitting, detected by a
-// single-element result whose element contains a comma.
-func stringSliceCSV(v *viper.Viper, key string) []string {
-	raw := v.GetStringSlice(key)
-	if len(raw) == 1 && strings.Contains(raw[0], ",") {
-		parts := strings.Split(raw[0], ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if t := strings.TrimSpace(p); t != "" {
-				out = append(out, t)
-			}
-		}
-		return out
-	}
-	return raw
+	return merr
 }
 
 func newServeCmd() *cobra.Command {
@@ -186,18 +184,22 @@ func newServeCmd() *cobra.Command {
 
 // buildServeCmd is the shared constructor — newServeCmd builds the
 // production viper instance, tests pass in one wired the way they
-// need. The viper instance becomes the single source of truth for
-// every value RunE / runServe / validateServeConfig consumes.
+// need. The viper instance is the layered config; Unmarshal in
+// RunE converts it into a serveConfig that everything downstream
+// consumes.
 func buildServeCmd(v *viper.Viper) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the server to serve a specific artifact type.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			registryURL, err := validateServeConfig(v)
-			if err != nil {
+			var cfg serveConfig
+			if err := v.Unmarshal(&cfg); err != nil {
+				return fmt.Errorf("unmarshal config: %w", err)
+			}
+			if err := cfg.Validate(); err != nil {
 				return fmt.Errorf("invalid flags: %w", err)
 			}
-			return runServe(cmd.Context(), v, registryURL)
+			return runServe(cmd.Context(), &cfg)
 		},
 	}
 
@@ -211,11 +213,10 @@ func buildServeCmd(v *viper.Viper) *cobra.Command {
 }
 
 // registerServeFlags installs the serve command's CLI flags on the
-// given pflag.FlagSet without binding them to a struct: viper holds
-// every value, and runServe / validateServeConfig read directly
-// from viper. pflag still sets the default each flag advertises in
-// --help, which is what viper's "pflag default" precedence layer
-// returns when no override exists.
+// given pflag.FlagSet without any struct binding. pflag still sets
+// the default each flag advertises in --help; viper holds the
+// resolved values, and Unmarshal in RunE writes them into a
+// serveConfig.
 func registerServeFlags(flags *pflag.FlagSet) {
 	flags.String(flagPort, "8080",
 		"The port the server listens to.")
@@ -281,16 +282,16 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"auth kind. Empty = ~/.docker/config.json.")
 }
 
-func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
-	rec, metricsHandler := buildRecorder(v.GetBool(flagEnableMetrics))
+func runServe(ctx context.Context, cfg *serveConfig) error {
+	rec, metricsHandler := buildRecorder(cfg.EnableMetrics)
 
-	authn, err := buildAuthn(ctx, v)
+	authn, err := buildAuthn(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to build authenticator: %w", err)
 	}
 	authMW := auth.Middleware(authn)
 
-	bp, err := buildBackendAuth(ctx, v)
+	bp, err := buildBackendAuth(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to build backend credentials: %w", err)
 	}
@@ -301,16 +302,15 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 		format string
 	)
 	registryOpts := []oci.RegistryOption{
-		oci.WithStreamingPushDisabled(v.GetBool(flagDisableStreamingPush)),
+		oci.WithStreamingPushDisabled(cfg.DisableStreamingPush),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
 	}
 
-	repoType := v.GetString(flagRepoType)
-	switch repoType {
+	switch cfg.RepoType {
 	case maven.RepoType:
 		r, err := oci.NewRegistry(
-			registryURL,
+			cfg.RegistryURL,
 			append(registryOpts, oci.WithArtifactType(maven.ArtifactType))...,
 		)
 		if err != nil {
@@ -323,14 +323,14 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 		reg, format, h = r, maven.RepoType, mh.Mux()
 	case python.RepoType:
 		r, err := oci.NewRegistry(
-			registryURL,
+			cfg.RegistryURL,
 			append(registryOpts, oci.WithArtifactType(python.ArtifactType))...,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
 		ph, err := python.NewHandler(r,
-			python.WithSimpleIndexCacheTTL(v.GetDuration(flagSimpleIndexCacheTTL)),
+			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithAuthMiddleware(authMW),
 		)
 		if err != nil {
@@ -345,7 +345,7 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 		eh := echo.NewHandler(echo.WithAuthMiddleware(authMW))
 		format, h = echo.RepoType, eh.Mux()
 	default:
-		return fmt.Errorf("repo-type %q is not supported", repoType)
+		return fmt.Errorf("repo-type %q is not supported", cfg.RepoType)
 	}
 
 	// Wrap the format mux with the format tag, then with the
@@ -354,8 +354,8 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 	// so SetFormat from inside WrapWithFormat propagates back up
 	// through any gorilla/mux dispatch.
 	h = handler.WrapWithFormat(format)(h)
-	metricsPath := v.GetString(flagMetricsPath)
-	if !v.GetBool(flagEnableMetrics) {
+	metricsPath := cfg.MetricsPath
+	if !cfg.EnableMetrics {
 		metricsPath = ""
 	}
 	h = handler.ObservabilityHandler(h, reg, metricsHandler, metricsPath)
@@ -365,7 +365,7 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 	// This leaves /healthz, /readyz, /metrics and any future
 	// public-by-default routes ungated.
 	srv, err := handler.NewServer(
-		v.GetString(flagPort),
+		cfg.Port,
 		handler.Loggeer,
 		handler.MetricsMiddleware(rec),
 	)
@@ -377,8 +377,7 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 }
 
 // buildAuthn constructs the auth.Authenticator the server installs
-// in front of every protected route, from the OCIFACTORY_AUTHN_*
-// configuration. Two paths:
+// in front of every protected route. Two paths:
 //
 //  1. --disable-authn (OCIFACTORY_AUTHN_DISABLED=true): wires
 //     AlwaysAnonymous with a loud warning. Local dev only.
@@ -387,23 +386,20 @@ func runServe(ctx context.Context, v *viper.Viper, registryURL *url.URL) error {
 //     and chains them in declaration order so a token whose iss
 //     matches any configured issuer is accepted.
 //
-// validateServeConfig refuses to run with neither set, so any
-// other branch is unreachable in production.
-func buildAuthn(ctx context.Context, v *viper.Viper) (auth.Authenticator, error) {
+// Validate refuses to run with neither set, so any other branch is
+// unreachable in production.
+func buildAuthn(ctx context.Context, cfg *serveConfig) (auth.Authenticator, error) {
 	logger := logging.NewFromEnv("OCIFACTORY_")
-	if v.GetBool(flagDisableAuthn) {
+	if cfg.DisableAuthn {
 		logger.WarnContext(ctx, "AUTHENTICATION DISABLED — every request authenticates as anonymous. "+
 			"Do not use --disable-authn in production.")
 		return auth.AlwaysAnonymous, nil
 	}
-	kind := v.GetString(flagAuthnKind)
-	switch kind {
+	switch cfg.AuthnKind {
 	case authnKindOIDC:
-		issuers := stringSliceCSV(v, flagAuthnOIDCIssuers)
-		audience := v.GetString(flagAuthnOIDCAudience)
-		children := make([]auth.Authenticator, 0, len(issuers))
-		for _, issuer := range issuers {
-			a, err := oidc.New(issuer, audience)
+		children := make([]auth.Authenticator, 0, len(cfg.AuthnOIDCIssuers))
+		for _, issuer := range cfg.AuthnOIDCIssuers {
+			a, err := oidc.New(issuer, cfg.AuthnOIDCAudience)
 			if err != nil {
 				return nil, fmt.Errorf("oidc issuer %q: %w", issuer, err)
 			}
@@ -411,34 +407,33 @@ func buildAuthn(ctx context.Context, v *viper.Viper) (auth.Authenticator, error)
 		}
 		return chain.New(children...), nil
 	default:
-		// validateServeConfig catches this earlier; defensive
-		// return so an out-of-tree main calling runServe directly
-		// still gets a clean error.
-		return nil, fmt.Errorf("authn-kind %q is not supported (allowed: %v)", kind, supportedAuthnKinds)
+		// Validate catches this earlier; defensive return so an
+		// out-of-tree main calling runServe directly still gets a
+		// clean error.
+		return nil, fmt.Errorf("authn-kind %q is not supported (allowed: %v)", cfg.AuthnKind, supportedAuthnKinds)
 	}
 }
 
 // buildBackendAuth constructs the credential provider ocifactory
-// presents to the backend OCI registry, from the
-// OCIFACTORY_BACKEND_AUTH_* configuration. When the operator hasn't
+// presents to the backend OCI registry. When the operator hasn't
 // set --backend-auth-kind / OCIFACTORY_BACKEND_AUTH_KIND, the
 // default is anonymous and a warning is logged so the implicit
 // no-credential intent isn't silent.
-func buildBackendAuth(ctx context.Context, v *viper.Viper) (backend.Provider, error) {
+func buildBackendAuth(ctx context.Context, cfg *serveConfig) (backend.Provider, error) {
 	logger := logging.NewFromEnv("OCIFACTORY_")
-	cfg := backend.Config{
-		Kind:                 v.GetString(flagBackendAuthKind),
-		GCPADCScopes:         stringSliceCSV(v, flagBackendAuthGCPADCScopes),
-		StaticEnvUserEnv:     v.GetString(flagBackendAuthStaticEnvUserEnv),
-		StaticEnvPasswordEnv: v.GetString(flagBackendAuthStaticEnvPasswordEnv),
-		DockerConfigPath:     v.GetString(flagBackendAuthDockerConfigPath),
+	bcfg := backend.Config{
+		Kind:                 cfg.BackendAuthKind,
+		GCPADCScopes:         cfg.BackendAuthGCPADCScopes,
+		StaticEnvUserEnv:     cfg.BackendAuthStaticEnvUserEnv,
+		StaticEnvPasswordEnv: cfg.BackendAuthStaticEnvPasswordEnv,
+		DockerConfigPath:     cfg.BackendAuthDockerConfigPath,
 	}
-	if cfg.Kind == "" || cfg.Kind == backend.KindAnonymous {
+	if bcfg.Kind == "" || bcfg.Kind == backend.KindAnonymous {
 		logger.WarnContext(ctx, "no backend credential provider configured (set --backend-auth-kind / "+
 			"OCIFACTORY_BACKEND_AUTH_KIND). Falling back to anonymous backend access — only safe for "+
 			"public read-only registries.")
 	}
-	return backend.New(cfg)
+	return backend.New(bcfg)
 }
 
 // buildRecorder returns the metrics recorder and the http.Handler that
