@@ -3,6 +3,7 @@ package python
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -726,5 +727,415 @@ func TestHandleSimpleIndex(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// uploadWheel performs a twine-style multipart upload of a real wheel
+// zip (one whose `<distinfo>/METADATA` actually parses) so the handler
+// can extract PEP 658 metadata and Requires-Python.
+func uploadWheel(t *testing.T, h *Handler, pkgName, version string, metadata string) (filename string, status int) {
+	t.Helper()
+
+	filename = pkgName + "-" + version + "-py3-none-any.whl"
+	wheelBytes := buildTestWheel(t, map[string]string{
+		pkgName + "-" + version + ".dist-info/METADATA": metadata,
+		pkgName + "-" + version + ".dist-info/WHEEL":    "Wheel-Version: 1.0\n",
+		pkgName + "/__init__.py":                        "",
+	})
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	if err := mw.WriteField("name", pkgName); err != nil {
+		t.Fatalf("write name: %v", err)
+	}
+	if err := mw.WriteField("version", version); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	fw, err := mw.CreateFormFile("content", filename)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write(wheelBytes); err != nil {
+		t.Fatalf("write wheel: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	return filename, rec.Code
+}
+
+// TestPEP503Normalization round-trips upload + simple-index lookup
+// across every separator variant. Per PEP 503, `Foo_Bar`, `foo-bar`,
+// and `foo.bar` are the same package; uploading any one and querying
+// any other must resolve.
+func TestPEP503Normalization(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		uploadAs   string
+		queryAs    string
+		wantStored string // canonical OwningRepo path under packages/
+	}{
+		{name: "underscore upload, dash query", uploadAs: "Foo_Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
+		{name: "dot upload, dash query", uploadAs: "Foo.Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
+		{name: "mixed upload, dash query", uploadAs: "Foo._-_Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
+		{name: "uppercase upload, lowercase query", uploadAs: "REQUESTS", queryAs: "requests", wantStored: "packages/requests"},
+		{name: "dash upload, dot query", uploadAs: "foo-bar", queryAs: "foo.bar", wantStored: "packages/foo-bar"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			if code := uploadPackage(t, h, tc.uploadAs, "1.0.0"); code != http.StatusCreated {
+				t.Fatalf("upload: status=%d", code)
+			}
+
+			// Stored under the normalized repo, regardless of upload casing.
+			storedKey := tc.wantStored + "/1.0.0/" + tc.uploadAs + "-1.0.0.whl"
+			if _, ok := reg.Files[storedKey]; !ok {
+				t.Errorf("missing stored file at normalized path %q; got files: %v", storedKey, registryFileKeys(reg))
+			}
+			// And the index sentinel is at the normalized name.
+			normalized := normalize(tc.uploadAs)
+			if _, ok := reg.Files["index/"+normalized+"/"+indexSentinelName]; !ok {
+				t.Errorf("missing index sentinel under normalized name %q", normalized)
+			}
+
+			// /simple/<queryAs>/ resolves to the same files as /simple/<normalized>/.
+			req := httptest.NewRequest(http.MethodGet, "/simple/"+tc.queryAs+"/", nil)
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("/simple/%s/ status=%d body=%s", tc.queryAs, rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, tc.uploadAs+"-1.0.0.whl") {
+				t.Errorf("body missing uploaded filename: %s", body)
+			}
+		})
+	}
+}
+
+func registryFileKeys(reg *oci.FakeRegistry) []string {
+	keys := make([]string, 0, len(reg.Files))
+	for k := range reg.Files {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestMultipartFieldOrder verifies the upload path no longer depends on
+// twine's name → version → content ordering. Sending content first must
+// succeed.
+func TestMultipartFieldOrder(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		write func(t *testing.T, mw *multipart.Writer)
+	}{
+		{
+			name: "content before name and version",
+			write: func(t *testing.T, mw *multipart.Writer) {
+				fw, err := mw.CreateFormFile("content", "example-pkg-1.0.0.whl")
+				if err != nil {
+					t.Fatalf("create form file: %v", err)
+				}
+				if _, err := fw.Write([]byte("payload")); err != nil {
+					t.Fatalf("write content: %v", err)
+				}
+				if err := mw.WriteField("name", "example-pkg"); err != nil {
+					t.Fatalf("write name: %v", err)
+				}
+				if err := mw.WriteField("version", "1.0.0"); err != nil {
+					t.Fatalf("write version: %v", err)
+				}
+			},
+		},
+		{
+			name: "version before name before content",
+			write: func(t *testing.T, mw *multipart.Writer) {
+				if err := mw.WriteField("version", "1.0.0"); err != nil {
+					t.Fatalf("write version: %v", err)
+				}
+				if err := mw.WriteField("name", "example-pkg"); err != nil {
+					t.Fatalf("write name: %v", err)
+				}
+				fw, err := mw.CreateFormFile("content", "example-pkg-1.0.0.whl")
+				if err != nil {
+					t.Fatalf("create form file: %v", err)
+				}
+				if _, err := fw.Write([]byte("payload")); err != nil {
+					t.Fatalf("write content: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			var b bytes.Buffer
+			mw := multipart.NewWriter(&b)
+			tc.write(t, mw)
+			if err := mw.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+
+			if got, want := rec.Code, http.StatusCreated; got != want {
+				t.Errorf("status = %d, want %d (body=%s)", got, want, rec.Body.String())
+			}
+			if _, ok := reg.Files["packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]; !ok {
+				t.Errorf("file not stored under expected key: %v", registryFileKeys(reg))
+			}
+		})
+	}
+}
+
+// TestPEP658WheelMetadata exercises the wheel-upload metadata-extraction
+// path: a valid wheel zip's `<distinfo>/METADATA` is written as a
+// `<filename>.metadata` companion, and the simple-index render advertises
+// it via the PEP 714 `data-core-metadata` (and legacy
+// `data-dist-info-metadata`) attributes alongside `data-requires-python`.
+func TestPEP658WheelMetadata(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
+	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
+	if code != http.StatusCreated {
+		t.Fatalf("upload status = %d", code)
+	}
+
+	// Metadata companion is stored as a sibling.
+	metaKey := "packages/requests/1.0.0/" + filename + ".metadata"
+	if got, ok := reg.Files[metaKey]; !ok {
+		t.Errorf("metadata companion missing at %q; have keys: %v", metaKey, registryFileKeys(reg))
+	} else if string(got) != meta {
+		t.Errorf("metadata content mismatch:\nwant: %q\ngot:  %q", meta, got)
+	}
+
+	// HTML simple-index advertises both attributes.
+	req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/simple/requests/ status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`data-requires-python="&gt;=3.7"`, // html template HTML-escapes the >
+		`data-core-metadata="sha256=`,
+		`data-dist-info-metadata="sha256=`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("HTML body missing %q; got:\n%s", want, body)
+		}
+	}
+
+	// .metadata sibling itself must NOT show up as a top-level file
+	// link in the simple index.
+	if strings.Contains(body, filename+".metadata") {
+		t.Errorf("simple-index body should not list the .metadata sibling as its own link; got:\n%s", body)
+	}
+}
+
+// TestPEP658_NonWheelHasNoMetadata confirms that uploading a non-wheel
+// (sdist) does not produce a `.metadata` companion and the simple-index
+// entry omits dist-info-metadata attributes.
+func TestPEP658_NonWheelHasNoMetadata(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	_ = mw.WriteField("name", "example")
+	_ = mw.WriteField("version", "1.0.0")
+	fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
+	_, _ = fw.Write([]byte("tarball-bytes"))
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload status=%d", rec.Code)
+	}
+
+	for k := range reg.Files {
+		if strings.HasSuffix(k, ".metadata") {
+			t.Errorf("non-wheel upload unexpectedly produced metadata companion: %s", k)
+		}
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/simple/example/", nil)
+	rec2 := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec2, req2)
+	body := rec2.Body.String()
+	for _, banned := range []string{"data-core-metadata", "data-dist-info-metadata", "data-requires-python"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("sdist simple-index entry should not advertise %q; got:\n%s", banned, body)
+		}
+	}
+}
+
+// TestSimpleIndexJSON verifies PEP 691 content negotiation: the same
+// /simple/<pkg>/ URL renders JSON when the client asks for it via
+// Accept and the JSON conforms to the spec's shape.
+func TestSimpleIndexJSON(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
+	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
+	if code != http.StatusCreated {
+		t.Fatalf("upload status=%d", code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+	req.Header.Set("Accept", contentTypeJSONv1)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got, want := rec.Header().Get("Content-Type"), contentTypeJSONv1; got != want {
+		t.Errorf("Content-Type=%q, want %q", got, want)
+	}
+
+	var got simpleIndexJSONPackage
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, rec.Body.String())
+	}
+	if got.Meta.APIVersion != pypiAPIVersion {
+		t.Errorf("api-version=%q, want %q", got.Meta.APIVersion, pypiAPIVersion)
+	}
+	if got.Name != "requests" {
+		t.Errorf("name=%q, want %q", got.Name, "requests")
+	}
+	if len(got.Files) != 1 {
+		t.Fatalf("files=%d, want 1; payload=%+v", len(got.Files), got)
+	}
+	f := got.Files[0]
+	if f.Filename != filename {
+		t.Errorf("filename=%q, want %q", f.Filename, filename)
+	}
+	if f.Hashes["sha256"] == "" {
+		t.Errorf("missing sha256 hash; got hashes=%v", f.Hashes)
+	}
+	if f.RequiresPython != ">=3.7" {
+		t.Errorf("requires-python=%q, want %q", f.RequiresPython, ">=3.7")
+	}
+	if f.CoreMetadata["sha256"] == "" {
+		t.Errorf("core-metadata.sha256 missing; got %v", f.CoreMetadata)
+	}
+	if f.DistInfoMetadata["sha256"] == "" {
+		t.Errorf("dist-info-metadata.sha256 missing; got %v", f.DistInfoMetadata)
+	}
+	if f.CoreMetadata["sha256"] != f.DistInfoMetadata["sha256"] {
+		t.Errorf("core-metadata != dist-info-metadata: %q vs %q", f.CoreMetadata["sha256"], f.DistInfoMetadata["sha256"])
+	}
+}
+
+// TestSimpleIndexJSONList confirms the root /simple/ endpoint also
+// honours Accept negotiation and emits the PEP 691 project list shape.
+func TestSimpleIndexJSONList(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	reg.Tags["index"] = []string{"flask", "requests"}
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	req.Header.Set("Accept", contentTypeJSONv1)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got, want := rec.Header().Get("Content-Type"), contentTypeJSONv1; got != want {
+		t.Errorf("Content-Type=%q, want %q", got, want)
+	}
+
+	var got simpleIndexJSONList
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v\nbody: %s", err, rec.Body.String())
+	}
+	if got.Meta.APIVersion != pypiAPIVersion {
+		t.Errorf("api-version=%q, want %q", got.Meta.APIVersion, pypiAPIVersion)
+	}
+	wantNames := []string{"flask", "requests"}
+	gotNames := make([]string, len(got.Projects))
+	for i, p := range got.Projects {
+		gotNames[i] = p.Name
+	}
+	sort.Strings(gotNames)
+	if diff := cmp.Diff(wantNames, gotNames); diff != "" {
+		t.Errorf("projects mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestNoAcceptHeader_DefaultsToHTML confirms that pip 21 (and earlier)
+// clients without Accept get the legacy HTML rendering, not JSON.
+func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	reg.Tags["index"] = []string{"flask"}
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	for _, path := range []string{"/simple/", "/simple/flask/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		h.Mux().ServeHTTP(rec, req)
+		if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+			t.Errorf("path=%q Content-Type=%q, want text/html prefix", path, got)
+		}
 	}
 }

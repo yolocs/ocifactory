@@ -1,11 +1,13 @@
 package python
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"path"
@@ -18,6 +20,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/renderer"
+	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2/errdef"
 )
 
@@ -27,6 +30,18 @@ const (
 
 	maxPackageLength = 256
 	maxVersionLength = 128
+
+	// maxMultipartMemory is the in-memory threshold for ParseMultipartForm.
+	// Files larger than this spill to a temp file (auto-cleaned via
+	// MultipartForm.RemoveAll), so streaming is preserved for large
+	// wheels while small uploads stay in memory.
+	maxMultipartMemory = 32 << 20
+
+	// metadataResolveConcurrency bounds the number of concurrent
+	// .metadata fetches the simple-index renderer issues on a cache
+	// miss. Big enough to amortise round-trip latency for a package
+	// with many versions, small enough not to flood the OCI backend.
+	metadataResolveConcurrency = 8
 
 	// indexSentinelName and indexSentinelContent are the constant layer
 	// name and body written under index/<pkgName>. handleSimpleIndex only
@@ -47,6 +62,7 @@ var (
 		"py":       "text/x-python",
 		"egg":      "text/plain",
 		"egg-info": "text/plain",
+		"metadata": "text/plain; charset=utf-8",
 	}
 
 	// pkgNameRegExp is the regex matcher for package names.
@@ -56,16 +72,6 @@ var (
 	//go:embed simple.html
 	fs embed.FS
 )
-
-type index struct {
-	Title string
-	Files []fileResult
-}
-
-type fileResult struct {
-	FileName string
-	FileURL  *url.URL
-}
 
 type repoFile struct {
 	oci.RepoFile
@@ -165,140 +171,178 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// handleSimpleIndex handles the simple index request.
-// For each package, we will create a new tag in the index repository.
-// With that, we can call "list tags" to get all the packages.
+// handleSimpleIndex renders the root simple index — the list of every
+// package the registry knows about. The index repo carries one tag per
+// (already-normalized) package name; ListTags is enough to enumerate
+// them.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 	logger := logging.FromContext(req.Context())
 
-	idx := index{Title: "Simple Index"}
 	tags, err := h.registry.ListTags(req.Context(), "index")
-	if err != nil {
-		if errors.Is(err, errdef.ErrNotFound) { // No index yet, so we just render an empty index
-			h.renderer.RenderHTML(w, "simple.html", idx)
-			return
-		}
+	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		logger.ErrorContext(req.Context(), "failed to list package index", "error", err)
 		http.Error(w, "failed to list package index", http.StatusInternalServerError)
 		return
 	}
 
-	for _, tag := range tags {
-		idx.Files = append(idx.Files, fileResult{FileName: tag, FileURL: &url.URL{
-			Scheme: req.URL.Scheme,
-			Host:   req.URL.Host,
-			Path:   fmt.Sprintf("/simple/%s/", tag),
-		}})
+	if pickContentType(req.Header.Get("Accept")) == contentTypeJSONv1 {
+		writeJSONIndexList(w, tags)
+		return
 	}
 
-	h.renderer.RenderHTML(w, "simple.html", idx)
+	page := indexPage{Title: "Simple Index"}
+	for _, tag := range tags {
+		page.Files = append(page.Files, indexFile{
+			Filename: tag,
+			URL: (&url.URL{
+				Scheme: req.URL.Scheme,
+				Host:   req.URL.Host,
+				Path:   "/simple/" + tag + "/",
+			}).String(),
+		})
+	}
+	h.renderer.RenderHTML(w, "simple.html", page)
 }
 
-// handleFilePut handles the file put request.
+// handleFilePut accepts a multipart upload from twine.
+//
+// Multipart parsing is two-pass via ParseMultipartForm so name, version,
+// and content can arrive in any order — RFC 7578 doesn't require a
+// fixed order, and assuming twine's ordering was a latent bug. Files
+// larger than maxMultipartMemory spill to a temp file, so streaming is
+// preserved for large wheels.
+//
+// On wheel uploads the handler also extracts `*.dist-info/METADATA`
+// from the wheel zip and stores it as a sibling file (PEP 658). Failure
+// to extract is logged but does not block the upload — the wheel still
+// publishes; clients just lose the metadata fast-path for that file.
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	logger := logging.FromContext(req.Context())
-	var pkgName, versionNum, contentName string
 
-	reader, err := req.MultipartReader()
-	if err != nil {
-		if err == http.ErrNotMultipart || err == http.ErrMissingBoundary {
+	if err := req.ParseMultipartForm(maxMultipartMemory); err != nil {
+		switch {
+		case errors.Is(err, http.ErrNotMultipart) || errors.Is(err, http.ErrMissingBoundary):
 			http.Error(w, "missing boundary in request or not a multipart request", http.StatusBadRequest)
-			return
+		default:
+			logger.DebugContext(req.Context(), "failed to parse multipart form", "error", err)
+			http.Error(w, "request body is not valid form data", http.StatusBadRequest)
 		}
-		logger.ErrorContext(req.Context(), "failed to create multipart reader", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	for {
-		p, err := reader.NextPart()
-		if err == io.EOF {
-			break
+	defer func() {
+		if req.MultipartForm != nil {
+			_ = req.MultipartForm.RemoveAll()
 		}
-		if err != nil {
-			logger.DebugContext(req.Context(), "failed to read multipart request", "error", err)
-			http.Error(w, "request body is not valid form data", http.StatusBadRequest)
-			return
-		}
+	}()
 
-		switch p.FormName() {
-		case "name":
-			pkgNameBytes, err := io.ReadAll(io.LimitReader(p, maxPackageLength+1))
-			if err != nil {
-				logger.DebugContext(req.Context(), "failed to read package name", "error", err)
-				http.Error(w, "failed to read package name", http.StatusBadRequest)
-				return
-			}
-			pkgName = string(pkgNameBytes)
-			if len(pkgName) > maxPackageLength {
-				logger.DebugContext(req.Context(), "package name is too long", "name", pkgName, "max_length", maxPackageLength)
-				http.Error(w, "package name is too long", http.StatusBadRequest)
-				return
-			}
-			if !pkgNameRegExp.MatchString(pkgName) {
-				logger.DebugContext(req.Context(), "invalid package name", "name", pkgName)
-				http.Error(w, "invalid package name", http.StatusBadRequest)
-				return
-			}
-		case "version":
-			versionBytes, err := io.ReadAll(io.LimitReader(p, maxVersionLength+1))
-			if err != nil {
-				logger.DebugContext(req.Context(), "failed to read version", "error", err)
-				http.Error(w, "failed to read version", http.StatusBadRequest)
-				return
-			}
-			versionNum = string(versionBytes)
-			if len(versionNum) > maxVersionLength {
-				logger.DebugContext(req.Context(), "version is too long", "version", versionNum, "max_length", maxVersionLength)
-				http.Error(w, "version is too long", http.StatusBadRequest)
-				return
-			}
-		case "content":
-			if versionNum == "" || pkgName == "" {
-				logger.DebugContext(req.Context(), "version or package name is not set")
-				http.Error(w, "version or package name is not set", http.StatusBadRequest)
-				return
-			}
-			contentName = p.FileName()
-			// The index repo write is a single sentinel per package, not
-			// per version. handleSimpleIndex only reads tag names from
-			// "index" via ListTags, so storing one constant placeholder
-			// layer under index/<pkgName> is enough — the OCI backend
-			// deduplicates the identical blob and file manifest across
-			// every subsequent upload of the same package.
-			fs := []*repoFile{
-				{
-					RepoFile: oci.RepoFile{
-						OwningRepo: "packages/" + pkgName,
-						OwningTag:  versionNum,
-						Name:       contentName,
-						MediaType:  detectMediaType(contentName),
-					},
-					Content: p,
-				},
-				{
-					RepoFile: oci.RepoFile{
-						OwningRepo: "index",
-						OwningTag:  pkgName,
-						Name:       indexSentinelName,
-						MediaType:  "text/plain",
-					},
-					Content: io.NopCloser(strings.NewReader(indexSentinelContent)),
-				},
-			}
-			if h.handlePut(req.Context(), w, fs) {
-				// A successful publish changes what /simple/<pkg>/ should
-				// render; drop the cached file list so the next render
-				// fetches fresh from the backend.
-				h.indexCache.invalidate(pkgName)
-			}
-		}
-	}
+	pkgName := firstFormValue(req.MultipartForm, "name")
+	versionNum := firstFormValue(req.MultipartForm, "version")
 
-	if pkgName == "" || versionNum == "" || contentName == "" {
-		logger.DebugContext(req.Context(), "missing required fields")
+	contentFiles := req.MultipartForm.File["content"]
+	if pkgName == "" || versionNum == "" || len(contentFiles) == 0 {
 		http.Error(w, "missing required fields", http.StatusBadRequest)
 		return
+	}
+	if len(pkgName) > maxPackageLength {
+		http.Error(w, "package name is too long", http.StatusBadRequest)
+		return
+	}
+	if !pkgNameRegExp.MatchString(pkgName) {
+		http.Error(w, "invalid package name", http.StatusBadRequest)
+		return
+	}
+	if len(versionNum) > maxVersionLength {
+		http.Error(w, "version is too long", http.StatusBadRequest)
+		return
+	}
+
+	normalizedName := normalize(pkgName)
+	contentHeader := contentFiles[0]
+	contentName := contentHeader.Filename
+	if contentName == "" {
+		http.Error(w, "missing filename for content", http.StatusBadRequest)
+		return
+	}
+
+	contentFile, err := contentHeader.Open()
+	if err != nil {
+		logger.ErrorContext(req.Context(), "failed to open uploaded content", "error", err)
+		http.Error(w, "failed to read content", http.StatusInternalServerError)
+		return
+	}
+	// Ownership of contentFile is handed to handlePut at the bottom of
+	// this function. Any early return before that point must close it
+	// directly.
+
+	var metaBytes []byte
+	if isWheelFilename(contentName) {
+		meta, mErr := extractWheelMetadata(contentFile, contentHeader.Size)
+		switch {
+		case mErr == nil:
+			metaBytes = meta
+		case errors.Is(mErr, errMetadataNotFound):
+			// PEP 427 wheels SHOULD include METADATA but the upload
+			// is still useful without it; just don't advertise PEP
+			// 658 for this file.
+			logger.DebugContext(req.Context(), "wheel has no METADATA member", "filename", contentName)
+		default:
+			logger.WarnContext(req.Context(), "failed to extract wheel METADATA", "error", mErr, "filename", contentName)
+		}
+		// Rewind regardless: subsequent AddFile must stream from the
+		// start of the wheel.
+		if _, err := contentFile.Seek(0, io.SeekStart); err != nil {
+			contentFile.Close()
+			logger.ErrorContext(req.Context(), "failed to rewind wheel content", "error", err)
+			http.Error(w, "failed to read content", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	uploads := []*repoFile{
+		{
+			RepoFile: oci.RepoFile{
+				OwningRepo: "packages/" + normalizedName,
+				OwningTag:  versionNum,
+				Name:       contentName,
+				MediaType:  detectMediaType(contentName),
+				Size:       contentHeader.Size,
+			},
+			Content: contentFile,
+		},
+	}
+	if metaBytes != nil {
+		uploads = append(uploads, &repoFile{
+			RepoFile: oci.RepoFile{
+				OwningRepo: "packages/" + normalizedName,
+				OwningTag:  versionNum,
+				Name:       metadataCompanionName(contentName),
+				MediaType:  detectMediaType(metadataCompanionName(contentName)),
+				Size:       int64(len(metaBytes)),
+			},
+			Content: io.NopCloser(bytes.NewReader(metaBytes)),
+		})
+	}
+	// The index repo write is a single sentinel per package, not per
+	// version. handleSimpleIndex only reads tag names from "index" via
+	// ListTags, so storing one constant placeholder layer under
+	// index/<normalizedName> is enough — the OCI backend deduplicates
+	// the identical blob and file manifest across every subsequent
+	// upload of the same package.
+	uploads = append(uploads, &repoFile{
+		RepoFile: oci.RepoFile{
+			OwningRepo: "index",
+			OwningTag:  normalizedName,
+			Name:       indexSentinelName,
+			MediaType:  "text/plain",
+		},
+		Content: io.NopCloser(strings.NewReader(indexSentinelContent)),
+	})
+
+	if h.handlePut(req.Context(), w, uploads) {
+		// A successful publish changes what /simple/<pkg>/ should
+		// render; drop the cached file list so the next render
+		// fetches fresh from the backend.
+		h.indexCache.invalidate(normalizedName)
 	}
 }
 
@@ -313,6 +357,7 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	pkg = normalize(pkg)
 	f := &oci.RepoFile{
 		OwningRepo: "packages/" + pkg,
 		OwningTag:  version,
@@ -330,11 +375,12 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "invalid path: missing package name", http.StatusBadRequest)
 		return
 	}
+	pkg = normalize(pkg)
 
 	files, ok := h.indexCache.get(pkg)
 	if !ok {
 		var err error
-		files, err = h.registry.ListFiles(req.Context(), "packages/"+pkg)
+		files, err = h.resolvePackageFiles(req.Context(), pkg)
 		if err != nil {
 			if errors.Is(err, errdef.ErrNotFound) {
 				http.Error(w, err.Error(), http.StatusNotFound)
@@ -354,23 +400,124 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 		h.indexCache.put(pkg, files)
 	}
 
-	idx := index{Title: pkg}
+	rendered := make([]indexFile, 0, len(files))
 	for _, f := range files {
-		idx.Files = append(idx.Files, fileResult{FileName: f.Name, FileURL: repoFileURL(req, f)})
+		rendered = append(rendered, indexFile{
+			Filename:       f.Filename,
+			URL:            renderedFileURL(req, pkg, f),
+			Sha256:         f.Sha256,
+			MetadataSha256: f.MetadataSha256,
+			RequiresPython: f.RequiresPython,
+		})
 	}
 
-	h.renderer.RenderHTML(w, "simple.html", idx)
+	if pickContentType(req.Header.Get("Accept")) == contentTypeJSONv1 {
+		writeJSONPackageIndex(w, pkg, rendered)
+		return
+	}
+	h.renderer.RenderHTML(w, "simple.html", indexPage{Title: pkg, Files: rendered})
 }
 
-func repoFileURL(req *http.Request, f *oci.RepoFile) *url.URL {
-	return &url.URL{
+// resolvePackageFiles enumerates a package's files plus the per-wheel
+// PEP 658 metadata + Requires-Python headers. The returned slice is
+// what goes into the simple-index cache; both HTML and JSON renderers
+// pivot off it.
+//
+// .metadata companion files are not returned in the slice — they are
+// consumed as siblings of the wheels they describe. Their Digest gives
+// us the PEP 658 hash without re-fetching, and their content is read
+// once to extract Requires-Python (bounded concurrency, best-effort:
+// unreadable companions log a warning and leave Requires-Python empty
+// rather than failing the whole render).
+func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cachedFile, error) {
+	logger := logging.FromContext(ctx)
+
+	rawFiles, err := h.registry.ListFiles(ctx, "packages/"+pkg)
+	if err != nil {
+		return nil, err
+	}
+
+	type sibKey struct{ tag, name string }
+	siblings := make(map[sibKey]*oci.RepoFile, len(rawFiles))
+	for _, f := range rawFiles {
+		siblings[sibKey{tag: f.OwningTag, name: f.Name}] = f
+	}
+
+	entries := make([]cachedFile, 0, len(rawFiles))
+	for _, f := range rawFiles {
+		if strings.HasSuffix(f.Name, ".metadata") {
+			// Companion file; surfaced via its sibling wheel below.
+			continue
+		}
+		entry := cachedFile{
+			Filename:  f.Name,
+			OwningTag: f.OwningTag,
+			Sha256:    strings.TrimPrefix(f.Digest, "sha256:"),
+		}
+		if isWheelFilename(f.Name) {
+			if meta, ok := siblings[sibKey{tag: f.OwningTag, name: metadataCompanionName(f.Name)}]; ok {
+				entry.MetadataSha256 = strings.TrimPrefix(meta.Digest, "sha256:")
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	// Resolve Requires-Python for every wheel that has a companion.
+	// Concurrent fetches with a small limit; per-fetch errors are
+	// best-effort (log and leave the field empty) so a single broken
+	// companion doesn't tank the whole render.
+	eg, gctx := errgroup.WithContext(ctx)
+	eg.SetLimit(metadataResolveConcurrency)
+	for i := range entries {
+		i := i
+		e := &entries[i]
+		if e.MetadataSha256 == "" || !isWheelFilename(e.Filename) {
+			continue
+		}
+		eg.Go(func() error {
+			rp, rerr := h.readRequiresPython(gctx, pkg, e.OwningTag, e.Filename)
+			if rerr != nil {
+				logger.WarnContext(gctx, "failed to read wheel METADATA companion",
+					"package", pkg, "version", e.OwningTag, "filename", e.Filename, "error", rerr)
+				return nil
+			}
+			e.RequiresPython = rp
+			return nil
+		})
+	}
+	_ = eg.Wait()
+
+	return entries, nil
+}
+
+func (h *Handler) readRequiresPython(ctx context.Context, pkg, tag, wheelName string) (string, error) {
+	f := &oci.RepoFile{
+		OwningRepo: "packages/" + pkg,
+		OwningTag:  tag,
+		Name:       metadataCompanionName(wheelName),
+	}
+	_, rc, err := h.registry.ReadFile(ctx, f)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, maxMetadataSize+1))
+	if err != nil {
+		return "", err
+	}
+	return parseRequiresPython(data), nil
+}
+
+func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {
+	u := url.URL{
 		Scheme: req.URL.Scheme,
 		Host:   req.URL.Host,
-		// Path should be /packages/{package_name_only}/{version}/{filename}
-		// f.OwningRepo is "packages/pkg", f.OwningTag is version, f.Name is filename
-		Path:     fmt.Sprintf("/%s/%s/%s", f.OwningRepo, f.OwningTag, f.Name),
-		Fragment: fmt.Sprintf("sha256=%s", strings.TrimPrefix(f.Digest, "sha256:")),
+		Path:   fmt.Sprintf("/packages/%s/%s/%s", pkg, f.OwningTag, f.Filename),
 	}
+	if f.Sha256 != "" {
+		u.Fragment = "sha256=" + f.Sha256
+	}
+	return u.String()
 }
 
 // handlePut writes every file in fs to the registry. It is also
@@ -448,4 +595,20 @@ func detectMediaType(filename string) string {
 		return mt
 	}
 	return "application/octet-stream"
+}
+
+// firstFormValue returns the first value for a multipart form field, or
+// "" if the field is absent or empty. ParseMultipartForm puts every
+// occurrence into a slice; for single-valued fields we want the first
+// non-empty entry.
+func firstFormValue(form *multipart.Form, name string) string {
+	if form == nil {
+		return ""
+	}
+	for _, v := range form.Value[name] {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
