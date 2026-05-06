@@ -37,6 +37,14 @@ const (
 	// wheels while small uploads stay in memory.
 	maxMultipartMemory = 32 << 20
 
+	// defaultMaxUploadBytes caps the total request-body size accepted
+	// by handleFilePut. ParseMultipartForm's disk-spill is unbounded
+	// without this — an authenticated attacker could fill the temp
+	// disk with a single oversized request. 1 GiB comfortably exceeds
+	// every wheel and sdist on PyPI today; operators can tighten it
+	// via WithMaxUploadBytes.
+	defaultMaxUploadBytes = 1 << 30
+
 	// metadataResolveConcurrency bounds the number of concurrent
 	// .metadata fetches the simple-index renderer issues on a cache
 	// miss. Big enough to amortise round-trip latency for a package
@@ -69,6 +77,15 @@ var (
 	// Reference: https://packaging.python.org/specifications/core-metadata/#name.
 	pkgNameRegExp = regexp.MustCompile("(?i)^([A-Z0-9]|[A-Z0-9][A-Z0-9-_.]*[A-Z0-9])$")
 
+	// uploadFilenameRegExp gates the bare filename twine sends in the
+	// `content` part. PyPI distribution filenames are conservatively
+	// shaped: ASCII letters, digits, dot, underscore, plus, hyphen.
+	// We reject anything else to keep the value safe to embed in the
+	// OCI manifest annotation, the simple-index URL, and the
+	// `<filename>.metadata` companion key. Path separators, control
+	// characters, and `..` segments cannot reach the OCI backend.
+	uploadFilenameRegExp = regexp.MustCompile(`^[A-Za-z0-9._+\-]+$`)
+
 	//go:embed simple.html
 	fs embed.FS
 )
@@ -79,10 +96,11 @@ type repoFile struct {
 }
 
 type Handler struct {
-	registry   handler.Registry
-	renderer   *renderer.Renderer
-	indexCache *simpleIndexCache
-	authMW     func(http.Handler) http.Handler
+	registry       handler.Registry
+	renderer       *renderer.Renderer
+	indexCache     *simpleIndexCache
+	authMW         func(http.Handler) http.Handler
+	maxUploadBytes int64
 }
 
 // Option configures optional Handler behaviour.
@@ -91,6 +109,7 @@ type Option func(*handlerConfig)
 type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
 	authMW              func(http.Handler) http.Handler
+	maxUploadBytes      int64
 }
 
 // WithSimpleIndexCacheTTL sets the per-package simple-index cache TTL.
@@ -99,6 +118,15 @@ type handlerConfig struct {
 func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
 	return func(c *handlerConfig) {
 		c.simpleIndexCacheTTL = ttl
+	}
+}
+
+// WithMaxUploadBytes caps the total size of a multipart upload body
+// the handler will accept. The default is defaultMaxUploadBytes
+// (1 GiB). A non-positive value disables the cap (not recommended).
+func WithMaxUploadBytes(n int64) Option {
+	return func(c *handlerConfig) {
+		c.maxUploadBytes = n
 	}
 }
 
@@ -121,7 +149,10 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 
 // NewHandler creates a new Handler.
 func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
-	cfg := handlerConfig{simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL}
+	cfg := handlerConfig{
+		simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL,
+		maxUploadBytes:      defaultMaxUploadBytes,
+	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -130,10 +161,11 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}
 	return &Handler{
-		registry:   registry,
-		renderer:   r,
-		indexCache: newSimpleIndexCache(cfg.simpleIndexCacheTTL),
-		authMW:     cfg.authMW,
+		registry:       registry,
+		renderer:       r,
+		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
+		authMW:         cfg.authMW,
+		maxUploadBytes: cfg.maxUploadBytes,
 	}, nil
 }
 
@@ -219,8 +251,18 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	logger := logging.FromContext(req.Context())
 
+	// Cap the total request body before ParseMultipartForm spills past
+	// maxMultipartMemory into a temp file. Without this, a single
+	// authenticated upload can fill the temp disk.
+	if h.maxUploadBytes > 0 {
+		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
+	}
+
 	if err := req.ParseMultipartForm(maxMultipartMemory); err != nil {
+		var maxBytesErr *http.MaxBytesError
 		switch {
+		case errors.As(err, &maxBytesErr):
+			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
 		case errors.Is(err, http.ErrNotMultipart) || errors.Is(err, http.ErrMissingBoundary):
 			http.Error(w, "missing boundary in request or not a multipart request", http.StatusBadRequest)
 		default:
@@ -261,6 +303,10 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	contentName := contentHeader.Filename
 	if contentName == "" {
 		http.Error(w, "missing filename for content", http.StatusBadRequest)
+		return
+	}
+	if !uploadFilenameRegExp.MatchString(contentName) || contentName == "." || contentName == ".." {
+		http.Error(w, "invalid filename for content", http.StatusBadRequest)
 		return
 	}
 
@@ -463,13 +509,14 @@ func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cached
 	}
 
 	// Resolve Requires-Python for every wheel that has a companion.
-	// Concurrent fetches with a small limit; per-fetch errors are
-	// best-effort (log and leave the field empty) so a single broken
-	// companion doesn't tank the whole render.
+	// Concurrent fetches with a small limit; per-fetch errors that
+	// aren't context cancellation are best-effort (log and leave the
+	// field empty) so a single broken companion doesn't tank the
+	// whole render. Context cancellation IS propagated so the caller
+	// skips caching partially-resolved entries.
 	eg, gctx := errgroup.WithContext(ctx)
 	eg.SetLimit(metadataResolveConcurrency)
 	for i := range entries {
-		i := i
 		e := &entries[i]
 		if e.MetadataSha256 == "" || !isWheelFilename(e.Filename) {
 			continue
@@ -477,6 +524,9 @@ func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cached
 		eg.Go(func() error {
 			rp, rerr := h.readRequiresPython(gctx, pkg, e.OwningTag, e.Filename)
 			if rerr != nil {
+				if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) {
+					return rerr
+				}
 				logger.WarnContext(gctx, "failed to read wheel METADATA companion",
 					"package", pkg, "version", e.OwningTag, "filename", e.Filename, "error", rerr)
 				return nil
@@ -485,7 +535,9 @@ func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cached
 			return nil
 		})
 	}
-	_ = eg.Wait()
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
 
 	return entries, nil
 }
@@ -526,12 +578,27 @@ func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {
 // status and returns false. The boolean return lets handleFilePut perform
 // post-write side effects (e.g. cache invalidation) only when the upload
 // actually succeeded.
+//
+// handlePut closes each entry's Content as soon as its AddFile completes
+// rather than deferring to function return; for a 3-entry batch
+// (wheel + .metadata + index sentinel) the eager close keeps the
+// multipart temp file open for one upload at a time instead of all three.
 func (h *Handler) handlePut(ctx context.Context, w http.ResponseWriter, fs []*repoFile) bool {
 	logger := logging.FromContext(ctx)
 
-	for _, f := range fs {
-		defer f.Content.Close()
+	// On any early-return path that hasn't reached the eager-close yet
+	// we still need to release the remaining Content readers.
+	cleanupFrom := 0
+	defer func() {
+		for i := cleanupFrom; i < len(fs); i++ {
+			_ = fs[i].Content.Close()
+		}
+	}()
+
+	for i, f := range fs {
 		desc, err := h.registry.AddFile(ctx, &f.RepoFile, f.Content)
+		_ = f.Content.Close()
+		cleanupFrom = i + 1
 		if err != nil {
 			logger.DebugContext(ctx, "failed to add file", "error", err)
 			if oci.HasCode(err, http.StatusUnauthorized) {

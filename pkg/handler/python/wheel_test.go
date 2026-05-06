@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -98,6 +99,46 @@ func TestExtractWheelMetadata_NotZip(t *testing.T) {
 	}
 	if errors.Is(err, errMetadataNotFound) {
 		t.Errorf("non-zip should not surface as errMetadataNotFound; got %v", err)
+	}
+}
+
+// TestExtractWheelMetadata_TooManyEntries exercises the zip-bomb cap:
+// a wheel whose central directory exceeds maxWheelEntries is rejected
+// before its members are walked.
+func TestExtractWheelMetadata_TooManyEntries(t *testing.T) {
+	t.Parallel()
+
+	files := make(map[string]string, maxWheelEntries+1)
+	for i := 0; i <= maxWheelEntries; i++ {
+		files["pkg/file-"+strconv.Itoa(i)+".py"] = ""
+	}
+	data := buildTestWheel(t, files)
+	_, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
+	if !errors.Is(err, errWheelTooManyEntries) {
+		t.Errorf("error = %v, want errWheelTooManyEntries", err)
+	}
+}
+
+// TestExtractWheelMetadata_OversizedDeclaredSize confirms that a wheel
+// whose METADATA member declares an UncompressedSize64 above the cap
+// is rejected before we read the body — the cap on read alone isn't
+// enough if a malformed ZIP64 header lies about the size.
+func TestExtractWheelMetadata_OversizedDeclaredSize(t *testing.T) {
+	t.Parallel()
+
+	// Build a real wheel zip, then mutate the central-directory
+	// header so METADATA claims a size larger than maxMetadataSize.
+	// We can't easily mutate post-encoding here without reaching
+	// into archive/zip internals, so instead we write an actual
+	// METADATA entry of size > maxMetadataSize and assert it's
+	// rejected.
+	big := bytes.Repeat([]byte("x"), maxMetadataSize+1)
+	data := buildTestWheel(t, map[string]string{
+		"requests-1.0.0.dist-info/METADATA": string(big),
+	})
+	_, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
+	if err == nil || errors.Is(err, errMetadataNotFound) || errors.Is(err, errWheelTooManyEntries) {
+		t.Errorf("expected oversized-METADATA rejection, got %v", err)
 	}
 }
 

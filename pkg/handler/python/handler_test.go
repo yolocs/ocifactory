@@ -3,7 +3,9 @@ package python
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1116,6 +1118,307 @@ func TestSimpleIndexJSONList(t *testing.T) {
 	if diff := cmp.Diff(wantNames, gotNames); diff != "" {
 		t.Errorf("projects mismatch (-want +got):\n%s", diff)
 	}
+}
+
+// TestHandleFilePut_BadInputs covers the assorted reject paths that
+// were previously untested: oversized name/version, malformed
+// multipart, missing filename, traversal-style filenames.
+func TestHandleFilePut_BadInputs(t *testing.T) {
+	t.Parallel()
+
+	type tweak func(t *testing.T, mw *multipart.Writer) (filename string)
+
+	defaultBody := func(t *testing.T, mw *multipart.Writer) string {
+		t.Helper()
+		if err := mw.WriteField("name", "example"); err != nil {
+			t.Fatalf("write name: %v", err)
+		}
+		if err := mw.WriteField("version", "1.0.0"); err != nil {
+			t.Fatalf("write version: %v", err)
+		}
+		fw, err := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("payload")); err != nil {
+			t.Fatalf("write content: %v", err)
+		}
+		return "example-1.0.0.tar.gz"
+	}
+
+	cases := []struct {
+		name       string
+		ctype      string // override Content-Type to break multipart
+		body       []byte // override the entire body (raw)
+		write      tweak
+		wantStatus int
+	}{
+		{
+			name: "oversized package name",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				_ = mw.WriteField("name", strings.Repeat("a", maxPackageLength+1))
+				_ = mw.WriteField("version", "1.0.0")
+				fw, _ := mw.CreateFormFile("content", "x-1.0.0.tar.gz")
+				_, _ = fw.Write([]byte("p"))
+				return "x-1.0.0.tar.gz"
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "oversized version",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				_ = mw.WriteField("name", "example")
+				_ = mw.WriteField("version", strings.Repeat("9", maxVersionLength+1))
+				fw, _ := mw.CreateFormFile("content", "example-x.tar.gz")
+				_, _ = fw.Write([]byte("p"))
+				return ""
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// Note: net/http's multipart parser applies filepath.Base
+			// before our handler sees Filename, so on POSIX
+			// "../etc/passwd" arrives as "passwd". The dotdot test
+			// below covers what does survive that stripping.
+			name: "filename is dotdot",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				_ = mw.WriteField("name", "example")
+				_ = mw.WriteField("version", "1.0.0")
+				fw, _ := mw.CreateFormFile("content", "..")
+				_, _ = fw.Write([]byte("p"))
+				return ""
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "filename with backslash",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				_ = mw.WriteField("name", "example")
+				_ = mw.WriteField("version", "1.0.0")
+				fw, _ := mw.CreateFormFile("content", `evil\name.whl`)
+				_, _ = fw.Write([]byte("p"))
+				return ""
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "filename with control char",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				_ = mw.WriteField("name", "example")
+				_ = mw.WriteField("version", "1.0.0")
+				fw, _ := mw.CreateFormFile("content", "evil\x00.whl")
+				_, _ = fw.Write([]byte("p"))
+				return ""
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "non-multipart body",
+			ctype:      "application/json",
+			body:       []byte(`{"name":"example"}`),
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "missing boundary",
+			ctype:      "multipart/form-data",
+			body:       []byte("not actually multipart"),
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "happy path establishes the test harness produces 201",
+			write: func(t *testing.T, mw *multipart.Writer) string {
+				return defaultBody(t, mw)
+			},
+			wantStatus: http.StatusCreated,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			var req *http.Request
+			if tc.body != nil {
+				req = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(tc.body))
+				req.Header.Set("Content-Type", tc.ctype)
+			} else {
+				var b bytes.Buffer
+				mw := multipart.NewWriter(&b)
+				tc.write(t, mw)
+				if err := mw.Close(); err != nil {
+					t.Fatalf("close: %v", err)
+				}
+				req = httptest.NewRequest(http.MethodPut, "/", &b)
+				req.Header.Set("Content-Type", mw.FormDataContentType())
+			}
+
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body=%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHandleFilePut_MaxUploadBytes confirms WithMaxUploadBytes returns
+// 413 for an oversized body and 201 just under the cap.
+func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		cap        int64
+		bodyExtra  int // bytes of payload above ~512 of multipart framing
+		wantStatus int
+	}{
+		{name: "under cap", cap: 1 << 20, bodyExtra: 1 << 10, wantStatus: http.StatusCreated},
+		{name: "over cap", cap: 1 << 14, bodyExtra: 1 << 16, wantStatus: http.StatusRequestEntityTooLarge},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			h, err := NewHandler(reg, WithMaxUploadBytes(tc.cap))
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			var b bytes.Buffer
+			mw := multipart.NewWriter(&b)
+			_ = mw.WriteField("name", "example")
+			_ = mw.WriteField("version", "1.0.0")
+			fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
+			_, _ = fw.Write(bytes.Repeat([]byte("a"), tc.bodyExtra))
+			_ = mw.Close()
+
+			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status=%d, want %d (body=%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestPEP658WheelMetadata_HashEquality asserts that the sha256
+// advertised in the simple-index render is the actual sha256 of the
+// stored .metadata blob — not just present.
+func TestPEP658WheelMetadata_HashEquality(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
+	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
+	if code != http.StatusCreated {
+		t.Fatalf("upload: %d", code)
+	}
+
+	wantSha := sha256Hex([]byte(meta))
+
+	// HTML render: extract the data-core-metadata="sha256=<hex>" value and compare.
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/simple/requests/", nil))
+	body := rec.Body.String()
+	want := `data-core-metadata="sha256=` + wantSha + `"`
+	if !strings.Contains(body, want) {
+		t.Errorf("HTML body missing %q; got:\n%s", want, body)
+	}
+	wantLegacy := `data-dist-info-metadata="sha256=` + wantSha + `"`
+	if !strings.Contains(body, wantLegacy) {
+		t.Errorf("HTML body missing %q; got:\n%s", wantLegacy, body)
+	}
+
+	// JSON render: parse and compare the field directly.
+	jsonReq := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+	jsonReq.Header.Set("Accept", contentTypeJSONv1)
+	jsonRec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(jsonRec, jsonReq)
+
+	var got simpleIndexJSONPackage
+	if err := json.Unmarshal(jsonRec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Files) != 1 {
+		t.Fatalf("files=%d, want 1", len(got.Files))
+	}
+	if g := got.Files[0].CoreMetadata["sha256"]; g != wantSha {
+		t.Errorf("core-metadata.sha256 = %q, want %q", g, wantSha)
+	}
+	if g := got.Files[0].DistInfoMetadata["sha256"]; g != wantSha {
+		t.Errorf("dist-info-metadata.sha256 = %q, want %q", g, wantSha)
+	}
+
+	// And the wheel's own hashes.sha256 matches the stored bytes.
+	storedKey := "packages/requests/1.0.0/" + filename
+	storedBytes, ok := reg.Files[storedKey]
+	if !ok {
+		t.Fatalf("stored wheel missing under %q", storedKey)
+	}
+	if g, want := got.Files[0].Hashes["sha256"], sha256Hex(storedBytes); g != want {
+		t.Errorf("hashes.sha256 = %q, want %q", g, want)
+	}
+}
+
+// TestPEP658_WheelWithoutRequiresPython covers the "wheel has METADATA
+// but no Requires-Python header" case: the metadata companion still
+// exists, but data-requires-python is omitted.
+func TestPEP658_WheelWithoutRequiresPython(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	const meta = "Metadata-Version: 2.1\nName: nopython\nVersion: 1.0.0\nSummary: no Requires-Python here\n"
+	if _, code := uploadWheel(t, h, "nopython", "1.0.0", meta); code != http.StatusCreated {
+		t.Fatalf("upload: %d", code)
+	}
+
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/simple/nopython/", nil))
+	body := rec.Body.String()
+	if strings.Contains(body, "data-requires-python") {
+		t.Errorf("HTML render should not advertise data-requires-python; got:\n%s", body)
+	}
+	// But PEP 658 metadata IS still advertised because METADATA was extractable.
+	if !strings.Contains(body, "data-core-metadata") {
+		t.Errorf("HTML render should still advertise data-core-metadata when METADATA is present; got:\n%s", body)
+	}
+
+	jr := httptest.NewRequest(http.MethodGet, "/simple/nopython/", nil)
+	jr.Header.Set("Accept", contentTypeJSONv1)
+	jrec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(jrec, jr)
+	var got simpleIndexJSONPackage
+	if err := json.Unmarshal(jrec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Files[0].RequiresPython != "" {
+		t.Errorf("requires-python = %q, want empty", got.Files[0].RequiresPython)
+	}
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum)
 }
 
 // TestNoAcceptHeader_DefaultsToHTML confirms that pip 21 (and earlier)

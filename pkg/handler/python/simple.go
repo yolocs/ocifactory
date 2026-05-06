@@ -15,11 +15,10 @@ const (
 	contentTypeHTML   = "text/html"
 
 	// pypiAPIVersion advertises the PEP 691 schema version we serve.
-	// 1.1 is the version that adds PEP 700 fields; we only emit a
-	// strict subset (filename/url/hashes/requires-python/metadata
-	// flags), all of which are valid 1.0 fields too. Clients that
-	// don't recognise 1.1 fall back to the common subset.
-	pypiAPIVersion = "1.1"
+	// We stick to 1.0 because we don't yet emit PEP 700's optional
+	// `versions` / `size` / `upload-time` / `tracks` fields; bumping
+	// to 1.1 without them would mis-signal capability to clients.
+	pypiAPIVersion = "1.0"
 )
 
 // pickContentType inspects an Accept header and returns the best PyPI
