@@ -64,6 +64,7 @@ const (
 	flagRepoType                        = "repo-type"
 	flagBackendRegistry                 = "backend-registry"
 	flagDisableStreamingPush            = "disable-streaming-push"
+	flagDisableBlobRedirect             = "disable-blob-redirect"
 	flagSimpleIndexCacheTTL             = "simple-index-cache-ttl"
 	flagPythonMaxUploadBytes            = "python-max-upload-bytes"
 	flagEnableMetrics                   = "enable-metrics"
@@ -89,6 +90,7 @@ type serveConfig struct {
 	RepoType             string        `mapstructure:"repo-type"`
 	BackendRegistry      string        `mapstructure:"backend-registry"`
 	DisableStreamingPush bool          `mapstructure:"disable-streaming-push"`
+	DisableBlobRedirect  bool          `mapstructure:"disable-blob-redirect"`
 	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
 	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
@@ -231,6 +233,15 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"Bodies above the in-memory threshold will spill to a temp file "+
 			"instead of streaming via chunked PATCH. Set this only for "+
 			"backend registries with broken or missing chunked-PATCH support.")
+	flags.Bool(flagDisableBlobRedirect, false,
+		"Disable redirecting blob downloads to backend-issued presigned "+
+			"URLs. By default, hosted backends (GAR, ECR, ACR, GHCR, Docker "+
+			"Hub) get a 307 to their CDN/object-store URL on blob GET, "+
+			"saving ocifactory egress on read-heavy workloads. Set this in "+
+			"environments where exposing backend URLs to clients is "+
+			"unacceptable (egress restrictions, DLP, audit requirements). "+
+			"Self-hosted inline-serving backends (zot, Harbor, distribution) "+
+			"are unaffected — they fall back to streaming automatically.")
 	flags.Duration(flagSimpleIndexCacheTTL, python.DefaultSimpleIndexCacheTTL,
 		"TTL for the per-replica per-package PyPI simple-index cache. "+
 			"Within the TTL, repeated GET /simple/<pkg>/ requests skip the "+
@@ -310,6 +321,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 	)
 	registryOpts := []oci.RegistryOption{
 		oci.WithStreamingPushDisabled(cfg.DisableStreamingPush),
+		oci.WithBlobRedirectDisabled(cfg.DisableBlobRedirect),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
 	}

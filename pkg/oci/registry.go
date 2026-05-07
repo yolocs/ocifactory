@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -107,6 +108,14 @@ type Registry struct {
 	// uses O(streamChunkSize) memory and zero disk regardless of body size.
 	disableStreamingPush bool
 
+	// disableBlobRedirect, when true, makes BlobRedirectURL return
+	// ("", nil) without contacting the backend. Operators set this in
+	// environments where exposing backend (CDN / object-store)
+	// presigned URLs to clients is unacceptable — egress restrictions,
+	// DLP, audit requirements. Handlers fall through to the
+	// stream-through ReadFile path automatically.
+	disableBlobRedirect bool
+
 	// rec collects per-backend-call observations. Defaults to
 	// metrics.NoOp() so existing tests and library callers that don't
 	// opt into instrumentation see no behavioural change. Wire a real
@@ -126,6 +135,15 @@ type Registry struct {
 	// chunk and every manifest write, so a 200 MB upload pays for
 	// one token round-trip rather than ~50.
 	authClient *auth.Client
+
+	// probeClient is the auth.Client BlobRedirectURL uses to inspect
+	// the backend's /v2/<repo>/blobs/<digest> response. It shares the
+	// same auth.Cache and credential function as authClient so token
+	// fetches are amortised across both paths, but its inner
+	// http.Client refuses to follow redirects — we want to read the
+	// 3xx Location directly rather than transparently fetch the
+	// presigned URL.
+	probeClient *auth.Client
 
 	// Used in unit tests to stub with in-memory backend.
 	newBackendFunc func(ctx context.Context, f *RepoFile) (destRepo, error)
@@ -195,6 +213,20 @@ func WithStreamingPushDisabled(disabled bool) RegistryOption {
 	}
 }
 
+// WithBlobRedirectDisabled, when true, makes BlobRedirectURL return
+// ("", nil) without contacting the backend. Set this in environments
+// where exposing the backend's presigned object-store URLs to clients
+// is unacceptable (egress restrictions, DLP, audit requirements);
+// handlers fall through to the stream-through ReadFile path
+// automatically. The default (false) lets BlobRedirectURL probe the
+// backend and short-circuit blob downloads to the backend's CDN.
+func WithBlobRedirectDisabled(disabled bool) RegistryOption {
+	return func(r *Registry) error {
+		r.disableBlobRedirect = disabled
+		return nil
+	}
+}
+
 // RepoFile represents a file in an OCI repository.
 type RepoFile struct {
 	OwningRepo string // Repository the owns the file. Usually what's right after the registy host.
@@ -249,20 +281,36 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	if provider == nil {
 		provider = backend.Anonymous()
 	}
+	credFn := func(ctx context.Context, host string) (auth.Credential, error) {
+		c, err := provider.Credential(ctx, host)
+		if err != nil {
+			return auth.EmptyCredential, err
+		}
+		return auth.Credential{
+			Username:    c.Username,
+			Password:    c.Password,
+			AccessToken: c.AccessToken,
+		}, nil
+	}
+	cache := auth.NewCache()
 	r.authClient = &auth.Client{
-		Client: retry.DefaultClient,
-		Cache:  auth.NewCache(),
-		Credential: func(ctx context.Context, host string) (auth.Credential, error) {
-			c, err := provider.Credential(ctx, host)
-			if err != nil {
-				return auth.EmptyCredential, err
-			}
-			return auth.Credential{
-				Username:    c.Username,
-				Password:    c.Password,
-				AccessToken: c.AccessToken,
-			}, nil
-		},
+		Client:     retry.DefaultClient,
+		Cache:      cache,
+		Credential: credFn,
+	}
+
+	// probeClient shares the credential function and token cache with
+	// authClient — keeping bearer-token fetches amortised — but its
+	// inner http.Client refuses to follow redirects so the redirect
+	// probe sees the raw 3xx Location.
+	probeHTTP := retry.NewClient()
+	probeHTTP.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	r.probeClient = &auth.Client{
+		Client:     probeHTTP,
+		Cache:      cache,
+		Credential: credFn,
 	}
 
 	return r, nil

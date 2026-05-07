@@ -62,6 +62,20 @@ control on `/metrics`, front it with your reverse proxy.
   `already_exists` buckets are normal-flow control labels — don't page
   on them.
 
+### Blob redirect
+
+| Metric | Type | Labels |
+|---|---|---|
+| `ocifactory_blob_redirect_total` | counter | `outcome` |
+
+- `outcome` ∈ `redirected` (the backend returned a presigned URL the
+  handler 307'd the client to), `inline` (the backend serves blobs
+  itself; handler fell back to streaming), `error` (the redirect probe
+  failed; handler also fell back to streaming).
+- A high `redirected:inline` ratio against a hosted backend (GAR, ECR,
+  ACR, GHCR, Docker Hub) confirms the egress short-circuit is doing its
+  job. The metric is not emitted when `--disable-blob-redirect` is set.
+
 ### Standard collectors
 
 The Prometheus recorder also registers `prometheus.NewGoCollector()`

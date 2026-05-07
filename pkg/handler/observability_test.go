@@ -41,6 +41,8 @@ func (r *recordingRecorder) HTTPRequest(format, op, status string, duration time
 }
 func (r *recordingRecorder) OCIBackendCall(string, string, time.Duration) {}
 
+func (r *recordingRecorder) BlobRedirect(string) {}
+
 func (r *recordingRecorder) snapshot() []httpCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
