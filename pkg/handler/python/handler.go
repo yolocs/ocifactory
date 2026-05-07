@@ -41,13 +41,13 @@ const (
 	// up many sub-cap fields to exhaust the walker's working memory.
 	maxTotalTextFieldBytes = 64 << 10
 
-	// defaultMaxUploadBytes caps the total request-body size accepted
+	// DefaultMaxUploadBytes caps the total request-body size accepted
 	// by handleFilePut. The streaming multipart walker never spills
 	// to disk, so this is purely a denial-of-service safeguard against
 	// a single oversized request streaming forever; 1 GiB comfortably
 	// exceeds every wheel and sdist on PyPI today and operators can
-	// tighten it via WithMaxUploadBytes.
-	defaultMaxUploadBytes = 1 << 30
+	// tighten it via WithMaxUploadBytes / --python-max-upload-bytes.
+	DefaultMaxUploadBytes = 1 << 30
 
 	// indexSentinelName and indexSentinelContent are the constant layer
 	// name and body written under index/<pkgName>. handleSimpleIndex only
@@ -115,7 +115,7 @@ func WithSimpleIndexCacheTTL(ttl time.Duration) Option {
 }
 
 // WithMaxUploadBytes caps the total size of a multipart upload body
-// the handler will accept. The default is defaultMaxUploadBytes
+// the handler will accept. The default is DefaultMaxUploadBytes
 // (1 GiB). A non-positive value disables the cap (not recommended).
 func WithMaxUploadBytes(n int64) Option {
 	return func(c *handlerConfig) {
@@ -144,7 +144,7 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL,
-		maxUploadBytes:      defaultMaxUploadBytes,
+		maxUploadBytes:      DefaultMaxUploadBytes,
 	}
 	for _, opt := range opts {
 		opt(&cfg)

@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
@@ -245,11 +246,12 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		RepoType:        "python",
 		BackendRegistry: "zot.example.com:5000/ocifactory",
 		// Defaults the production binary advertises in --help.
-		EnableMetrics:       true,
-		MetricsPath:         "/metrics",
-		SimpleIndexCacheTTL: 13 * time.Second,
-		DisableAuthn:        true,
-		AuthnKind:           "oidc",
+		EnableMetrics:        true,
+		MetricsPath:          "/metrics",
+		SimpleIndexCacheTTL:  13 * time.Second,
+		PythonMaxUploadBytes: python.DefaultMaxUploadBytes,
+		DisableAuthn:         true,
+		AuthnKind:            "oidc",
 		AuthnOIDCIssuers: []string{
 			"https://accounts.google.com",
 			"https://token.actions.githubusercontent.com",

@@ -65,6 +65,7 @@ const (
 	flagBackendRegistry                 = "backend-registry"
 	flagDisableStreamingPush            = "disable-streaming-push"
 	flagSimpleIndexCacheTTL             = "simple-index-cache-ttl"
+	flagPythonMaxUploadBytes            = "python-max-upload-bytes"
 	flagEnableMetrics                   = "enable-metrics"
 	flagMetricsPath                     = "metrics-path"
 	flagDisableAuthn                    = "disable-authn"
@@ -89,6 +90,7 @@ type serveConfig struct {
 	BackendRegistry      string        `mapstructure:"backend-registry"`
 	DisableStreamingPush bool          `mapstructure:"disable-streaming-push"`
 	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
+	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
 	MetricsPath          string        `mapstructure:"metrics-path"`
 
@@ -236,6 +238,11 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"for the affected package. Set to 0 to disable caching. "+
 			"Note: in multi-replica deployments, an upload landing on one "+
 			"replica may take up to this long to be reflected by another.")
+	flags.Int64(flagPythonMaxUploadBytes, python.DefaultMaxUploadBytes,
+		"Cap on the total request-body size accepted by the python upload "+
+			"endpoint. Defends against an authenticated client streaming "+
+			"arbitrary bytes to burn instance hours / egress before the OCI "+
+			"backend rejects the layer. Set to 0 to disable the cap.")
 	flags.Bool(flagEnableMetrics, true,
 		"Expose Prometheus metrics at --metrics-path and instrument the "+
 			"HTTP and OCI backend layers. When false, the no-op recorder is "+
@@ -331,6 +338,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		}
 		ph, err := python.NewHandler(r,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
+			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),
 		)
 		if err != nil {
