@@ -1,9 +1,12 @@
 package maven
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -269,6 +272,118 @@ func TestHandleGet(t *testing.T) {
 				if got, want := w.Header().Get("Content-Type"), mediaType; got != want {
 					t.Errorf("Content-Type = %q, want %q", got, want)
 				}
+			}
+		})
+	}
+}
+
+// redirectingRegistry wraps an *oci.FakeRegistry and lets a test
+// program BlobRedirectURL's return values, exercising the handler's
+// redirect-vs-stream branching.
+type redirectingRegistry struct {
+	*oci.FakeRegistry
+	redirectURL string
+	redirectErr error
+	calls       atomic.Int64
+}
+
+func (r *redirectingRegistry) BlobRedirectURL(_ context.Context, _ *oci.RepoFile) (string, error) {
+	r.calls.Add(1)
+	return r.redirectURL, r.redirectErr
+}
+
+func TestHandleGet_BlobRedirect(t *testing.T) {
+	t.Parallel()
+
+	setupFile := &oci.RepoFile{
+		OwningRepo: "com/example/project",
+		OwningTag:  "1.0.0",
+		Name:       "project-1.0.0.jar",
+		MediaType:  "application/java-archive",
+	}
+	const setupData = "jar content"
+	const reqPath = "/com/example/project/1.0.0/project-1.0.0.jar"
+	const presigned = "https://cdn.example.com/blob?signature=xyz"
+
+	cases := []struct {
+		name           string
+		method         string
+		redirectURL    string
+		redirectErr    error
+		wantStatus     int
+		wantLocation   string
+		wantBody       string
+		wantProbeCalls int64
+	}{
+		{
+			name:           "GET redirects when backend returns presigned URL",
+			method:         http.MethodGet,
+			redirectURL:    presigned,
+			wantStatus:     http.StatusTemporaryRedirect,
+			wantLocation:   presigned,
+			wantProbeCalls: 1,
+		},
+		{
+			name:           "GET falls through to streaming when redirect URL is empty",
+			method:         http.MethodGet,
+			redirectURL:    "",
+			wantStatus:     http.StatusOK,
+			wantBody:       setupData,
+			wantProbeCalls: 1,
+		},
+		{
+			name:           "GET falls through to streaming on probe error",
+			method:         http.MethodGet,
+			redirectErr:    errors.New("transient backend failure"),
+			wantStatus:     http.StatusOK,
+			wantBody:       setupData,
+			wantProbeCalls: 1,
+		},
+		{
+			name:           "HEAD never probes for redirect",
+			method:         http.MethodHead,
+			redirectURL:    presigned,
+			wantStatus:     http.StatusOK,
+			wantProbeCalls: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := oci.NewFakeRegistry()
+			if _, err := fake.AddFile(t.Context(), setupFile, strings.NewReader(setupData)); err != nil {
+				t.Fatalf("setup AddFile: %v", err)
+			}
+			reg := &redirectingRegistry{
+				FakeRegistry: fake,
+				redirectURL:  tc.redirectURL,
+				redirectErr:  tc.redirectErr,
+			}
+
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			req := httptest.NewRequest(tc.method, reqPath, nil)
+			w := httptest.NewRecorder()
+			h.Mux().ServeHTTP(w, req)
+
+			if got, want := w.Code, tc.wantStatus; got != want {
+				t.Errorf("status = %d, want %d", got, want)
+			}
+			if got, want := w.Header().Get("Location"), tc.wantLocation; got != want {
+				t.Errorf("Location = %q, want %q", got, want)
+			}
+			if tc.method == http.MethodGet && tc.wantBody != "" {
+				if got := w.Body.String(); got != tc.wantBody {
+					t.Errorf("body = %q, want %q", got, tc.wantBody)
+				}
+			}
+			if got, want := reg.calls.Load(), tc.wantProbeCalls; got != want {
+				t.Errorf("BlobRedirectURL calls = %d, want %d", got, want)
 			}
 		})
 	}

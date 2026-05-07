@@ -18,6 +18,7 @@ func TestNoOp_DoesNothing(t *testing.T) {
 	r := NoOp()
 	r.HTTPRequest("python", "read", "200", time.Millisecond, 10, 20)
 	r.OCIBackendCall("push_blob", StatusOK, time.Millisecond)
+	r.BlobRedirect("redirected")
 	// The point of NoOp is that it has no observable side effects; if
 	// we reached this line without panicking the contract is met.
 }
@@ -88,12 +89,34 @@ func TestPrometheus_OCIBackendCall_RecordsCounters(t *testing.T) {
 	}
 }
 
+func TestPrometheus_BlobRedirect_RecordsCounters(t *testing.T) {
+	t.Parallel()
+
+	p := NewPrometheus(prometheus.NewRegistry())
+
+	p.BlobRedirect("redirected")
+	p.BlobRedirect("redirected")
+	p.BlobRedirect("inline")
+	p.BlobRedirect("error")
+
+	if got, want := testutil.ToFloat64(p.blobRedirectTotal.WithLabelValues("redirected")), 2.0; got != want {
+		t.Errorf("blob_redirect_total{redirected} = %v, want %v", got, want)
+	}
+	if got, want := testutil.ToFloat64(p.blobRedirectTotal.WithLabelValues("inline")), 1.0; got != want {
+		t.Errorf("blob_redirect_total{inline} = %v, want %v", got, want)
+	}
+	if got, want := testutil.ToFloat64(p.blobRedirectTotal.WithLabelValues("error")), 1.0; got != want {
+		t.Errorf("blob_redirect_total{error} = %v, want %v", got, want)
+	}
+}
+
 func TestPrometheus_Handler_ExposesRegisteredMetrics(t *testing.T) {
 	t.Parallel()
 
 	p := NewPrometheus(prometheus.NewRegistry())
 	p.HTTPRequest("maven", "write", "201", time.Millisecond, 1, 2)
 	p.OCIBackendCall("push_blob", StatusOK, time.Millisecond)
+	p.BlobRedirect("redirected")
 
 	rec := httptest.NewRecorder()
 	p.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -106,6 +129,7 @@ func TestPrometheus_Handler_ExposesRegisteredMetrics(t *testing.T) {
 		"ocifactory_http_response_bytes_out_total",
 		"ocifactory_oci_backend_requests_total",
 		"ocifactory_oci_backend_request_duration_seconds",
+		"ocifactory_blob_redirect_total",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics body missing %q\n%s", want, body)

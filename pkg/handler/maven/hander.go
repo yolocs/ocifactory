@@ -207,6 +207,20 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
+	// HEAD wants headers only — never redirect. The redirect path is
+	// only worth taking when the response would otherwise transfer
+	// bytes; HEAD has no egress to save.
+	if req.Method != http.MethodHead {
+		if redirectURL, err := h.registry.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
+			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
+			return
+		} else if err != nil {
+			// Best-effort — fall through to the streaming path.
+			logger.DebugContext(req.Context(), "blob redirect probe failed; falling back to streaming", "error", err)
+		}
+	}
+
 	desc, r, err := h.registry.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)

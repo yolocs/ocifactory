@@ -18,9 +18,10 @@ import (
 // fakeRecorder captures every Recorder call so tests can assert on the
 // observed labels without standing up Prometheus.
 type fakeRecorder struct {
-	mu      sync.Mutex
-	backend []backendObs
-	http    []httpObs
+	mu       sync.Mutex
+	backend  []backendObs
+	http     []httpObs
+	redirect []string
 }
 
 type backendObs struct {
@@ -47,6 +48,18 @@ func (f *fakeRecorder) OCIBackendCall(op, status string, duration time.Duration)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.backend = append(f.backend, backendObs{op, status, duration})
+}
+
+func (f *fakeRecorder) BlobRedirect(outcome string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.redirect = append(f.redirect, outcome)
+}
+
+func (f *fakeRecorder) redirectOutcomes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.redirect...)
 }
 
 func (f *fakeRecorder) backendOpStatuses() []string {

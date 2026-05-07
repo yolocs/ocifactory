@@ -174,6 +174,15 @@ func (r *FakeRegistry) ListFiles(ctx context.Context, repo string) ([]*RepoFile,
 	return filesList, nil
 }
 
+// BlobRedirectURL always returns ("", nil), matching the inline-serving
+// branch of the real Registry's behaviour. Handlers that try the
+// redirect path against the fake fall through to ReadFile, which is
+// exactly what their tests want — blob streaming is exercised either
+// way.
+func (r *FakeRegistry) BlobRedirectURL(ctx context.Context, f *RepoFile) (string, error) {
+	return "", nil
+}
+
 func aliasKey(repo, alias string) string {
 	return repo + "/" + alias
 }

@@ -16,6 +16,13 @@ type Registry interface {
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
 	ListTags(ctx context.Context, repo string) ([]string, error)
 	ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error)
+
+	// BlobRedirectURL returns a presigned URL the client can follow to
+	// download the file's blob directly from the backend's CDN/object
+	// store, or ("", nil) when the backend serves blobs inline (or
+	// redirects are disabled). Hard failures return ("", err); callers
+	// should fall back to ReadFile in that case.
+	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
 }
 
 type Middleware func(next http.Handler) http.Handler

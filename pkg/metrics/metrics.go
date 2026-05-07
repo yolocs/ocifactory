@@ -34,6 +34,13 @@ type Recorder interface {
 	// either "ok" or the HTTP status code returned by the backend, or
 	// "error" for non-HTTP failures.
 	OCIBackendCall(op, status string, duration time.Duration)
+
+	// BlobRedirect records the outcome of one BlobRedirectURL probe.
+	// outcome is "redirected" (caller will 307 to the backend's
+	// presigned URL), "inline" (backend serves bytes itself; caller
+	// falls back to ReadFile), or "error" (probe failed; caller
+	// also falls back to ReadFile).
+	BlobRedirect(outcome string)
 }
 
 // StatusOK is the conventional success label for OCIBackendCall.
@@ -58,6 +65,7 @@ type noopRecorder struct{}
 
 func (noopRecorder) HTTPRequest(string, string, string, time.Duration, int64, int64) {}
 func (noopRecorder) OCIBackendCall(string, string, time.Duration)                    {}
+func (noopRecorder) BlobRedirect(string)                                             {}
 
 // NoOp returns a Recorder that discards every observation. Used by tests
 // and by serve when --enable-metrics=false.
@@ -86,6 +94,8 @@ type Prometheus struct {
 
 	backendRequestsTotal   *prometheus.CounterVec
 	backendRequestDuration *prometheus.HistogramVec
+
+	blobRedirectTotal *prometheus.CounterVec
 }
 
 // NewPrometheus constructs a Prometheus-backed Recorder. Pass nil for reg
@@ -125,6 +135,10 @@ func NewPrometheus(reg *prometheus.Registry) *Prometheus {
 			Help:    "OCI backend call latency, labelled by operation.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"op"}),
+		blobRedirectTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ocifactory_blob_redirect_total",
+			Help: "Total BlobRedirectURL probe outcomes, labelled by outcome (redirected, inline, error).",
+		}, []string{"outcome"}),
 	}
 	reg.MustRegister(
 		p.httpRequestsTotal,
@@ -133,6 +147,7 @@ func NewPrometheus(reg *prometheus.Registry) *Prometheus {
 		p.httpBytesOut,
 		p.backendRequestsTotal,
 		p.backendRequestDuration,
+		p.blobRedirectTotal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
@@ -155,6 +170,11 @@ func (p *Prometheus) HTTPRequest(format, op, status string, duration time.Durati
 func (p *Prometheus) OCIBackendCall(op, status string, duration time.Duration) {
 	p.backendRequestsTotal.WithLabelValues(op, status).Inc()
 	p.backendRequestDuration.WithLabelValues(op).Observe(duration.Seconds())
+}
+
+// BlobRedirect implements Recorder.
+func (p *Prometheus) BlobRedirect(outcome string) {
+	p.blobRedirectTotal.WithLabelValues(outcome).Inc()
 }
 
 // Handler returns an http.Handler that serves the Prometheus exposition
