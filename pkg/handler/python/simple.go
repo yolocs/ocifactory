@@ -80,12 +80,6 @@ type indexFile struct {
 	URL string
 	// Sha256 is the file blob's hex sha256 (no `sha256:` prefix).
 	Sha256 string
-	// MetadataSha256 is the hex sha256 of the PEP 658 metadata
-	// companion, when one exists. Empty for sdists and any wheel
-	// uploaded before PEP 658 support landed.
-	MetadataSha256 string
-	// RequiresPython is the wheel's `Requires-Python` value, if any.
-	RequiresPython string
 }
 
 // indexPage is the data passed to the simple.html template.
@@ -94,19 +88,11 @@ type indexPage struct {
 	Files []indexFile
 }
 
-// simpleIndexJSONFile is the JSON wire shape per PEP 691 §"file" /
-// PEP 714 §"core-metadata". The hyphenated keys match the spec.
+// simpleIndexJSONFile is the JSON wire shape per PEP 691 §"file".
 type simpleIndexJSONFile struct {
-	Filename       string            `json:"filename"`
-	URL            string            `json:"url"`
-	Hashes         map[string]string `json:"hashes"`
-	RequiresPython string            `json:"requires-python,omitempty"`
-	// CoreMetadata and DistInfoMetadata carry the same value; PEP 714
-	// renamed the field, so we emit both for client compatibility.
-	// pip 23.1+ reads core-metadata; older clients fall back to
-	// dist-info-metadata.
-	CoreMetadata     map[string]string `json:"core-metadata,omitempty"`
-	DistInfoMetadata map[string]string `json:"dist-info-metadata,omitempty"`
+	Filename string            `json:"filename"`
+	URL      string            `json:"url"`
+	Hashes   map[string]string `json:"hashes"`
 }
 
 type simpleIndexJSONMeta struct {
@@ -136,17 +122,12 @@ func writeJSONPackageIndex(w http.ResponseWriter, name string, files []indexFile
 	}
 	for _, f := range files {
 		jf := simpleIndexJSONFile{
-			Filename:       f.Filename,
-			URL:            f.URL,
-			Hashes:         map[string]string{},
-			RequiresPython: f.RequiresPython,
+			Filename: f.Filename,
+			URL:      f.URL,
+			Hashes:   map[string]string{},
 		}
 		if f.Sha256 != "" {
 			jf.Hashes["sha256"] = f.Sha256
-		}
-		if f.MetadataSha256 != "" {
-			jf.CoreMetadata = map[string]string{"sha256": f.MetadataSha256}
-			jf.DistInfoMetadata = map[string]string{"sha256": f.MetadataSha256}
 		}
 		out.Files = append(out.Files, jf)
 	}

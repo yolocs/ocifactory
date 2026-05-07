@@ -9,10 +9,7 @@
 <body>
   <h1> Links for {{.Title}} </h1>
   {{range $file := .Files}}
-  <a href="{{$file.URL}}"
-    {{- with $file.RequiresPython}} data-requires-python="{{.}}"{{end}}
-    {{- with $file.MetadataSha256}} data-core-metadata="sha256={{.}}" data-dist-info-metadata="sha256={{.}}"{{end -}}
-  >{{$file.Filename}}</a><br />
+  <a href="{{$file.URL}}">{{$file.Filename}}</a><br />
   {{end}}
 </body>
 

@@ -1,7 +1,6 @@
 package python
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"errors"
@@ -21,7 +20,6 @@ import (
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/renderer"
-	"golang.org/x/sync/errgroup"
 	"oras.land/oras-go/v2/errdef"
 )
 
@@ -50,12 +48,6 @@ const (
 	// exceeds every wheel and sdist on PyPI today and operators can
 	// tighten it via WithMaxUploadBytes.
 	defaultMaxUploadBytes = 1 << 30
-
-	// metadataResolveConcurrency bounds the number of concurrent
-	// .metadata fetches the simple-index renderer issues on a cache
-	// miss. Big enough to amortise round-trip latency for a package
-	// with many versions, small enough not to flood the OCI backend.
-	metadataResolveConcurrency = 8
 
 	// indexSentinelName and indexSentinelContent are the constant layer
 	// name and body written under index/<pkgName>. handleSimpleIndex only
@@ -250,14 +242,6 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 // walker can't construct the OCI repo path without them. Every Python
 // upload tool in the wild (twine, flit, hatchling, poetry) already
 // sends fields first; uploads that violate the order get a 400.
-//
-// On wheel uploads the handler also extracts `<distinfo>/METADATA`
-// from the wheel zip and stores it as a sibling file (PEP 658). The
-// extractor is fed by an io.TeeReader off the wheel stream — the
-// METADATA bytes land in a 1 MiB-capped RAM buffer while AddFile
-// pushes the whole wheel through unaltered. Failure to extract is
-// logged and the upload still publishes; clients just lose the
-// metadata fast-path for that file.
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
@@ -312,8 +296,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "form fields too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		// First non-empty value wins, matching the previous
-		// firstFormValue semantics.
+		// First non-empty value wins.
 		if v != "" {
 			if _, ok := fields[p.FormName()]; !ok {
 				fields[p.FormName()] = v
@@ -359,67 +342,14 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 
 	normalizedName := normalize(pkgName)
 
-	// For wheels, tee the part body through the streaming METADATA
-	// extractor. AddFile drives the read; the walker runs in a
-	// goroutine and signals completion once the pipe drains.
-	var (
-		wheelReader io.Reader = contentPart
-		joinMeta    func() metaResult
-	)
-	if isWheelFilename(contentName) {
-		wheelReader, joinMeta = teeWheelMetadata(contentPart)
-	}
-
 	wheelRF := &oci.RepoFile{
 		OwningRepo: "packages/" + normalizedName,
 		OwningTag:  versionNum,
 		Name:       contentName,
 		MediaType:  detectMediaType(contentName),
 	}
-	if !h.streamAddFile(ctx, w, wheelRF, wheelReader) {
-		// Even on failure, drain the metadata extractor so its
-		// goroutine and pipe don't leak.
-		if joinMeta != nil {
-			_ = joinMeta()
-		}
+	if !h.streamAddFile(ctx, w, wheelRF, contentPart) {
 		return
-	}
-
-	var metaBytes []byte
-	if joinMeta != nil {
-		res := joinMeta()
-		switch {
-		case res.err == nil:
-			metaBytes = res.data
-		case errors.Is(res.err, errMetadataNotFound),
-			errors.Is(res.err, errStreamMETADATAUnreachable),
-			errors.Is(res.err, errMalformedZip):
-			// Best-effort: the wheel doesn't carry retrievable
-			// METADATA via the streaming walker (no member, an
-			// unsupported zip feature, or just not a real zip
-			// behind a .whl name). The upload still succeeds;
-			// clients lose the PEP 658 fast-path for this file.
-			logger.DebugContext(ctx, "wheel METADATA not extracted",
-				"reason", res.err, "filename", contentName)
-		case errors.Is(res.err, errWheelTooManyEntries):
-			logger.WarnContext(ctx, "wheel exceeds entry cap; skipping METADATA", "filename", contentName)
-		default:
-			logger.WarnContext(ctx, "failed to extract wheel METADATA", "error", res.err, "filename", contentName)
-		}
-	}
-
-	if metaBytes != nil {
-		metaName := metadataCompanionName(contentName)
-		metaRF := &oci.RepoFile{
-			OwningRepo: "packages/" + normalizedName,
-			OwningTag:  versionNum,
-			Name:       metaName,
-			MediaType:  detectMediaType(metaName),
-			Size:       int64(len(metaBytes)),
-		}
-		if !h.streamAddFile(ctx, w, metaRF, bytes.NewReader(metaBytes)) {
-			return
-		}
 	}
 
 	// The index repo write is a single sentinel per package, not per
@@ -489,36 +419,6 @@ func writeMultipartReadError(w http.ResponseWriter, err error, logger *slog.Logg
 	default:
 		logger.DebugContext(ctx, "failed to read multipart part", "error", err)
 		http.Error(w, "request body is not valid form data", http.StatusBadRequest)
-	}
-}
-
-// metaResult is the outcome of a streaming METADATA extraction tee.
-type metaResult struct {
-	data []byte
-	err  error
-}
-
-// teeWheelMetadata returns an io.Reader that mirrors the wheel body to
-// a streaming METADATA extractor, plus a join function the caller
-// invokes after the upload to retrieve the result. The extractor runs
-// in a goroutine and drains the pipe through to EOF so the upload
-// writer side never blocks on backpressure even if the walker stopped
-// early on success or hit an unrecoverable error mid-stream.
-func teeWheelMetadata(src io.Reader) (io.Reader, func() metaResult) {
-	pr, pw := io.Pipe()
-	resCh := make(chan metaResult, 1)
-	go func() {
-		data, err := extractWheelMetadataStream(pr)
-		// Drain whatever remains so the writer side (TeeReader →
-		// pipe writer driven by AddFile) never blocks. EOF on the
-		// pipe arrives once the caller's join closes pw.
-		_, _ = io.Copy(io.Discard, pr)
-		resCh <- metaResult{data: data, err: err}
-	}()
-	teed := io.TeeReader(src, pw)
-	return teed, func() metaResult {
-		_ = pw.Close()
-		return <-resCh
 	}
 }
 
@@ -610,11 +510,9 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	rendered := make([]indexFile, 0, len(files))
 	for _, f := range files {
 		rendered = append(rendered, indexFile{
-			Filename:       f.Filename,
-			URL:            renderedFileURL(req, pkg, f),
-			Sha256:         f.Sha256,
-			MetadataSha256: f.MetadataSha256,
-			RequiresPython: f.RequiresPython,
+			Filename: f.Filename,
+			URL:      renderedFileURL(req, pkg, f),
+			Sha256:   f.Sha256,
 		})
 	}
 
@@ -625,100 +523,24 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	h.renderer.RenderHTML(w, "simple.html", indexPage{Title: pkg, Files: rendered})
 }
 
-// resolvePackageFiles enumerates a package's files plus the per-wheel
-// PEP 658 metadata + Requires-Python headers. The returned slice is
-// what goes into the simple-index cache; both HTML and JSON renderers
-// pivot off it.
-//
-// .metadata companion files are not returned in the slice — they are
-// consumed as siblings of the wheels they describe. Their Digest gives
-// us the PEP 658 hash without re-fetching, and their content is read
-// once to extract Requires-Python (bounded concurrency, best-effort:
-// unreadable companions log a warning and leave Requires-Python empty
-// rather than failing the whole render).
+// resolvePackageFiles enumerates a package's files. The returned slice
+// is what goes into the simple-index cache; both HTML and JSON
+// renderers pivot off it.
 func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cachedFile, error) {
-	logger := logging.FromContext(ctx)
-
 	rawFiles, err := h.registry.ListFiles(ctx, "packages/"+pkg)
 	if err != nil {
 		return nil, err
 	}
 
-	type sibKey struct{ tag, name string }
-	siblings := make(map[sibKey]*oci.RepoFile, len(rawFiles))
-	for _, f := range rawFiles {
-		siblings[sibKey{tag: f.OwningTag, name: f.Name}] = f
-	}
-
 	entries := make([]cachedFile, 0, len(rawFiles))
 	for _, f := range rawFiles {
-		if strings.HasSuffix(f.Name, ".metadata") {
-			// Companion file; surfaced via its sibling wheel below.
-			continue
-		}
-		entry := cachedFile{
+		entries = append(entries, cachedFile{
 			Filename:  f.Name,
 			OwningTag: f.OwningTag,
 			Sha256:    strings.TrimPrefix(f.Digest, "sha256:"),
-		}
-		if isWheelFilename(f.Name) {
-			if meta, ok := siblings[sibKey{tag: f.OwningTag, name: metadataCompanionName(f.Name)}]; ok {
-				entry.MetadataSha256 = strings.TrimPrefix(meta.Digest, "sha256:")
-			}
-		}
-		entries = append(entries, entry)
-	}
-
-	// Resolve Requires-Python for every wheel that has a companion.
-	// Concurrent fetches with a small limit; per-fetch errors that
-	// aren't context cancellation are best-effort (log and leave the
-	// field empty) so a single broken companion doesn't tank the
-	// whole render. Context cancellation IS propagated so the caller
-	// skips caching partially-resolved entries.
-	eg, gctx := errgroup.WithContext(ctx)
-	eg.SetLimit(metadataResolveConcurrency)
-	for i := range entries {
-		e := &entries[i]
-		if e.MetadataSha256 == "" || !isWheelFilename(e.Filename) {
-			continue
-		}
-		eg.Go(func() error {
-			rp, rerr := h.readRequiresPython(gctx, pkg, e.OwningTag, e.Filename)
-			if rerr != nil {
-				if errors.Is(rerr, context.Canceled) || errors.Is(rerr, context.DeadlineExceeded) {
-					return rerr
-				}
-				logger.WarnContext(gctx, "failed to read wheel METADATA companion",
-					"package", pkg, "version", e.OwningTag, "filename", e.Filename, "error", rerr)
-				return nil
-			}
-			e.RequiresPython = rp
-			return nil
 		})
 	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
-
 	return entries, nil
-}
-
-func (h *Handler) readRequiresPython(ctx context.Context, pkg, tag, wheelName string) (string, error) {
-	f := &oci.RepoFile{
-		OwningRepo: "packages/" + pkg,
-		OwningTag:  tag,
-		Name:       metadataCompanionName(wheelName),
-	}
-	_, rc, err := h.registry.ReadFile(ctx, f)
-	if err != nil {
-		return "", err
-	}
-	defer rc.Close()
-	data, err := io.ReadAll(io.LimitReader(rc, maxMetadataSize+1))
-	if err != nil {
-		return "", err
-	}
-	return parseRequiresPython(data), nil
 }
 
 func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {

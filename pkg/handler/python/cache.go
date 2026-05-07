@@ -23,17 +23,15 @@ const DefaultSimpleIndexCacheTTL = 60 * time.Second
 const simpleIndexCacheSize = 4096
 
 // cachedFile is the per-file payload we memoise from a single
-// ListFiles + per-wheel METADATA fetch. The render path turns each
-// entry into an indexFile (HTML or JSON) by attaching a request-
-// specific URL — caching this slice (instead of rendered output)
-// avoids tying entries to a particular request scheme/host and
-// covers both HTML and JSON renderings off a single cache miss.
+// ListFiles. The render path turns each entry into an indexFile
+// (HTML or JSON) by attaching a request-specific URL — caching this
+// slice (instead of rendered output) avoids tying entries to a
+// particular request scheme/host and covers both HTML and JSON
+// renderings off a single cache miss.
 type cachedFile struct {
-	Filename       string
-	OwningTag      string
-	Sha256         string
-	MetadataSha256 string
-	RequiresPython string
+	Filename  string
+	OwningTag string
+	Sha256    string
 }
 
 // simpleIndexCache memoises the per-package simple-index payload. The

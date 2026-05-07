@@ -3,7 +3,6 @@ package python
 import (
 	"encoding/json"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -69,11 +68,9 @@ func TestWriteJSONPackageIndex_Schema(t *testing.T) {
 
 	files := []indexFile{
 		{
-			Filename:       "requests-2.31.0-py3-none-any.whl",
-			URL:            "http://example/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
-			Sha256:         "abc123",
-			MetadataSha256: "def456",
-			RequiresPython: ">=3.7",
+			Filename: "requests-2.31.0-py3-none-any.whl",
+			URL:      "http://example/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
+			Sha256:   "abc123",
 		},
 		{
 			Filename: "requests-2.31.0.tar.gz",
@@ -97,12 +94,9 @@ func TestWriteJSONPackageIndex_Schema(t *testing.T) {
 		Name: "requests",
 		Files: []simpleIndexJSONFile{
 			{
-				Filename:         "requests-2.31.0-py3-none-any.whl",
-				URL:              "http://example/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
-				Hashes:           map[string]string{"sha256": "abc123"},
-				RequiresPython:   ">=3.7",
-				CoreMetadata:     map[string]string{"sha256": "def456"},
-				DistInfoMetadata: map[string]string{"sha256": "def456"},
+				Filename: "requests-2.31.0-py3-none-any.whl",
+				URL:      "http://example/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
+				Hashes:   map[string]string{"sha256": "abc123"},
 			},
 			{
 				Filename: "requests-2.31.0.tar.gz",
@@ -138,20 +132,5 @@ func TestWriteJSONIndexList_Schema(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("JSON index list mismatch (-want +got):\n%s", diff)
-	}
-}
-
-func TestWriteJSONPackageIndex_OmitsEmptyMetadata(t *testing.T) {
-	t.Parallel()
-
-	rec := httptest.NewRecorder()
-	writeJSONPackageIndex(rec, "foo", []indexFile{
-		{Filename: "foo-1.0.0.tar.gz", URL: "u", Sha256: "abc"},
-	})
-	body := rec.Body.String()
-	for _, banned := range []string{"core-metadata", "dist-info-metadata", "requires-python"} {
-		if strings.Contains(body, banned) {
-			t.Errorf("body unexpectedly contains %q for sdist with no metadata: %s", banned, body)
-		}
 	}
 }

@@ -3,7 +3,6 @@ package python
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -733,44 +732,6 @@ func TestHandleSimpleIndex(t *testing.T) {
 	}
 }
 
-// uploadWheel performs a twine-style multipart upload of a real wheel
-// zip (one whose `<distinfo>/METADATA` actually parses) so the handler
-// can extract PEP 658 metadata and Requires-Python.
-func uploadWheel(t *testing.T, h *Handler, pkgName, version string, metadata string) (filename string, status int) {
-	t.Helper()
-
-	filename = pkgName + "-" + version + "-py3-none-any.whl"
-	wheelBytes := buildTestWheel(t, map[string]string{
-		pkgName + "-" + version + ".dist-info/METADATA": metadata,
-		pkgName + "-" + version + ".dist-info/WHEEL":    "Wheel-Version: 1.0\n",
-		pkgName + "/__init__.py":                        "",
-	})
-
-	var b bytes.Buffer
-	mw := multipart.NewWriter(&b)
-	if err := mw.WriteField("name", pkgName); err != nil {
-		t.Fatalf("write name: %v", err)
-	}
-	if err := mw.WriteField("version", version); err != nil {
-		t.Fatalf("write version: %v", err)
-	}
-	fw, err := mw.CreateFormFile("content", filename)
-	if err != nil {
-		t.Fatalf("create form file: %v", err)
-	}
-	if _, err := fw.Write(wheelBytes); err != nil {
-		t.Fatalf("write wheel: %v", err)
-	}
-	if err := mw.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	rec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec, req)
-	return filename, rec.Code
-}
-
 // TestPEP503Normalization round-trips upload + simple-index lookup
 // across every separator variant. Per PEP 503, `Foo_Bar`, `foo-bar`,
 // and `foo.bar` are the same package; uploading any one and querying
@@ -929,103 +890,6 @@ func TestMultipartFieldOrder(t *testing.T) {
 	}
 }
 
-// TestPEP658WheelMetadata exercises the wheel-upload metadata-extraction
-// path: a valid wheel zip's `<distinfo>/METADATA` is written as a
-// `<filename>.metadata` companion, and the simple-index render advertises
-// it via the PEP 714 `data-core-metadata` (and legacy
-// `data-dist-info-metadata`) attributes alongside `data-requires-python`.
-func TestPEP658WheelMetadata(t *testing.T) {
-	t.Parallel()
-
-	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
-	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
-	if code != http.StatusCreated {
-		t.Fatalf("upload status = %d", code)
-	}
-
-	// Metadata companion is stored as a sibling.
-	metaKey := "packages/requests/1.0.0/" + filename + ".metadata"
-	if got, ok := reg.Files[metaKey]; !ok {
-		t.Errorf("metadata companion missing at %q; have keys: %v", metaKey, registryFileKeys(reg))
-	} else if string(got) != meta {
-		t.Errorf("metadata content mismatch:\nwant: %q\ngot:  %q", meta, got)
-	}
-
-	// HTML simple-index advertises both attributes.
-	req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
-	rec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/simple/requests/ status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	body := rec.Body.String()
-	for _, want := range []string{
-		`data-requires-python="&gt;=3.7"`, // html template HTML-escapes the >
-		`data-core-metadata="sha256=`,
-		`data-dist-info-metadata="sha256=`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("HTML body missing %q; got:\n%s", want, body)
-		}
-	}
-
-	// .metadata sibling itself must NOT show up as a top-level file
-	// link in the simple index.
-	if strings.Contains(body, filename+".metadata") {
-		t.Errorf("simple-index body should not list the .metadata sibling as its own link; got:\n%s", body)
-	}
-}
-
-// TestPEP658_NonWheelHasNoMetadata confirms that uploading a non-wheel
-// (sdist) does not produce a `.metadata` companion and the simple-index
-// entry omits dist-info-metadata attributes.
-func TestPEP658_NonWheelHasNoMetadata(t *testing.T) {
-	t.Parallel()
-
-	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	var b bytes.Buffer
-	mw := multipart.NewWriter(&b)
-	_ = mw.WriteField("name", "example")
-	_ = mw.WriteField("version", "1.0.0")
-	fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
-	_, _ = fw.Write([]byte("tarball-bytes"))
-	_ = mw.Close()
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	rec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec, req)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("upload status=%d", rec.Code)
-	}
-
-	for k := range reg.Files {
-		if strings.HasSuffix(k, ".metadata") {
-			t.Errorf("non-wheel upload unexpectedly produced metadata companion: %s", k)
-		}
-	}
-
-	req2 := httptest.NewRequest(http.MethodGet, "/simple/example/", nil)
-	rec2 := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec2, req2)
-	body := rec2.Body.String()
-	for _, banned := range []string{"data-core-metadata", "data-dist-info-metadata", "data-requires-python"} {
-		if strings.Contains(body, banned) {
-			t.Errorf("sdist simple-index entry should not advertise %q; got:\n%s", banned, body)
-		}
-	}
-}
-
 // TestSimpleIndexJSON verifies PEP 691 content negotiation: the same
 // /simple/<pkg>/ URL renders JSON when the client asks for it via
 // Accept and the JSON conforms to the spec's shape.
@@ -1038,9 +902,8 @@ func TestSimpleIndexJSON(t *testing.T) {
 		t.Fatalf("NewHandler: %v", err)
 	}
 
-	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
-	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
-	if code != http.StatusCreated {
+	const filename = "requests-1.0.0-py3-none-any.whl"
+	if code := uploadFile(t, h, "requests", "1.0.0", filename); code != http.StatusCreated {
 		t.Fatalf("upload status=%d", code)
 	}
 
@@ -1075,18 +938,38 @@ func TestSimpleIndexJSON(t *testing.T) {
 	if f.Hashes["sha256"] == "" {
 		t.Errorf("missing sha256 hash; got hashes=%v", f.Hashes)
 	}
-	if f.RequiresPython != ">=3.7" {
-		t.Errorf("requires-python=%q, want %q", f.RequiresPython, ">=3.7")
+}
+
+// uploadFile is a minimal twine-style multipart upload helper: it
+// writes name, version, then a content part with an arbitrary opaque
+// body. The body is not parsed by the handler — it just gets streamed
+// into the OCI backend — so callers don't need a real wheel.
+func uploadFile(t *testing.T, h *Handler, pkgName, version, filename string) int {
+	t.Helper()
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	if err := mw.WriteField("name", pkgName); err != nil {
+		t.Fatalf("write name: %v", err)
 	}
-	if f.CoreMetadata["sha256"] == "" {
-		t.Errorf("core-metadata.sha256 missing; got %v", f.CoreMetadata)
+	if err := mw.WriteField("version", version); err != nil {
+		t.Fatalf("write version: %v", err)
 	}
-	if f.DistInfoMetadata["sha256"] == "" {
-		t.Errorf("dist-info-metadata.sha256 missing; got %v", f.DistInfoMetadata)
+	fw, err := mw.CreateFormFile("content", filename)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
 	}
-	if f.CoreMetadata["sha256"] != f.DistInfoMetadata["sha256"] {
-		t.Errorf("core-metadata != dist-info-metadata: %q vs %q", f.CoreMetadata["sha256"], f.DistInfoMetadata["sha256"])
+	if _, err := fw.Write([]byte("payload-" + filename)); err != nil {
+		t.Fatalf("write content: %v", err)
 	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	return rec.Code
 }
 
 // TestSimpleIndexJSONList confirms the root /simple/ endpoint also
@@ -1319,116 +1202,6 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestPEP658WheelMetadata_HashEquality asserts that the sha256
-// advertised in the simple-index render is the actual sha256 of the
-// stored .metadata blob — not just present.
-func TestPEP658WheelMetadata_HashEquality(t *testing.T) {
-	t.Parallel()
-
-	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	const meta = "Metadata-Version: 2.1\nName: requests\nVersion: 1.0.0\nRequires-Python: >=3.7\n"
-	filename, code := uploadWheel(t, h, "requests", "1.0.0", meta)
-	if code != http.StatusCreated {
-		t.Fatalf("upload: %d", code)
-	}
-
-	wantSha := sha256Hex([]byte(meta))
-
-	// HTML render: extract the data-core-metadata="sha256=<hex>" value and compare.
-	rec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/simple/requests/", nil))
-	body := rec.Body.String()
-	want := `data-core-metadata="sha256=` + wantSha + `"`
-	if !strings.Contains(body, want) {
-		t.Errorf("HTML body missing %q; got:\n%s", want, body)
-	}
-	wantLegacy := `data-dist-info-metadata="sha256=` + wantSha + `"`
-	if !strings.Contains(body, wantLegacy) {
-		t.Errorf("HTML body missing %q; got:\n%s", wantLegacy, body)
-	}
-
-	// JSON render: parse and compare the field directly.
-	jsonReq := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
-	jsonReq.Header.Set("Accept", contentTypeJSONv1)
-	jsonRec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(jsonRec, jsonReq)
-
-	var got simpleIndexJSONPackage
-	if err := json.Unmarshal(jsonRec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(got.Files) != 1 {
-		t.Fatalf("files=%d, want 1", len(got.Files))
-	}
-	if g := got.Files[0].CoreMetadata["sha256"]; g != wantSha {
-		t.Errorf("core-metadata.sha256 = %q, want %q", g, wantSha)
-	}
-	if g := got.Files[0].DistInfoMetadata["sha256"]; g != wantSha {
-		t.Errorf("dist-info-metadata.sha256 = %q, want %q", g, wantSha)
-	}
-
-	// And the wheel's own hashes.sha256 matches the stored bytes.
-	storedKey := "packages/requests/1.0.0/" + filename
-	storedBytes, ok := reg.Files[storedKey]
-	if !ok {
-		t.Fatalf("stored wheel missing under %q", storedKey)
-	}
-	if g, want := got.Files[0].Hashes["sha256"], sha256Hex(storedBytes); g != want {
-		t.Errorf("hashes.sha256 = %q, want %q", g, want)
-	}
-}
-
-// TestPEP658_WheelWithoutRequiresPython covers the "wheel has METADATA
-// but no Requires-Python header" case: the metadata companion still
-// exists, but data-requires-python is omitted.
-func TestPEP658_WheelWithoutRequiresPython(t *testing.T) {
-	t.Parallel()
-
-	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
-
-	const meta = "Metadata-Version: 2.1\nName: nopython\nVersion: 1.0.0\nSummary: no Requires-Python here\n"
-	if _, code := uploadWheel(t, h, "nopython", "1.0.0", meta); code != http.StatusCreated {
-		t.Fatalf("upload: %d", code)
-	}
-
-	rec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/simple/nopython/", nil))
-	body := rec.Body.String()
-	if strings.Contains(body, "data-requires-python") {
-		t.Errorf("HTML render should not advertise data-requires-python; got:\n%s", body)
-	}
-	// But PEP 658 metadata IS still advertised because METADATA was extractable.
-	if !strings.Contains(body, "data-core-metadata") {
-		t.Errorf("HTML render should still advertise data-core-metadata when METADATA is present; got:\n%s", body)
-	}
-
-	jr := httptest.NewRequest(http.MethodGet, "/simple/nopython/", nil)
-	jr.Header.Set("Accept", contentTypeJSONv1)
-	jrec := httptest.NewRecorder()
-	h.Mux().ServeHTTP(jrec, jr)
-	var got simpleIndexJSONPackage
-	if err := json.Unmarshal(jrec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got.Files[0].RequiresPython != "" {
-		t.Errorf("requires-python = %q, want empty", got.Files[0].RequiresPython)
-	}
-}
-
-func sha256Hex(b []byte) string {
-	sum := sha256.Sum256(b)
-	return fmt.Sprintf("%x", sum)
 }
 
 // TestNoAcceptHeader_DefaultsToHTML confirms that pip 21 (and earlier)
