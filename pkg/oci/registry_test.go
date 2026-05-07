@@ -170,8 +170,9 @@ func TestDetectFileMediaType(t *testing.T) {
 type inMemoryRepo struct {
 	*memory.Store
 
-	mu      sync.Mutex
-	allTags map[string]string
+	mu             sync.Mutex
+	allTags        map[string]string
+	deletedDigests map[string]struct{}
 }
 
 func (r *inMemoryRepo) Tags(_ context.Context, _ string, fn func(tags []string) error) error {
@@ -188,6 +189,11 @@ func (r *inMemoryRepo) Tag(ctx context.Context, desc ocispec.Descriptor, referen
 	return r.Store.Tag(ctx, desc, reference)
 }
 
+// Delete simulates removal: oras-go's memory.Store has no Delete, so
+// we keep a deleted-digest set and let Predecessors filter on it.
+// That's enough for the unit tests that need to observe an unlinked
+// referrer (e.g. AddFile's overwrite path); a real registry GCs the
+// underlying blob/manifest for us.
 func (r *inMemoryRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
 	r.mu.Lock()
 	for tag, digest := range r.allTags {
@@ -195,8 +201,32 @@ func (r *inMemoryRepo) Delete(ctx context.Context, target ocispec.Descriptor) er
 			delete(r.allTags, tag)
 		}
 	}
+	if r.deletedDigests == nil {
+		r.deletedDigests = map[string]struct{}{}
+	}
+	r.deletedDigests[target.Digest.String()] = struct{}{}
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *inMemoryRepo) Predecessors(ctx context.Context, node ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	all, err := r.Store.Predecessors(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.deletedDigests) == 0 {
+		return all, nil
+	}
+	kept := make([]ocispec.Descriptor, 0, len(all))
+	for _, d := range all {
+		if _, gone := r.deletedDigests[d.Digest.String()]; gone {
+			continue
+		}
+		kept = append(kept, d)
+	}
+	return kept, nil
 }
 
 // Intercept the Resolve call to return ErrNotFound if the target has been deleted.
@@ -535,15 +565,18 @@ func TestAddFile_BufferedPath(t *testing.T) {
 				t.Errorf("AddFile() pushed blob size = %d, want %d", gotBytes, tc.wantFileSize)
 			}
 
-			// Re-adding the same content must not re-push the blob: the
-			// Exists check should short-circuit it, and the unchanged
-			// manifest path should skip the manifest re-pack as well.
+			// Re-uploading the same (repo, tag, name) is rejected by
+			// default — the immutable-add contract takes precedence
+			// over the older dedup-via-pushIfMissing path. The error
+			// is returned before any byte is read from the body, so
+			// the second call must not push anything.
 			pushesAfterFirst := counting.pushCalls
-			if _, err := r.AddFile(ctx, tc.repoFile, bytes.NewReader(tc.content)); err != nil {
-				t.Fatalf("AddFile() second call error = %v", err)
+			_, err = r.AddFile(ctx, tc.repoFile, bytes.NewReader(tc.content))
+			if !errors.Is(err, ErrAlreadyExists) {
+				t.Fatalf("AddFile() second call error = %v, want ErrAlreadyExists", err)
 			}
 			if counting.pushCalls != pushesAfterFirst {
-				t.Errorf("AddFile() second call pushed %d more times, want 0", counting.pushCalls-pushesAfterFirst)
+				t.Errorf("AddFile() rejected re-upload pushed %d more times, want 0", counting.pushCalls-pushesAfterFirst)
 			}
 		})
 	}
@@ -1132,4 +1165,154 @@ func TestAppendRefs_RepointReapsOldAlias(t *testing.T) {
 	if string(got) != "b" {
 		t.Errorf("ReadFile(latest, b.txt) = %q, want %q", got, "b")
 	}
+}
+
+// TestAddFile_ReuploadRejectedByDefault locks the safe-by-default
+// re-upload behaviour. A second AddFile to the same
+// (OwningRepo, OwningTag, Name) returns ErrAlreadyExists without
+// touching the body, regardless of whether the new content matches
+// the existing file. The byte-untouched property matters because
+// streaming clients can retry without rewinding.
+func TestAddFile_ReuploadRejectedByDefault(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	tests := []struct {
+		name   string
+		first  string
+		second string
+	}{
+		{name: "identical content", first: "hello", second: "hello"},
+		{name: "different content", first: "hello", second: "world!"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r, _ := newTestRegistry(t)
+			f := &RepoFile{
+				OwningRepo: "pkg",
+				OwningTag:  "v1",
+				Name:       "a.txt",
+			}
+			if _, err := r.AddFile(ctx, f, strings.NewReader(tc.first)); err != nil {
+				t.Fatalf("AddFile() first call error = %v", err)
+			}
+
+			body := &readCounter{src: strings.NewReader(tc.second)}
+			_, err := r.AddFile(ctx, f, body)
+			if !errors.Is(err, ErrAlreadyExists) {
+				t.Fatalf("AddFile() second call error = %v, want ErrAlreadyExists", err)
+			}
+			if body.calls != 0 {
+				t.Errorf("AddFile() rejected re-upload read %d Read call(s), want 0", body.calls)
+			}
+		})
+	}
+}
+
+// TestAddFile_ReuploadAllowedWithOverwrite verifies the opt-in
+// overwrite path: with WithAllowOverwrite(true), a second AddFile to
+// the same name replaces the previous file manifest, and ReadFile
+// subsequently yields the new content. The previous file manifest is
+// unlinked from the version's referrer set so ListFiles reports
+// exactly one entry per filename.
+func TestAddFile_ReuploadAllowedWithOverwrite(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, err := NewRegistry(
+		&url.URL{Scheme: "https", Host: "example.com"},
+		WithAllowOverwrite(true),
+	)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+	r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+		return memRepo, nil
+	}
+
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}
+	if _, err := r.AddFile(ctx, f, strings.NewReader("first")); err != nil {
+		t.Fatalf("AddFile() first call error = %v", err)
+	}
+	if _, err := r.AddFile(ctx, f, strings.NewReader("second")); err != nil {
+		t.Fatalf("AddFile() second call error = %v", err)
+	}
+
+	files, err := r.ListFiles(ctx, "pkg")
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	if got, want := len(files), 1; got != want {
+		t.Fatalf("ListFiles() = %d files, want %d (got: %+v)", got, want, files)
+	}
+
+	_, body, err := r.ReadFile(ctx, f)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	got, _ := io.ReadAll(body)
+	body.Close()
+	if string(got) != "second" {
+		t.Errorf("ReadFile() after overwrite = %q, want %q", got, "second")
+	}
+}
+
+// TestAddFile_ReuploadDistinctNamesNotAffected proves the existence
+// probe scopes its match by Name: a second AddFile with a different
+// filename under the same OwningTag is the normal multi-file case
+// and must succeed even with the default policy.
+func TestAddFile_ReuploadDistinctNamesNotAffected(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, _ := newTestRegistry(t)
+
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile(a.txt) error = %v", err)
+	}
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "b.txt",
+	}, strings.NewReader("b")); err != nil {
+		t.Fatalf("AddFile(b.txt) error = %v", err)
+	}
+
+	files, err := r.ListFiles(ctx, "pkg")
+	if err != nil {
+		t.Fatalf("ListFiles() error = %v", err)
+	}
+	gotNames := make([]string, 0, len(files))
+	for _, f := range files {
+		gotNames = append(gotNames, f.Name)
+	}
+	slices.Sort(gotNames)
+	if diff := cmp.Diff([]string{"a.txt", "b.txt"}, gotNames); diff != "" {
+		t.Errorf("ListFiles() names mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// readCounter tracks how many times Read is called on the wrapped
+// reader. Used to assert that the rejected-re-upload path returns
+// ErrAlreadyExists before consuming any of the request body.
+type readCounter struct {
+	src   io.Reader
+	calls int
+}
+
+func (r *readCounter) Read(p []byte) (int, error) {
+	r.calls++
+	return r.src.Read(p)
 }

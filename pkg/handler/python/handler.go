@@ -201,12 +201,9 @@ func (h *Handler) Mux() http.Handler {
 // (already-normalized) package name; ListTags is enough to enumerate
 // them.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
-	logger := logging.FromContext(req.Context())
-
 	tags, err := h.registry.ListTags(req.Context(), "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		logger.ErrorContext(req.Context(), "failed to list package index", "error", err)
-		http.Error(w, "failed to list package index", http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "failed to list package index")
 		return
 	}
 
@@ -353,19 +350,32 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// The index repo write is a single sentinel per package, not per
-	// version. handleSimpleIndex only reads tag names from "index"
-	// via ListTags, so storing one constant placeholder layer under
-	// index/<normalizedName> is enough — the OCI backend deduplicates
-	// the identical blob and file manifest across every subsequent
-	// upload of the same package.
-	sentinelRF := &oci.RepoFile{
-		OwningRepo: "index",
-		OwningTag:  normalizedName,
-		Name:       indexSentinelName,
-		MediaType:  "text/plain",
-		Size:       int64(len(indexSentinelContent)),
-	}
-	if !h.streamAddFile(ctx, w, sentinelRF, strings.NewReader(indexSentinelContent)) {
+	// version — handleSimpleIndex only reads tag names from "index"
+	// via ListTags, so one constant placeholder layer under
+	// index/<normalizedName> is enough.
+	//
+	// We must skip the AddFile call when the sentinel is already
+	// there: with the default re-upload policy (--allow-overwrite=false)
+	// any second AddFile to the same (index, normalizedName, present)
+	// tuple would 409, which would surface as a spurious upload
+	// failure on every package release after the first. ListTags is
+	// cheap (the index repo is one tag per package, and it's the
+	// same call /simple/ already makes on the read side), so we
+	// trade an extra round-trip per upload for a clean immutable
+	// AddFile contract.
+	if err := h.ensureIndexSentinel(ctx, normalizedName); err != nil {
+		logger.DebugContext(ctx, "failed to ensure index sentinel", "error", err)
+		var maxBytesErr *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBytesErr):
+			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
+		case oci.HasCode(err, http.StatusUnauthorized):
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+		case oci.HasCode(err, http.StatusForbidden):
+			http.Error(w, err.Error(), http.StatusForbidden)
+		default:
+			handler.WriteError(ctx, w, http.StatusInternalServerError, err, "internal error")
+		}
 		return
 	}
 
@@ -388,6 +398,38 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 
 	h.indexCache.invalidate(normalizedName)
 	w.WriteHeader(http.StatusCreated)
+}
+
+// ensureIndexSentinel writes the index/<normalizedName> sentinel only
+// when no tag exists for that package yet. Idempotent: a second
+// upload of any version of the same package skips the write entirely
+// rather than colliding with the immutable-add contract that AddFile
+// now enforces by default.
+//
+// errdef.ErrNotFound from ListTags is treated as "no packages yet"
+// (zot returns it for empty repositories), matching how
+// handleSimpleIndex already absorbs the same shape.
+func (h *Handler) ensureIndexSentinel(ctx context.Context, normalizedName string) error {
+	tags, err := h.registry.ListTags(ctx, "index")
+	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		return fmt.Errorf("list index tags: %w", err)
+	}
+	for _, t := range tags {
+		if t == normalizedName {
+			return nil
+		}
+	}
+	sentinelRF := &oci.RepoFile{
+		OwningRepo: "index",
+		OwningTag:  normalizedName,
+		Name:       indexSentinelName,
+		MediaType:  "text/plain",
+		Size:       int64(len(indexSentinelContent)),
+	}
+	if _, err := h.registry.AddFile(ctx, sentinelRF, strings.NewReader(indexSentinelContent)); err != nil {
+		return fmt.Errorf("add index sentinel: %w", err)
+	}
+	return nil
 }
 
 // errFieldTooLarge is returned by readTextPart when a non-file form
@@ -440,12 +482,14 @@ func (h *Handler) streamAddFile(ctx context.Context, w http.ResponseWriter, f *o
 		switch {
 		case errors.As(err, &maxBytesErr):
 			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
+		case errors.Is(err, oci.ErrAlreadyExists):
+			http.Error(w, "file already exists in version", http.StatusConflict)
 		case oci.HasCode(err, http.StatusUnauthorized):
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 		case oci.HasCode(err, http.StatusForbidden):
 			http.Error(w, err.Error(), http.StatusForbidden)
 		default:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handler.WriteError(ctx, w, http.StatusInternalServerError, err, "internal error")
 		}
 		return false
 	}
@@ -501,7 +545,7 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 			return
 		}
 		h.indexCache.put(pkg, files)
@@ -587,7 +631,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.Rep
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 	defer r.Close()
@@ -601,8 +645,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	}
 
 	if _, err := io.Copy(w, r); err != nil {
-		logger.DebugContext(req.Context(), "failed to write response", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 }

@@ -1505,3 +1505,114 @@ func (dummyByteReader) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// TestHandleFilePut_ReuploadConflict locks the wire-level shape of the
+// re-upload contract: the second upload of the same wheel under the
+// same version returns 409 Conflict by default, and flipping
+// AllowOverwrite on the registry promotes it back to 201.
+func TestHandleFilePut_ReuploadConflict(t *testing.T) {
+	t.Parallel()
+
+	build := func(content string) (*bytes.Buffer, string) {
+		var b bytes.Buffer
+		mw := multipart.NewWriter(&b)
+		_ = mw.WriteField("name", "example-pkg")
+		_ = mw.WriteField("version", "1.0.0")
+		fw, _ := mw.CreateFormFile("content", "example_pkg-1.0.0.whl")
+		_, _ = fw.Write([]byte(content))
+		_ = mw.Close()
+		return &b, mw.FormDataContentType()
+	}
+
+	send := func(t *testing.T, h http.Handler, body *bytes.Buffer, ctype string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req.Header.Set("Content-Type", ctype)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	tests := []struct {
+		name           string
+		allowOverwrite bool
+		wantSecond     int
+	}{
+		{name: "default rejects re-upload", allowOverwrite: false, wantSecond: http.StatusConflict},
+		{name: "allow-overwrite returns 201", allowOverwrite: true, wantSecond: http.StatusCreated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			reg.AllowOverwrite = tc.allowOverwrite
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+
+			body, ctype := build("first upload")
+			if rec := send(t, h.Mux(), body, ctype); rec.Code != http.StatusCreated {
+				t.Fatalf("first upload status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+
+			body, ctype = build("second upload")
+			rec := send(t, h.Mux(), body, ctype)
+			if got, want := rec.Code, tc.wantSecond; got != want {
+				t.Fatalf("second upload status=%d, want %d (body=%s)", got, want, rec.Body.String())
+			}
+			if rec.Code == http.StatusConflict {
+				// Public 409 message is not the wrapped internal one
+				// (which would carry the OCI repo / tag / name path).
+				if got := rec.Body.String(); !strings.Contains(got, "file already exists") {
+					t.Errorf("409 body = %q, want contains %q", got, "file already exists")
+				}
+			}
+		})
+	}
+}
+
+// TestHandleFilePut_ReuploadOfDifferentVersionSucceeds proves the
+// 409 default scopes by version: a second upload of the same package
+// under a new version is the normal release flow and must succeed.
+// The index sentinel must remain a single tag under index/<pkg>.
+func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
+	t.Parallel()
+
+	build := func(version string) (*bytes.Buffer, string) {
+		var b bytes.Buffer
+		mw := multipart.NewWriter(&b)
+		_ = mw.WriteField("name", "example-pkg")
+		_ = mw.WriteField("version", version)
+		fw, _ := mw.CreateFormFile("content", "example_pkg-"+version+".whl")
+		_, _ = fw.Write([]byte("content for " + version))
+		_ = mw.Close()
+		return &b, mw.FormDataContentType()
+	}
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	for _, version := range []string{"1.0.0", "1.0.1", "2.0.0"} {
+		body, ctype := build(version)
+		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req.Header.Set("Content-Type", ctype)
+		rec := httptest.NewRecorder()
+		h.Mux().ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("upload %s status=%d, want 201 (body=%s)", version, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Exactly one sentinel under the index repo, regardless of how
+	// many versions were uploaded.
+	indexTags := reg.Tags["index"]
+	if got, want := len(indexTags), 1; got != want {
+		t.Errorf("index tags = %v, want exactly one entry for the package", indexTags)
+	}
+}

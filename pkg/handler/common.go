@@ -25,6 +25,25 @@ type Registry interface {
 	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
 }
 
+// WriteError logs internal at ERROR (so operators see the backend
+// detail in the server logs) and writes public to the client with the
+// given status code. Use this for 5xx responses where the underlying
+// error often carries backend hostnames, paths, or auth-translation
+// noise that clients have no business seeing — leaking them via
+// http.Error(w, err.Error(), 500) is a small but real
+// deployment-topology disclosure.
+//
+// 4xx branches that already construct their own public message
+// (NotFound, Unauthorized, Forbidden, BadRequest from validation)
+// keep using http.Error directly; their messages are not leaky.
+func WriteError(ctx context.Context, w http.ResponseWriter, code int, internal error, public string) {
+	logging.FromContext(ctx).ErrorContext(ctx, "handler error",
+		"code", code,
+		"error", internal,
+	)
+	http.Error(w, public, code)
+}
+
 type Middleware func(next http.Handler) http.Handler
 
 // Server is a wrapper around serving.Server that allows for adding middlewares.

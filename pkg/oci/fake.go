@@ -31,6 +31,14 @@ type FakeRegistry struct {
 	Files   map[string][]byte
 	Tags    map[string][]string
 	Aliases map[string]string
+
+	// AllowOverwrite mirrors WithAllowOverwrite on the real Registry.
+	// When false (the default), AddFile returns ErrAlreadyExists for a
+	// re-upload of an existing (OwningRepo, OwningTag, Name); when
+	// true the existing entry is replaced. Tests that exercise the
+	// 409-on-re-upload branch leave it false; tests for overwrite
+	// flip it on per-test.
+	AllowOverwrite bool
 }
 
 func NewFakeRegistry() *FakeRegistry {
@@ -61,12 +69,19 @@ func (r *FakeRegistry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (
 		return nil, fmt.Errorf("%w: tag %q in repo %q is an alias", ErrAliasCollision, f.OwningTag, f.OwningRepo)
 	}
 
+	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
+	if _, exists := r.Files[key]; exists && !r.AllowOverwrite {
+		// Match the real Registry's pre-upload rejection: the body
+		// is not consumed, so handler tests that simulate a twine
+		// retry can re-use the same reader.
+		return nil, fmt.Errorf("%w: %s", ErrAlreadyExists, key)
+	}
+
 	content, err := io.ReadAll(ro)
 	if err != nil {
 		return nil, err
 	}
 
-	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
 	r.Files[key] = content
 	r.AddTag(f.OwningRepo, f.OwningTag)
 

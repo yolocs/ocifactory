@@ -174,6 +174,7 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: flagRepoType, flagName: flagRepoType, shorthand: "t"},
 		{name: flagBackendRegistry, flagName: flagBackendRegistry},
 		{name: flagDisableStreamingPush, flagName: flagDisableStreamingPush},
+		{name: flagAllowOverwrite, flagName: flagAllowOverwrite},
 		{name: flagDisableAuthn, flagName: flagDisableAuthn},
 		{name: flagAuthnKind, flagName: flagAuthnKind},
 		{name: flagAuthnOIDCIssuers, flagName: flagAuthnOIDCIssuers},

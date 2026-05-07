@@ -203,8 +203,11 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
 		code := httpStatus(err)
 		if code == 0 {
-			code = http.StatusInternalServerError
+			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+			return
 		}
+		// Checksum-validation errors carry deliberately framed
+		// public messages (4xx); pass them through.
 		http.Error(w, err.Error(), code)
 		return
 	}
@@ -212,6 +215,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	desc, err := h.registry.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
+		if errors.Is(err, oci.ErrAlreadyExists) {
+			http.Error(w, "file already exists in version", http.StatusConflict)
+			return
+		}
 		if oci.HasCode(err, http.StatusUnauthorized) {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
@@ -220,7 +227,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 	logger.DebugContext(req.Context(), "added file", "descriptor", desc)
@@ -292,7 +299,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.Rep
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 	defer r.Close()
@@ -306,8 +313,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	}
 
 	if _, err := io.Copy(w, r); err != nil {
-		logger.DebugContext(req.Context(), "failed to write response", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 }
