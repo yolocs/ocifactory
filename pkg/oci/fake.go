@@ -150,10 +150,12 @@ func (r *FakeRegistry) ListTags(ctx context.Context, repo string) ([]string, err
 
 // ListFiles enumerates files keyed under the repo, ignoring alias tags
 // (alias resolution would double-count files that already appear under
-// their canonical version).
+// their canonical version). Digest is computed from the stored content
+// to mirror the real Registry's behaviour, where the digest comes from
+// the file manifest's FileDigestAnnotation.
 func (r *FakeRegistry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
 	var filesList []*RepoFile
-	for key := range r.Files {
+	for key, content := range r.Files {
 		parts := strings.Split(key, "/")
 		if len(parts) < 3 {
 			continue
@@ -162,7 +164,12 @@ func (r *FakeRegistry) ListFiles(ctx context.Context, repo string) ([]*RepoFile,
 		if rp != repo {
 			continue
 		}
-		filesList = append(filesList, &RepoFile{Name: fn, OwningRepo: rp, OwningTag: tag})
+		filesList = append(filesList, &RepoFile{
+			Name:       fn,
+			OwningRepo: rp,
+			OwningTag:  tag,
+			Digest:     fmt.Sprintf("sha256:%x", sha256.Sum256(content)),
+		})
 	}
 	return filesList, nil
 }

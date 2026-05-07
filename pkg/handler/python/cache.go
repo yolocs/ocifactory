@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
-	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // DefaultSimpleIndexCacheTTL is the default time entries live in the
@@ -23,10 +22,21 @@ const DefaultSimpleIndexCacheTTL = 60 * time.Second
 // proxy, revisit.
 const simpleIndexCacheSize = 4096
 
-// simpleIndexCache memoises the per-package file list returned by
-// Registry.ListFiles. handlePackageIndex turns each entry into a
-// pip-friendly link at render time, so caching the slice — not the
-// rendered HTML — avoids tying entries to a specific request scheme/host.
+// cachedFile is the per-file payload we memoise from a single
+// ListFiles. The render path turns each entry into an indexFile
+// (HTML or JSON) by attaching a request-specific URL — caching this
+// slice (instead of rendered output) avoids tying entries to a
+// particular request scheme/host and covers both HTML and JSON
+// renderings off a single cache miss.
+type cachedFile struct {
+	Filename  string
+	OwningTag string
+	Sha256    string
+}
+
+// simpleIndexCache memoises the per-package simple-index payload. The
+// renderer pivots between HTML and JSON off the cached []cachedFile
+// without needing to re-fetch the OCI backend.
 //
 // Backed by hashicorp/golang-lru's expirable LRU, which gives us TTL
 // expiry plus a bounded entry count for free. A ttl of zero or negative
@@ -34,7 +44,7 @@ const simpleIndexCacheSize = 4096
 // no-op. The handler still calls invalidate unconditionally so adopting
 // the cache is purely additive at the call sites.
 type simpleIndexCache struct {
-	lru *expirable.LRU[string, []*oci.RepoFile]
+	lru *expirable.LRU[string, []cachedFile]
 }
 
 func newSimpleIndexCache(ttl time.Duration) *simpleIndexCache {
@@ -42,18 +52,18 @@ func newSimpleIndexCache(ttl time.Duration) *simpleIndexCache {
 		return &simpleIndexCache{}
 	}
 	return &simpleIndexCache{
-		lru: expirable.NewLRU[string, []*oci.RepoFile](simpleIndexCacheSize, nil, ttl),
+		lru: expirable.NewLRU[string, []cachedFile](simpleIndexCacheSize, nil, ttl),
 	}
 }
 
-func (c *simpleIndexCache) get(pkg string) ([]*oci.RepoFile, bool) {
+func (c *simpleIndexCache) get(pkg string) ([]cachedFile, bool) {
 	if c.lru == nil {
 		return nil, false
 	}
 	return c.lru.Get(pkg)
 }
 
-func (c *simpleIndexCache) put(pkg string, files []*oci.RepoFile) {
+func (c *simpleIndexCache) put(pkg string, files []cachedFile) {
 	if c.lru == nil {
 		return
 	}

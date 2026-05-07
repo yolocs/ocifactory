@@ -2,13 +2,14 @@
 <html>
 
 <head>
+  <meta name="pypi:repository-version" content="1.0">
   <title> Links for {{.Title}} </title>
 </head>
 
 <body>
   <h1> Links for {{.Title}} </h1>
   {{range $file := .Files}}
-  <a href="{{ $file.FileURL }}">{{$file.FileName}}</a><br />
+  <a href="{{$file.URL}}">{{$file.Filename}}</a><br />
   {{end}}
 </body>
 

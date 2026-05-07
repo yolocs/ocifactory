@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // TestSimpleIndexCache exercises the wrapper's contract: get, put, and
@@ -18,10 +17,10 @@ import (
 func TestSimpleIndexCache(t *testing.T) {
 	t.Parallel()
 
-	files := func(names ...string) []*oci.RepoFile {
-		out := make([]*oci.RepoFile, len(names))
+	files := func(names ...string) []cachedFile {
+		out := make([]cachedFile, len(names))
 		for i, n := range names {
-			out[i] = &oci.RepoFile{Name: n, OwningRepo: "packages/example", OwningTag: "1.0.0"}
+			out[i] = cachedFile{Filename: n, OwningTag: "1.0.0"}
 		}
 		return out
 	}
@@ -29,11 +28,11 @@ func TestSimpleIndexCache(t *testing.T) {
 	type cacheOp struct {
 		op    string // "put", "get", "invalidate", "sleep"
 		pkg   string
-		files []*oci.RepoFile
+		files []cachedFile
 		sleep time.Duration
 		// Only meaningful for "get" steps.
 		wantOK    bool
-		wantFiles []*oci.RepoFile
+		wantFiles []cachedFile
 	}
 
 	cases := []struct {
@@ -129,7 +128,7 @@ func TestSimpleIndexCache_Concurrent(t *testing.T) {
 				pkg := "pkg" + string(rune('a'+(j%4)))
 				switch j % 3 {
 				case 0:
-					c.put(pkg, []*oci.RepoFile{{Name: "f", OwningRepo: "packages/" + pkg, OwningTag: "1"}})
+					c.put(pkg, []cachedFile{{Filename: "f", OwningTag: "1"}})
 				case 1:
 					c.invalidate(pkg)
 				case 2:

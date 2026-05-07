@@ -1,6 +1,8 @@
 package oci
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"io"
 	"slices"
 	"sort"
@@ -12,6 +14,14 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/errdef"
 )
+
+// digestOf is a small helper for ListFiles tests: returns the
+// "sha256:<hex>" string the fake reports for a file with the given
+// content. Mirrors how the real Registry surfaces the digest via the
+// FileDigestAnnotation.
+func digestOf(content string) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(content)))
+}
 
 func TestNewFakeRegistry(t *testing.T) {
 	t.Parallel()
@@ -347,9 +357,9 @@ func TestFakeRegistry_ListFiles(t *testing.T) {
 				"other/repo/v1.0.0/file4.txt":   []byte("content4"),
 			},
 			want: []*RepoFile{
-				{Name: "file1.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0"},
-				{Name: "file2.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0"},
-				{Name: "file3.txt", OwningRepo: "example/repo", OwningTag: "v2.0.0"},
+				{Name: "file1.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0", Digest: digestOf("content1")},
+				{Name: "file2.txt", OwningRepo: "example/repo", OwningTag: "v1.0.0", Digest: digestOf("content2")},
+				{Name: "file3.txt", OwningRepo: "example/repo", OwningTag: "v2.0.0", Digest: digestOf("content3")},
 			},
 			wantErr: false,
 		},
