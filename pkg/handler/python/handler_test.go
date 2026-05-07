@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -839,19 +840,29 @@ func registryFileKeys(reg *oci.FakeRegistry) []string {
 	return keys
 }
 
-// TestMultipartFieldOrder verifies the upload path no longer depends on
-// twine's name → version → content ordering. Sending content first must
-// succeed.
+// TestMultipartFieldOrder pins down the ordering contract of the
+// streaming upload path: metadata fields must precede the content
+// part. Twine, flit, hatchling, and poetry all send fields first; the
+// streaming walker can't construct the OCI repo path without name and
+// version, so a content-first request gets a 400.
 func TestMultipartFieldOrder(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name  string
-		write func(t *testing.T, mw *multipart.Writer)
+		name       string
+		write      func(t *testing.T, mw *multipart.Writer)
+		wantStatus int
+		wantStored bool
 	}{
 		{
-			name: "content before name and version",
+			name: "fields before content succeeds",
 			write: func(t *testing.T, mw *multipart.Writer) {
+				if err := mw.WriteField("version", "1.0.0"); err != nil {
+					t.Fatalf("write version: %v", err)
+				}
+				if err := mw.WriteField("name", "example-pkg"); err != nil {
+					t.Fatalf("write name: %v", err)
+				}
 				fw, err := mw.CreateFormFile("content", "example-pkg-1.0.0.whl")
 				if err != nil {
 					t.Fatalf("create form file: %v", err)
@@ -859,23 +870,13 @@ func TestMultipartFieldOrder(t *testing.T) {
 				if _, err := fw.Write([]byte("payload")); err != nil {
 					t.Fatalf("write content: %v", err)
 				}
-				if err := mw.WriteField("name", "example-pkg"); err != nil {
-					t.Fatalf("write name: %v", err)
-				}
-				if err := mw.WriteField("version", "1.0.0"); err != nil {
-					t.Fatalf("write version: %v", err)
-				}
 			},
+			wantStatus: http.StatusCreated,
+			wantStored: true,
 		},
 		{
-			name: "version before name before content",
+			name: "content before fields rejected",
 			write: func(t *testing.T, mw *multipart.Writer) {
-				if err := mw.WriteField("version", "1.0.0"); err != nil {
-					t.Fatalf("write version: %v", err)
-				}
-				if err := mw.WriteField("name", "example-pkg"); err != nil {
-					t.Fatalf("write name: %v", err)
-				}
 				fw, err := mw.CreateFormFile("content", "example-pkg-1.0.0.whl")
 				if err != nil {
 					t.Fatalf("create form file: %v", err)
@@ -883,7 +884,15 @@ func TestMultipartFieldOrder(t *testing.T) {
 				if _, err := fw.Write([]byte("payload")); err != nil {
 					t.Fatalf("write content: %v", err)
 				}
+				if err := mw.WriteField("name", "example-pkg"); err != nil {
+					t.Fatalf("write name: %v", err)
+				}
+				if err := mw.WriteField("version", "1.0.0"); err != nil {
+					t.Fatalf("write version: %v", err)
+				}
 			},
+			wantStatus: http.StatusBadRequest,
+			wantStored: false,
 		},
 	}
 
@@ -909,11 +918,12 @@ func TestMultipartFieldOrder(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
 
-			if got, want := rec.Code, http.StatusCreated; got != want {
+			if got, want := rec.Code, tc.wantStatus; got != want {
 				t.Errorf("status = %d, want %d (body=%s)", got, want, rec.Body.String())
 			}
-			if _, ok := reg.Files["packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]; !ok {
-				t.Errorf("file not stored under expected key: %v", registryFileKeys(reg))
+			_, stored := reg.Files["packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]
+			if stored != tc.wantStored {
+				t.Errorf("stored = %t, want %t (keys=%v)", stored, tc.wantStored, registryFileKeys(reg))
 			}
 		})
 	}
@@ -1441,4 +1451,170 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 			t.Errorf("path=%q Content-Type=%q, want text/html prefix", path, got)
 		}
 	}
+}
+
+// TestHandleFilePut_OversizedTextField confirms the per-field byte cap
+// rejects an oversized non-file form part with 413 rather than letting
+// it sit in the walker's working memory until the file part arrives.
+func TestHandleFilePut_OversizedTextField(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	if err := mw.WriteField("name", strings.Repeat("a", maxTextFieldBytes+1)); err != nil {
+		t.Fatalf("write name: %v", err)
+	}
+	if err := mw.WriteField("version", "1.0.0"); err != nil {
+		t.Fatalf("write version: %v", err)
+	}
+	fw, _ := mw.CreateFormFile("content", "x-1.0.0.tar.gz")
+	_, _ = fw.Write([]byte("payload"))
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status=%d, want 413 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleFilePut_TotalTextFieldsTooLarge confirms that piling up
+// many sub-cap text parts past the cumulative cap is rejected, so a
+// client can't pre-stage hundreds of KB of fields ahead of the file
+// part to chew through walker memory.
+func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	// Each field is below the per-field cap, but their sum exceeds
+	// maxTotalTextFieldBytes.
+	chunk := strings.Repeat("x", maxTextFieldBytes/2)
+	count := (maxTotalTextFieldBytes / len(chunk)) + 4
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	for i := 0; i < count; i++ {
+		_ = mw.WriteField(fmt.Sprintf("filler-%d", i), chunk)
+	}
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status=%d, want 413 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleFilePut_TrailingPartsDrained verifies the streaming walker
+// keeps reading after the file part — trailing text parts (e.g. a
+// signature appendix some uploaders emit) don't break the upload.
+func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	_ = mw.WriteField("name", "example")
+	_ = mw.WriteField("version", "1.0.0")
+	fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
+	_, _ = fw.Write([]byte("payload"))
+	// Trailing fields after content — accepted but discarded.
+	_ = mw.WriteField("comment", "uploaded by twine")
+	_ = mw.WriteField("md5_digest", "deadbeef")
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if _, ok := reg.Files["packages/example/1.0.0/example-1.0.0.tar.gz"]; !ok {
+		t.Errorf("file missing: %v", registryFileKeys(reg))
+	}
+}
+
+// TestHandleFilePut_NoTmpSpill confirms that an upload large enough to
+// have spilled past ParseMultipartForm's old 32 MiB threshold leaves
+// the temp directory empty when handled by the streaming walker. The
+// test points TMPDIR at a per-test directory and checks it is empty
+// after the request completes.
+//
+// Sequential because t.Setenv mutates process-global state.
+func TestHandleFilePut_NoTmpSpill(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	reg := oci.NewFakeRegistry()
+	h, err := NewHandler(reg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	// 40 MiB body: comfortably past the old 32 MiB ParseMultipartForm
+	// in-memory threshold so the legacy path would have spilled.
+	const payloadSize = 40 << 20
+
+	var b bytes.Buffer
+	mw := multipart.NewWriter(&b)
+	_ = mw.WriteField("name", "example")
+	_ = mw.WriteField("version", "1.0.0")
+	fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
+	if _, err := io.CopyN(fw, dummyByteReader{}, payloadSize); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	_ = mw.Close()
+
+	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("read tmp: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("TMPDIR not empty after upload: %v", names)
+	}
+}
+
+// dummyByteReader returns deterministic bytes without holding the full
+// payload in memory ahead of time. Used by TestHandleFilePut_NoTmpSpill
+// so the test itself doesn't allocate a 64 MiB buffer.
+type dummyByteReader struct{}
+
+func (dummyByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(i)
+	}
+	return len(p), nil
 }

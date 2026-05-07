@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -31,18 +32,23 @@ const (
 	maxPackageLength = 256
 	maxVersionLength = 128
 
-	// maxMultipartMemory is the in-memory threshold for ParseMultipartForm.
-	// Files larger than this spill to a temp file (auto-cleaned via
-	// MultipartForm.RemoveAll), so streaming is preserved for large
-	// wheels while small uploads stay in memory.
-	maxMultipartMemory = 32 << 20
+	// maxTextFieldBytes caps the size of any single non-file form
+	// part the streaming multipart walker will accept (name, version,
+	// :action, sha256_digest, comment, etc.). Every legitimate twine
+	// field is well under 1 KiB; 8 KiB is a generous safety margin.
+	maxTextFieldBytes = 8 << 10
+
+	// maxTotalTextFieldBytes caps the cumulative size of every text
+	// part across an upload, defending against a request that piles
+	// up many sub-cap fields to exhaust the walker's working memory.
+	maxTotalTextFieldBytes = 64 << 10
 
 	// defaultMaxUploadBytes caps the total request-body size accepted
-	// by handleFilePut. ParseMultipartForm's disk-spill is unbounded
-	// without this — an authenticated attacker could fill the temp
-	// disk with a single oversized request. 1 GiB comfortably exceeds
-	// every wheel and sdist on PyPI today; operators can tighten it
-	// via WithMaxUploadBytes.
+	// by handleFilePut. The streaming multipart walker never spills
+	// to disk, so this is purely a denial-of-service safeguard against
+	// a single oversized request streaming forever; 1 GiB comfortably
+	// exceeds every wheel and sdist on PyPI today and operators can
+	// tighten it via WithMaxUploadBytes.
 	defaultMaxUploadBytes = 1 << 30
 
 	// metadataResolveConcurrency bounds the number of concurrent
@@ -89,11 +95,6 @@ var (
 	//go:embed simple.html
 	fs embed.FS
 )
-
-type repoFile struct {
-	oci.RepoFile
-	Content io.ReadCloser
-}
 
 type Handler struct {
 	registry       handler.Registry
@@ -238,50 +239,98 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 
 // handleFilePut accepts a multipart upload from twine.
 //
-// Multipart parsing is two-pass via ParseMultipartForm so name, version,
-// and content can arrive in any order — RFC 7578 doesn't require a
-// fixed order, and assuming twine's ordering was a latent bug. Files
-// larger than maxMultipartMemory spill to a temp file, so streaming is
-// preserved for large wheels.
+// Multipart parts are streamed via req.MultipartReader rather than
+// buffered with ParseMultipartForm. The walker collects text fields
+// (name, version, :action, ...) until it hits the file part; once it
+// arrives the wheel/sdist body is streamed straight into AddFile via
+// the OCI streaming push path. No bytes ever touch /tmp.
 //
-// On wheel uploads the handler also extracts `*.dist-info/METADATA`
-// from the wheel zip and stores it as a sibling file (PEP 658). Failure
-// to extract is logged but does not block the upload — the wheel still
-// publishes; clients just lose the metadata fast-path for that file.
+// The streaming design imposes one ordering requirement on clients:
+// the metadata fields must arrive before the `content` part, since the
+// walker can't construct the OCI repo path without them. Every Python
+// upload tool in the wild (twine, flit, hatchling, poetry) already
+// sends fields first; uploads that violate the order get a 400.
+//
+// On wheel uploads the handler also extracts `<distinfo>/METADATA`
+// from the wheel zip and stores it as a sibling file (PEP 658). The
+// extractor is fed by an io.TeeReader off the wheel stream — the
+// METADATA bytes land in a 1 MiB-capped RAM buffer while AddFile
+// pushes the whole wheel through unaltered. Failure to extract is
+// logged and the upload still publishes; clients just lose the
+// metadata fast-path for that file.
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
-	logger := logging.FromContext(req.Context())
+	ctx := req.Context()
+	logger := logging.FromContext(ctx)
 
-	// Cap the total request body before ParseMultipartForm spills past
-	// maxMultipartMemory into a temp file. Without this, a single
-	// authenticated upload can fill the temp disk.
 	if h.maxUploadBytes > 0 {
 		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
 	}
 
-	if err := req.ParseMultipartForm(maxMultipartMemory); err != nil {
-		var maxBytesErr *http.MaxBytesError
+	mr, err := req.MultipartReader()
+	if err != nil {
 		switch {
-		case errors.As(err, &maxBytesErr):
-			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
 		case errors.Is(err, http.ErrNotMultipart) || errors.Is(err, http.ErrMissingBoundary):
 			http.Error(w, "missing boundary in request or not a multipart request", http.StatusBadRequest)
 		default:
-			logger.DebugContext(req.Context(), "failed to parse multipart form", "error", err)
+			logger.DebugContext(ctx, "failed to open multipart reader", "error", err)
 			http.Error(w, "request body is not valid form data", http.StatusBadRequest)
 		}
 		return
 	}
-	defer func() {
-		if req.MultipartForm != nil {
-			_ = req.MultipartForm.RemoveAll()
+
+	fields := map[string]string{}
+	var totalText int
+	var contentPart *multipart.Part
+
+	// Phase 1: walk text parts until the file part appears (or the
+	// request ends without one).
+	for {
+		p, perr := mr.NextPart()
+		if errors.Is(perr, io.EOF) {
+			break
 		}
-	}()
+		if perr != nil {
+			writeMultipartReadError(w, perr, logger, ctx)
+			return
+		}
+		if p.FormName() == "content" {
+			contentPart = p
+			break
+		}
+		v, rerr := readTextPart(p, maxTextFieldBytes)
+		_ = p.Close()
+		if rerr != nil {
+			if errors.Is(rerr, errFieldTooLarge) {
+				http.Error(w, fmt.Sprintf("field %q exceeds %d-byte limit", p.FormName(), maxTextFieldBytes), http.StatusRequestEntityTooLarge)
+				return
+			}
+			writeMultipartReadError(w, rerr, logger, ctx)
+			return
+		}
+		totalText += len(v)
+		if totalText > maxTotalTextFieldBytes {
+			http.Error(w, "form fields too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		// First non-empty value wins, matching the previous
+		// firstFormValue semantics.
+		if v != "" {
+			if _, ok := fields[p.FormName()]; !ok {
+				fields[p.FormName()] = v
+			}
+		}
+	}
 
-	pkgName := firstFormValue(req.MultipartForm, "name")
-	versionNum := firstFormValue(req.MultipartForm, "version")
+	if contentPart == nil {
+		http.Error(w, "missing required fields", http.StatusBadRequest)
+		return
+	}
+	defer contentPart.Close()
 
-	contentFiles := req.MultipartForm.File["content"]
-	if pkgName == "" || versionNum == "" || len(contentFiles) == 0 {
+	pkgName := fields["name"]
+	versionNum := fields["version"]
+
+	if pkgName == "" || versionNum == "" {
 		http.Error(w, "missing required fields", http.StatusBadRequest)
 		return
 	}
@@ -298,9 +347,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	normalizedName := normalize(pkgName)
-	contentHeader := contentFiles[0]
-	contentName := contentHeader.Filename
+	contentName := contentPart.FileName()
 	if contentName == "" {
 		http.Error(w, "missing filename for content", http.StatusBadRequest)
 		return
@@ -310,86 +357,200 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	contentFile, err := contentHeader.Open()
-	if err != nil {
-		logger.ErrorContext(req.Context(), "failed to open uploaded content", "error", err)
-		http.Error(w, "failed to read content", http.StatusInternalServerError)
+	normalizedName := normalize(pkgName)
+
+	// For wheels, tee the part body through the streaming METADATA
+	// extractor. AddFile drives the read; the walker runs in a
+	// goroutine and signals completion once the pipe drains.
+	var (
+		wheelReader io.Reader = contentPart
+		joinMeta    func() metaResult
+	)
+	if isWheelFilename(contentName) {
+		wheelReader, joinMeta = teeWheelMetadata(contentPart)
+	}
+
+	wheelRF := &oci.RepoFile{
+		OwningRepo: "packages/" + normalizedName,
+		OwningTag:  versionNum,
+		Name:       contentName,
+		MediaType:  detectMediaType(contentName),
+	}
+	if !h.streamAddFile(ctx, w, wheelRF, wheelReader) {
+		// Even on failure, drain the metadata extractor so its
+		// goroutine and pipe don't leak.
+		if joinMeta != nil {
+			_ = joinMeta()
+		}
 		return
 	}
-	// Ownership of contentFile is handed to handlePut at the bottom of
-	// this function. Any early return before that point must close it
-	// directly.
 
 	var metaBytes []byte
-	if isWheelFilename(contentName) {
-		meta, mErr := extractWheelMetadata(contentFile, contentHeader.Size)
+	if joinMeta != nil {
+		res := joinMeta()
 		switch {
-		case mErr == nil:
-			metaBytes = meta
-		case errors.Is(mErr, errMetadataNotFound):
-			// PEP 427 wheels SHOULD include METADATA but the upload
-			// is still useful without it; just don't advertise PEP
-			// 658 for this file.
-			logger.DebugContext(req.Context(), "wheel has no METADATA member", "filename", contentName)
+		case res.err == nil:
+			metaBytes = res.data
+		case errors.Is(res.err, errMetadataNotFound),
+			errors.Is(res.err, errStreamMETADATAUnreachable),
+			errors.Is(res.err, errMalformedZip):
+			// Best-effort: the wheel doesn't carry retrievable
+			// METADATA via the streaming walker (no member, an
+			// unsupported zip feature, or just not a real zip
+			// behind a .whl name). The upload still succeeds;
+			// clients lose the PEP 658 fast-path for this file.
+			logger.DebugContext(ctx, "wheel METADATA not extracted",
+				"reason", res.err, "filename", contentName)
+		case errors.Is(res.err, errWheelTooManyEntries):
+			logger.WarnContext(ctx, "wheel exceeds entry cap; skipping METADATA", "filename", contentName)
 		default:
-			logger.WarnContext(req.Context(), "failed to extract wheel METADATA", "error", mErr, "filename", contentName)
+			logger.WarnContext(ctx, "failed to extract wheel METADATA", "error", res.err, "filename", contentName)
 		}
-		// Rewind regardless: subsequent AddFile must stream from the
-		// start of the wheel.
-		if _, err := contentFile.Seek(0, io.SeekStart); err != nil {
-			contentFile.Close()
-			logger.ErrorContext(req.Context(), "failed to rewind wheel content", "error", err)
-			http.Error(w, "failed to read content", http.StatusInternalServerError)
+	}
+
+	if metaBytes != nil {
+		metaName := metadataCompanionName(contentName)
+		metaRF := &oci.RepoFile{
+			OwningRepo: "packages/" + normalizedName,
+			OwningTag:  versionNum,
+			Name:       metaName,
+			MediaType:  detectMediaType(metaName),
+			Size:       int64(len(metaBytes)),
+		}
+		if !h.streamAddFile(ctx, w, metaRF, bytes.NewReader(metaBytes)) {
 			return
 		}
 	}
 
-	uploads := []*repoFile{
-		{
-			RepoFile: oci.RepoFile{
-				OwningRepo: "packages/" + normalizedName,
-				OwningTag:  versionNum,
-				Name:       contentName,
-				MediaType:  detectMediaType(contentName),
-				Size:       contentHeader.Size,
-			},
-			Content: contentFile,
-		},
-	}
-	if metaBytes != nil {
-		uploads = append(uploads, &repoFile{
-			RepoFile: oci.RepoFile{
-				OwningRepo: "packages/" + normalizedName,
-				OwningTag:  versionNum,
-				Name:       metadataCompanionName(contentName),
-				MediaType:  detectMediaType(metadataCompanionName(contentName)),
-				Size:       int64(len(metaBytes)),
-			},
-			Content: io.NopCloser(bytes.NewReader(metaBytes)),
-		})
-	}
 	// The index repo write is a single sentinel per package, not per
-	// version. handleSimpleIndex only reads tag names from "index" via
-	// ListTags, so storing one constant placeholder layer under
+	// version. handleSimpleIndex only reads tag names from "index"
+	// via ListTags, so storing one constant placeholder layer under
 	// index/<normalizedName> is enough — the OCI backend deduplicates
 	// the identical blob and file manifest across every subsequent
 	// upload of the same package.
-	uploads = append(uploads, &repoFile{
-		RepoFile: oci.RepoFile{
-			OwningRepo: "index",
-			OwningTag:  normalizedName,
-			Name:       indexSentinelName,
-			MediaType:  "text/plain",
-		},
-		Content: io.NopCloser(strings.NewReader(indexSentinelContent)),
-	})
-
-	if h.handlePut(req.Context(), w, uploads) {
-		// A successful publish changes what /simple/<pkg>/ should
-		// render; drop the cached file list so the next render
-		// fetches fresh from the backend.
-		h.indexCache.invalidate(normalizedName)
+	sentinelRF := &oci.RepoFile{
+		OwningRepo: "index",
+		OwningTag:  normalizedName,
+		Name:       indexSentinelName,
+		MediaType:  "text/plain",
+		Size:       int64(len(indexSentinelContent)),
 	}
+	if !h.streamAddFile(ctx, w, sentinelRF, strings.NewReader(indexSentinelContent)) {
+		return
+	}
+
+	// Drain any trailing parts the client may have sent after the
+	// file. None of the standard uploaders do today, but RFC 7578
+	// doesn't forbid it; discarding them keeps connection reuse
+	// healthy without affecting the upload outcome.
+	for {
+		p, perr := mr.NextPart()
+		if errors.Is(perr, io.EOF) {
+			break
+		}
+		if perr != nil {
+			logger.DebugContext(ctx, "failed to drain trailing multipart part", "error", perr)
+			break
+		}
+		_, _ = io.Copy(io.Discard, p)
+		_ = p.Close()
+	}
+
+	h.indexCache.invalidate(normalizedName)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// errFieldTooLarge is returned by readTextPart when a non-file form
+// part exceeds maxTextFieldBytes.
+var errFieldTooLarge = errors.New("form field too large")
+
+// readTextPart consumes a non-file form part into a string, capping at
+// limit bytes. Anything over the cap is rejected with errFieldTooLarge
+// so a malicious client can't pile a multi-megabyte text field into
+// the walker's working memory before the file part arrives.
+func readTextPart(p *multipart.Part, limit int) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(p, int64(limit)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > limit {
+		return "", errFieldTooLarge
+	}
+	return string(data), nil
+}
+
+// writeMultipartReadError translates an error from a multipart NextPart
+// or readTextPart call into the matching HTTP response.
+func writeMultipartReadError(w http.ResponseWriter, err error, logger *slog.Logger, ctx context.Context) {
+	var maxBytesErr *http.MaxBytesError
+	switch {
+	case errors.As(err, &maxBytesErr):
+		http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
+	default:
+		logger.DebugContext(ctx, "failed to read multipart part", "error", err)
+		http.Error(w, "request body is not valid form data", http.StatusBadRequest)
+	}
+}
+
+// metaResult is the outcome of a streaming METADATA extraction tee.
+type metaResult struct {
+	data []byte
+	err  error
+}
+
+// teeWheelMetadata returns an io.Reader that mirrors the wheel body to
+// a streaming METADATA extractor, plus a join function the caller
+// invokes after the upload to retrieve the result. The extractor runs
+// in a goroutine and drains the pipe through to EOF so the upload
+// writer side never blocks on backpressure even if the walker stopped
+// early on success or hit an unrecoverable error mid-stream.
+func teeWheelMetadata(src io.Reader) (io.Reader, func() metaResult) {
+	pr, pw := io.Pipe()
+	resCh := make(chan metaResult, 1)
+	go func() {
+		data, err := extractWheelMetadataStream(pr)
+		// Drain whatever remains so the writer side (TeeReader →
+		// pipe writer driven by AddFile) never blocks. EOF on the
+		// pipe arrives once the caller's join closes pw.
+		_, _ = io.Copy(io.Discard, pr)
+		resCh <- metaResult{data: data, err: err}
+	}()
+	teed := io.TeeReader(src, pw)
+	return teed, func() metaResult {
+		_ = pw.Close()
+		return <-resCh
+	}
+}
+
+// streamAddFile wraps registry.AddFile with the standard error → HTTP
+// translation used by the upload path. It returns true on success and
+// writes the appropriate error response (and returns false) on
+// failure. Callers are expected to short-circuit subsequent steps on
+// false return.
+//
+// MaxBytesError is detected inline so a request body that overflows
+// h.maxUploadBytes mid-stream (e.g. while AddFile is reading the wheel
+// body) returns 413 instead of a generic 500.
+func (h *Handler) streamAddFile(ctx context.Context, w http.ResponseWriter, f *oci.RepoFile, content io.Reader) bool {
+	logger := logging.FromContext(ctx)
+	desc, err := h.registry.AddFile(ctx, f, content)
+	if err != nil {
+		logger.DebugContext(ctx, "failed to add file", "error", err)
+		var maxBytesErr *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBytesErr):
+			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
+		case oci.HasCode(err, http.StatusUnauthorized):
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+		case oci.HasCode(err, http.StatusForbidden):
+			http.Error(w, err.Error(), http.StatusForbidden)
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return false
+	}
+	logger.DebugContext(ctx, "added file", "descriptor", desc)
+	return true
 }
 
 func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
@@ -572,52 +733,6 @@ func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {
 	return u.String()
 }
 
-// handlePut writes every file in fs to the registry. It is also
-// responsible for the HTTP response: on success it writes 201 Created and
-// returns true; on the first failure it writes the appropriate error
-// status and returns false. The boolean return lets handleFilePut perform
-// post-write side effects (e.g. cache invalidation) only when the upload
-// actually succeeded.
-//
-// handlePut closes each entry's Content as soon as its AddFile completes
-// rather than deferring to function return; for a 3-entry batch
-// (wheel + .metadata + index sentinel) the eager close keeps the
-// multipart temp file open for one upload at a time instead of all three.
-func (h *Handler) handlePut(ctx context.Context, w http.ResponseWriter, fs []*repoFile) bool {
-	logger := logging.FromContext(ctx)
-
-	// On any early-return path that hasn't reached the eager-close yet
-	// we still need to release the remaining Content readers.
-	cleanupFrom := 0
-	defer func() {
-		for i := cleanupFrom; i < len(fs); i++ {
-			_ = fs[i].Content.Close()
-		}
-	}()
-
-	for i, f := range fs {
-		desc, err := h.registry.AddFile(ctx, &f.RepoFile, f.Content)
-		_ = f.Content.Close()
-		cleanupFrom = i + 1
-		if err != nil {
-			logger.DebugContext(ctx, "failed to add file", "error", err)
-			if oci.HasCode(err, http.StatusUnauthorized) {
-				http.Error(w, err.Error(), http.StatusUnauthorized)
-				return false
-			}
-			if oci.HasCode(err, http.StatusForbidden) {
-				http.Error(w, err.Error(), http.StatusForbidden)
-				return false
-			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return false
-		}
-		logger.DebugContext(ctx, "added file", "descriptor", desc)
-	}
-	w.WriteHeader(http.StatusCreated)
-	return true
-}
-
 func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
@@ -662,20 +777,4 @@ func detectMediaType(filename string) string {
 		return mt
 	}
 	return "application/octet-stream"
-}
-
-// firstFormValue returns the first value for a multipart form field, or
-// "" if the field is absent or empty. ParseMultipartForm puts every
-// occurrence into a slice; for single-valued fields we want the first
-// non-empty entry.
-func firstFormValue(form *multipart.Form, name string) string {
-	if form == nil {
-		return ""
-	}
-	for _, v := range form.Value[name] {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

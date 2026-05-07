@@ -1,89 +1,44 @@
 package python
 
 import (
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"errors"
-	"fmt"
-	"io"
 	"path"
 	"regexp"
 	"strings"
 )
 
-// errMetadataNotFound is returned by extractWheelMetadata when the zip
-// has no `*.dist-info/METADATA` member. handleFilePut treats this as
-// "no PEP 658 metadata to advertise" rather than a hard failure — the
-// upload still succeeds; clients just lose the metadata fast-path.
+// errMetadataNotFound is returned by the streaming METADATA extractor
+// when the wheel zip has no `<distinfo>/METADATA` member. The upload
+// path treats this as "no PEP 658 metadata to advertise" rather than a
+// hard failure — the upload still succeeds; clients just lose the
+// metadata fast-path.
 var errMetadataNotFound = errors.New("wheel METADATA not found")
 
-// wheelMetadataPath matches the `*.dist-info/METADATA` member inside a
+// wheelMetadataPath matches the `<distinfo>/METADATA` member inside a
 // wheel zip per the wheel binary format (PEP 427).
 var wheelMetadataPath = regexp.MustCompile(`^[^/]+\.dist-info/METADATA$`)
 
 // maxMetadataSize caps how much of a `<wheel>.metadata` companion file
-// the simple-index renderer reads when extracting Requires-Python.
-// Real-world METADATA blobs are a few KB; 1 MiB is a generous upper
-// bound that keeps a malicious or corrupted file from pinning memory.
+// the simple-index renderer reads when extracting Requires-Python and
+// how much METADATA the streaming extractor will buffer during an
+// upload. Real-world METADATA blobs are a few KB; 1 MiB is a generous
+// upper bound that keeps a malicious or corrupted file from pinning
+// memory.
 const maxMetadataSize = 1 << 20
 
-// maxWheelEntries caps how many entries we tolerate in a wheel zip
-// before refusing to scan further. Legitimate wheels carry a few
-// hundred entries at most; this cap is well clear of that and well
-// short of the 65 535 ZIP spec limit, so a malicious wheel cannot
-// force archive/zip's File slice to grow without bound. When the cap
+// maxWheelEntries caps how many local file headers the streaming
+// METADATA extractor walks before refusing to continue. Legitimate
+// wheels carry a few hundred entries at most; this cap is well clear
+// of that and well short of the 65 535 ZIP spec limit. When the cap
 // trips, the upload still succeeds — handleFilePut just doesn't
 // advertise a PEP 658 metadata companion for the file.
 const maxWheelEntries = 4096
 
-// errWheelTooManyEntries means the zip's central directory exceeds
-// maxWheelEntries. Treated as "no metadata available" by callers.
+// errWheelTooManyEntries means the zip exceeds maxWheelEntries local
+// file headers. Treated as "no metadata available" by callers.
 var errWheelTooManyEntries = errors.New("wheel has too many zip entries")
-
-// extractWheelMetadata reads a wheel zip via ReaderAt+size and returns
-// the bytes of its `*.dist-info/METADATA` entry. The wheel spec
-// guarantees at most one such file per wheel; if absent,
-// errMetadataNotFound is returned.
-//
-// Defence-in-depth: the central directory is capped at maxWheelEntries
-// to bound memory before we walk it, and a member's declared
-// uncompressed size is checked against maxMetadataSize before opening
-// it so a malformed ZIP64 header can't make the LimitReader irrelevant.
-func extractWheelMetadata(r io.ReaderAt, size int64) ([]byte, error) {
-	zr, err := zip.NewReader(r, size)
-	if err != nil {
-		return nil, fmt.Errorf("read wheel zip: %w", err)
-	}
-	if len(zr.File) > maxWheelEntries {
-		return nil, errWheelTooManyEntries
-	}
-	for _, f := range zr.File {
-		if !wheelMetadataPath.MatchString(f.Name) {
-			continue
-		}
-		if f.UncompressedSize64 > maxMetadataSize {
-			return nil, fmt.Errorf("METADATA declared size %d exceeds cap %d", f.UncompressedSize64, maxMetadataSize)
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return nil, fmt.Errorf("open METADATA: %w", err)
-		}
-		data, err := io.ReadAll(io.LimitReader(rc, maxMetadataSize+1))
-		closeErr := rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read METADATA: %w", err)
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close METADATA: %w", closeErr)
-		}
-		if int64(len(data)) > maxMetadataSize {
-			return nil, fmt.Errorf("METADATA exceeds %d bytes", maxMetadataSize)
-		}
-		return data, nil
-	}
-	return nil, errMetadataNotFound
-}
 
 // parseRequiresPython extracts the value of the `Requires-Python` header
 // from a wheel METADATA blob, returning "" if absent. METADATA is

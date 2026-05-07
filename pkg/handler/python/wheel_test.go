@@ -3,15 +3,12 @@ package python
 import (
 	"archive/zip"
 	"bytes"
-	"errors"
-	"strconv"
 	"testing"
 )
 
 // buildTestWheel writes a minimal in-memory zip archive that mimics a
 // wheel: at least one `<distinfo>/METADATA` file, optionally other
-// members. The returned bytes can be handed to extractWheelMetadata
-// via bytes.NewReader.
+// members. The returned bytes are usable as a wheel body.
 func buildTestWheel(t *testing.T, files map[string]string) []byte {
 	t.Helper()
 
@@ -30,116 +27,6 @@ func buildTestWheel(t *testing.T, files map[string]string) []byte {
 		t.Fatalf("zip close: %v", err)
 	}
 	return buf.Bytes()
-}
-
-func TestExtractWheelMetadata(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name    string
-		files   map[string]string
-		want    string
-		wantErr error
-	}{
-		{
-			name: "metadata present",
-			files: map[string]string{
-				"requests-2.0.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: requests\nRequires-Python: >=3.7\n",
-				"requests-2.0.0.dist-info/RECORD":   "ignored",
-				"requests/__init__.py":              "",
-			},
-			want: "Metadata-Version: 2.1\nName: requests\nRequires-Python: >=3.7\n",
-		},
-		{
-			name: "no dist-info METADATA",
-			files: map[string]string{
-				"requests/__init__.py": "",
-			},
-			wantErr: errMetadataNotFound,
-		},
-		{
-			name: "metadata in nested distinfo only matches top-level",
-			files: map[string]string{
-				"sub/something.dist-info/METADATA":  "wrong",
-				"requests-2.0.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: requests\n",
-			},
-			want: "Metadata-Version: 2.1\nName: requests\n",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			data := buildTestWheel(t, tc.files)
-			got, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("extractWheelMetadata error = %v, want %v", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("extractWheelMetadata unexpected error: %v", err)
-			}
-			if string(got) != tc.want {
-				t.Errorf("extractWheelMetadata = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestExtractWheelMetadata_NotZip(t *testing.T) {
-	t.Parallel()
-
-	data := []byte("not a zip file")
-	_, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
-	if err == nil {
-		t.Fatalf("expected error for non-zip input, got nil")
-	}
-	if errors.Is(err, errMetadataNotFound) {
-		t.Errorf("non-zip should not surface as errMetadataNotFound; got %v", err)
-	}
-}
-
-// TestExtractWheelMetadata_TooManyEntries exercises the zip-bomb cap:
-// a wheel whose central directory exceeds maxWheelEntries is rejected
-// before its members are walked.
-func TestExtractWheelMetadata_TooManyEntries(t *testing.T) {
-	t.Parallel()
-
-	files := make(map[string]string, maxWheelEntries+1)
-	for i := 0; i <= maxWheelEntries; i++ {
-		files["pkg/file-"+strconv.Itoa(i)+".py"] = ""
-	}
-	data := buildTestWheel(t, files)
-	_, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
-	if !errors.Is(err, errWheelTooManyEntries) {
-		t.Errorf("error = %v, want errWheelTooManyEntries", err)
-	}
-}
-
-// TestExtractWheelMetadata_OversizedDeclaredSize confirms that a wheel
-// whose METADATA member declares an UncompressedSize64 above the cap
-// is rejected before we read the body — the cap on read alone isn't
-// enough if a malformed ZIP64 header lies about the size.
-func TestExtractWheelMetadata_OversizedDeclaredSize(t *testing.T) {
-	t.Parallel()
-
-	// Build a real wheel zip, then mutate the central-directory
-	// header so METADATA claims a size larger than maxMetadataSize.
-	// We can't easily mutate post-encoding here without reaching
-	// into archive/zip internals, so instead we write an actual
-	// METADATA entry of size > maxMetadataSize and assert it's
-	// rejected.
-	big := bytes.Repeat([]byte("x"), maxMetadataSize+1)
-	data := buildTestWheel(t, map[string]string{
-		"requests-1.0.0.dist-info/METADATA": string(big),
-	})
-	_, err := extractWheelMetadata(bytes.NewReader(data), int64(len(data)))
-	if err == nil || errors.Is(err, errMetadataNotFound) || errors.Is(err, errWheelTooManyEntries) {
-		t.Errorf("expected oversized-METADATA rejection, got %v", err)
-	}
 }
 
 func TestParseRequiresPython(t *testing.T) {
