@@ -1,6 +1,7 @@
 package maven
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -125,6 +126,11 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 	repoParts := vars["repoParts"]             // This is groupId/artifactId
 	versionSnapshot := vars["versionSnapshot"] // This is version-SNAPSHOT
 
+	if err := validatePath(repoParts, versionSnapshot, ""); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
 		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
@@ -142,6 +148,11 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	repoParts := vars["repoParts"] // This is groupId/artifactId or groupId/artifactId/version for versioned metadata
+
+	if err := validatePath(repoParts, "", ""); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
@@ -163,6 +174,11 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 	version := vars["version"]
 	filename := vars["filename"]
 
+	if err := validatePath(repoParts, version, filename); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
 		OwningTag:  version,
@@ -181,12 +197,19 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	logger := logging.FromContext(req.Context())
 
 	defer req.Body.Close()
-	// Forward the HTTP Content-Length so AddFile can short-circuit the
-	// peek-and-decide buffer for sized uploads (mvn deploy always sets
-	// it). req.ContentLength is -1 for chunked / unknown, which AddFile
-	// treats as "size unknown" and falls back to peeking.
-	f.Size = req.ContentLength
-	desc, err := h.registry.AddFile(req.Context(), f, req.Body)
+
+	body, err := h.maybeVerifyChecksum(req, f)
+	if err != nil {
+		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
+		code := httpStatus(err)
+		if code == 0 {
+			code = http.StatusInternalServerError
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+
+	desc, err := h.registry.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
 		if oci.HasCode(err, http.StatusUnauthorized) {
@@ -202,6 +225,39 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 	}
 	logger.DebugContext(req.Context(), "added file", "descriptor", desc)
 	w.WriteHeader(http.StatusCreated)
+}
+
+// maybeVerifyChecksum returns the request body to forward to AddFile.
+// For non-checksum filenames it returns req.Body untouched and forwards
+// req.ContentLength via f.Size so AddFile keeps its streaming fast path.
+// For checksum filenames it buffers the (always tiny) body, validates it
+// against the previously-uploaded companion artifact, and returns a
+// reader over the buffered bytes so AddFile still sees an io.Reader.
+func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Reader, error) {
+	if ext, _, _ := checksumExt(f.Name); ext == "" {
+		// Forward the HTTP Content-Length so AddFile can short-circuit
+		// the peek-and-decide buffer for sized uploads (mvn deploy
+		// always sets it). req.ContentLength is -1 for chunked /
+		// unknown, which AddFile treats as "size unknown" and falls
+		// back to peeking.
+		f.Size = req.ContentLength
+		return req.Body, nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxChecksumBodyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read checksum body: %w", err)
+	}
+	if len(body) > maxChecksumBodyBytes {
+		return nil, badRequest("checksum body exceeds %d bytes", maxChecksumBodyBytes)
+	}
+
+	if err := verifyChecksumUpload(req.Context(), h.registry, f, body); err != nil {
+		return nil, err
+	}
+
+	f.Size = int64(len(body))
+	return bytes.NewReader(body), nil
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
