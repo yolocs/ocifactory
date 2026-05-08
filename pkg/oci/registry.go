@@ -761,12 +761,18 @@ func (r *Registry) resolveVersionDescriptor(ctx context.Context, backend destRep
 // prefix filter is gone. Callers that need version-vs-alias discrimination
 // should use a sibling helper (added when first needed; the current
 // in-tree caller is python's "index" repo, which has no aliases).
+//
+// 404 NAME_UNKNOWN responses (zot returns this for repositories that
+// have never been pushed to) are normalized to errdef.ErrNotFound so
+// callers can rely on a single sentinel check regardless of whether
+// they're talking to a fake or a real backend.
 func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) {
 	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
 	if err != nil {
 		return nil, err
 	}
-	return registry.Tags(ctx, backend)
+	tags, err := registry.Tags(ctx, backend)
+	return tags, normalizeNotFound(err)
 }
 
 // ListFiles enumerates all files across all canonical versions in repo.

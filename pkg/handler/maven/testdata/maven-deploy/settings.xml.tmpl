@@ -2,14 +2,18 @@
 <!--
   settings.xml template for the maven real-client integration test.
 
-  __LOCAL_REPO__       - per-test local m2 cache (set via Go's t.TempDir())
-  __OCIFACTORY_URL__   - http://host:port for the ocifactory subprocess
-  __USERNAME__         - dummy user (server runs with --disable-authn)
-  __PASSWORD__         - dummy password (likewise)
+  Placeholders substituted by the Go test before mvn reads the file:
+    LOCAL_REPO     per-test local m2 cache (set via Go's t.TempDir())
+    OCIFACTORY_URL http://host:port for the ocifactory subprocess
+    USERNAME       dummy user (server runs with authn disabled)
+    PASSWORD       dummy password (likewise)
 
-  The server is configured with --disable-authn so any value here is
-  accepted; the credential just has to be present so mvn sends a
+  Authentication is disabled on the server side, so any credential
+  is accepted; the values just have to be present so mvn sends a
   Basic auth header at all.
+
+  XML comments must not contain consecutive dashes, so flag names are
+  written without the leading double-dash here.
 -->
 <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
