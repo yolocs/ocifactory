@@ -1,3 +1,12 @@
+//go:build integration
+
+// Real-client integration test for the python handler. Gated behind
+// the `integration` build tag because the standard go-test runner
+// already has mvn / java / python3 preinstalled — without the tag,
+// `go test ./...` on a stock ubuntu runner would try to run this
+// test for real and conflict with the dedicated client-integration
+// job that owns the toolchain. Run via `go test -tags=integration`.
+
 package python_test
 
 import (

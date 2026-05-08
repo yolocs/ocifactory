@@ -214,12 +214,14 @@ jobs:
         run: 'sudo apt-get update && sudo apt-get install -y --no-install-recommends maven'
 
       - name: 'Run client integration tests'
-        # No -short so the testcontainers-driven tests actually run
-        # (the rest of the suite has already been exercised by the
-        # go-test job above).
+        # -tags=integration compiles the integration_test.go files
+        # the shared go-test job skips. The shared job runs the
+        # rest of the suite under the same Go version so we don't
+        # need to repeat it here.
         run: |
           go test -race -count=1 \
-            -run 'TestPythonIntegration_RealClients|TestMavenIntegration_RealClients' \
+            -tags=integration \
+            -timeout=10m \
             -v \
             ./pkg/handler/python/... \
             ./pkg/handler/maven/...

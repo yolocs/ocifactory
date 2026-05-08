@@ -1,3 +1,12 @@
+//go:build integration
+
+// Real-client integration test for the maven handler. Gated behind
+// the `integration` build tag because the standard go-test runner
+// (ubuntu-latest) has mvn + java preinstalled — without the tag the
+// shared go-test job would run this test instead of the dedicated
+// client-integration job that owns the wiring. Run via
+// `go test -tags=integration`.
+
 package maven_test
 
 import (
