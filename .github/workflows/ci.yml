@@ -178,3 +178,48 @@ jobs:
             echo "=== ocifactory.log ==="
             cat ./run/ocifactory.log
           fi
+
+  # client-integration runs the per-format real-client tests: pip /
+  # twine / mvn driving an ocifactory subprocess against a zot
+  # registry started by testcontainers-go.
+  #
+  # The shared go-test job above runs the same tests but skips them
+  # because the runner image doesn't ship pip/twine/mvn. Splitting
+  # them into a dedicated job keeps the unit suite fast and isolates
+  # the (slower) network-driven cases that need extra tooling.
+  client-integration:
+    name: 'client-integration'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+
+      - uses: 'actions/setup-go@v5' # ratchet:exclude
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - uses: 'actions/setup-python@v5' # ratchet:exclude
+        with:
+          python-version: '3.x'
+
+      - uses: 'actions/setup-java@v4' # ratchet:exclude
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 'Install twine'
+        run: 'python -m pip install --upgrade pip twine'
+
+      - name: 'Install maven'
+        run: 'sudo apt-get update && sudo apt-get install -y --no-install-recommends maven'
+
+      - name: 'Run client integration tests'
+        # No -short so the testcontainers-driven tests actually run
+        # (the rest of the suite has already been exercised by the
+        # go-test job above).
+        run: |
+          go test -race -count=1 \
+            -run 'TestPythonIntegration_RealClients|TestMavenIntegration_RealClients' \
+            -v \
+            ./pkg/handler/python/... \
+            ./pkg/handler/maven/...
