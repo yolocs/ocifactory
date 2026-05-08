@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  settings.xml template for the maven real-client integration test.
+
+  Placeholders substituted by the Go test before mvn reads the file:
+    LOCAL_REPO     per-test local m2 cache (set via Go's t.TempDir())
+    OCIFACTORY_URL http://host:port for the ocifactory subprocess
+    USERNAME       dummy user (server runs with authn disabled)
+    PASSWORD       dummy password (likewise)
+
+  Authentication is disabled on the server side, so any credential
+  is accepted; the values just have to be present so mvn sends a
+  Basic auth header at all.
+
+  XML comments must not contain consecutive dashes, so flag names are
+  written without the leading double-dash here.
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              http://maven.apache.org/xsd/settings-1.0.0.xsd">
+    <localRepository>__LOCAL_REPO__</localRepository>
+
+    <servers>
+        <server>
+            <id>ocifactory-int</id>
+            <username>__USERNAME__</username>
+            <password>__PASSWORD__</password>
+        </server>
+    </servers>
+
+    <profiles>
+        <profile>
+            <id>ocifactory-int</id>
+            <repositories>
+                <repository>
+                    <id>ocifactory-int</id>
+                    <url>__OCIFACTORY_URL__</url>
+                    <releases>
+                        <enabled>true</enabled>
+                        <updatePolicy>always</updatePolicy>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                        <updatePolicy>always</updatePolicy>
+                    </snapshots>
+                </repository>
+            </repositories>
+        </profile>
+    </profiles>
+
+    <activeProfiles>
+        <activeProfile>ocifactory-int</activeProfile>
+    </activeProfiles>
+</settings>
