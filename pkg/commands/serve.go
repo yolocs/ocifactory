@@ -65,6 +65,7 @@ const (
 	flagBackendRegistry                 = "backend-registry"
 	flagDisableStreamingPush            = "disable-streaming-push"
 	flagDisableBlobRedirect             = "disable-blob-redirect"
+	flagAllowOverwrite                  = "allow-overwrite"
 	flagSimpleIndexCacheTTL             = "simple-index-cache-ttl"
 	flagPythonMaxUploadBytes            = "python-max-upload-bytes"
 	flagEnableMetrics                   = "enable-metrics"
@@ -91,6 +92,7 @@ type serveConfig struct {
 	BackendRegistry      string        `mapstructure:"backend-registry"`
 	DisableStreamingPush bool          `mapstructure:"disable-streaming-push"`
 	DisableBlobRedirect  bool          `mapstructure:"disable-blob-redirect"`
+	AllowOverwrite       bool          `mapstructure:"allow-overwrite"`
 	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
 	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
@@ -233,6 +235,16 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"Bodies above the in-memory threshold will spill to a temp file "+
 			"instead of streaming via chunked PATCH. Set this only for "+
 			"backend registries with broken or missing chunked-PATCH support.")
+	flags.Bool(flagAllowOverwrite, false,
+		"Allow re-uploading a file whose (repo, version, name) tuple "+
+			"already exists. The default (false) rejects re-uploads with "+
+			"409 Conflict, matching PyPI's auditability story and keeping "+
+			"every published version immutable. Set this true for "+
+			"workflows that intentionally re-publish under the same "+
+			"version (Maven snapshots, fix-the-CI-job retries, ephemeral "+
+			"staging) — overwrites unlink the previous file manifest from "+
+			"the version's referrer set so readers always see exactly "+
+			"one match per filename.")
 	flags.Bool(flagDisableBlobRedirect, false,
 		"Disable redirecting blob downloads to backend-issued presigned "+
 			"URLs. By default, hosted backends (GAR, ECR, ACR, GHCR, Docker "+
@@ -322,6 +334,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 	registryOpts := []oci.RegistryOption{
 		oci.WithStreamingPushDisabled(cfg.DisableStreamingPush),
 		oci.WithBlobRedirectDisabled(cfg.DisableBlobRedirect),
+		oci.WithAllowOverwrite(cfg.AllowOverwrite),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
 	}

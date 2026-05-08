@@ -75,6 +75,14 @@ var ErrDigestMismatch = errors.New("file digest mismatch")
 // write path turns silent overwrite into a typed error.
 var ErrAliasCollision = errors.New("tag collides with incompatible artifactType")
 
+// ErrAlreadyExists is returned by AddFile when a file with the same
+// (OwningRepo, OwningTag, Name) already exists and the registry was
+// constructed without WithAllowOverwrite(true). Handlers translate it
+// to 409 Conflict — re-uploading an existing file in an existing
+// version is rejected by default to match PyPI's auditability story
+// and keep an immutable view of every published version.
+var ErrAlreadyExists = errors.New("file already exists in version")
+
 // destRepo is the subset of oras-go's remote.Repository (and our in-memory
 // fake) that pkg/oci needs. Pinned as an interface so tests can substitute
 // memory-backed implementations.
@@ -115,6 +123,17 @@ type Registry struct {
 	// DLP, audit requirements. Handlers fall through to the
 	// stream-through ReadFile path automatically.
 	disableBlobRedirect bool
+
+	// allowOverwrite, when true, lets AddFile re-upload a file whose
+	// (OwningRepo, OwningTag, Name) already exists; the old file
+	// manifest is unlinked from the version's referrer set after the
+	// new one is pushed so readers always see exactly one match per
+	// filename. The default (false) returns ErrAlreadyExists instead,
+	// which handlers translate to 409 Conflict — safe-by-default for
+	// auditability and immutable-version semantics. Operators flip
+	// this on via --allow-overwrite when they need lax behaviour
+	// (e.g. snapshot workflows that re-publish under the same tag).
+	allowOverwrite bool
 
 	// rec collects per-backend-call observations. Defaults to
 	// metrics.NoOp() so existing tests and library callers that don't
@@ -209,6 +228,25 @@ func WithBackendAuth(p backend.Provider) RegistryOption {
 func WithStreamingPushDisabled(disabled bool) RegistryOption {
 	return func(r *Registry) error {
 		r.disableStreamingPush = disabled
+		return nil
+	}
+}
+
+// WithAllowOverwrite controls re-upload semantics. When true, AddFile
+// permits replacing a file whose (OwningRepo, OwningTag, Name) already
+// exists in the version: the new file manifest is pushed and the old
+// one is unlinked from the version's referrer set so subsequent reads
+// see only the new content. When false (the default), AddFile returns
+// ErrAlreadyExists on a re-upload attempt; handlers translate that to
+// 409 Conflict.
+//
+// The safe-by-default shape mirrors PyPI's behaviour and keeps every
+// published version auditably immutable. Operators that intentionally
+// re-publish under the same tag (Maven snapshots, fix-the-CI-job
+// workflows, ephemeral staging) flip this on via --allow-overwrite.
+func WithAllowOverwrite(allow bool) RegistryOption {
+	return func(r *Registry) error {
+		r.allowOverwrite = allow
 		return nil
 	}
 }
@@ -371,9 +409,27 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 //   - If RepoFile.OwningTag currently resolves to an alias manifest
 //     (artifactType ≠ versionArtifactType), AddFile returns
 //     ErrAliasCollision rather than silently overwriting the alias.
+//   - If a file with the same (OwningRepo, OwningTag, Name) already
+//     exists and the registry was constructed without
+//     WithAllowOverwrite(true), AddFile returns ErrAlreadyExists
+//     before the body is read so a rejected re-upload doesn't pay for
+//     a wasted upload. With WithAllowOverwrite(true), the previous
+//     file manifest is unlinked from the version's referrer set after
+//     the new one is pushed; readers only ever see one match per
+//     filename, even across overwrites.
 func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
 	if f.OwningTag == "" {
 		return nil, fmt.Errorf("OwningTag must be set")
+	}
+
+	// Existence probe runs before uploadBlob so a rejected re-upload
+	// doesn't read a byte of the request body. The probe also returns
+	// the pre-existing file manifest descriptor when overwrite is
+	// allowed, so we can unlink it after the new manifest lands
+	// without a second referrer scan.
+	oldFileManifest, err := r.probeExistingFile(ctx, f)
+	if err != nil {
+		return nil, err
 	}
 
 	blobDesc, backend, err := r.uploadBlob(ctx, f, ro)
@@ -391,7 +447,74 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 		return nil, err
 	}
 
+	// Best-effort cleanup of the previous file manifest when this is
+	// an overwrite. Skipped when the new manifest is byte-identical
+	// (same digest) to the old — re-uploading identical content is
+	// idempotent and there's nothing to unlink. A delete failure is
+	// not fatal: the orphan remains discoverable via the version's
+	// referrers list until backend GC reaps it, but the live referrer
+	// scan in ReadFile may then return either manifest. That
+	// uncertainty is exactly what overwrite-mode opts into.
+	if oldFileManifest != nil && oldFileManifest.Digest != fileManifestDesc.Digest {
+		_ = backend.Delete(ctx, *oldFileManifest)
+	}
+
 	return &FileDescriptor{Manifest: fileManifestDesc, File: blobDesc}, nil
+}
+
+// probeExistingFile resolves the version manifest (if any) and scans
+// its file referrers for one whose FileNameAnnotation matches f.Name.
+// Behaviour:
+//
+//   - No version tag yet, or no matching file referrer → returns
+//     (nil, nil); caller proceeds with the normal write path.
+//   - Match found and overwrite is disabled → returns
+//     (nil, ErrAlreadyExists).
+//   - Match found and overwrite is enabled → returns the existing
+//     descriptor so AddFile can unlink it after the new manifest is
+//     pushed.
+//
+// The tag-points-at-an-alias case is left to ensureVersionManifest to
+// translate into ErrAliasCollision: this probe only cares about file
+// referrers under a canonical version manifest.
+func (r *Registry) probeExistingFile(ctx context.Context, f *RepoFile) (*ocispec.Descriptor, error) {
+	backend, err := r.newBackendFunc(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+
+	versionDesc, err := backend.Resolve(ctx, f.OwningTag)
+	if err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to resolve version tag %q: %w", f.OwningTag, err)
+	}
+
+	aType, err := manifestArtifactType(ctx, backend, versionDesc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect tag %q: %w", f.OwningTag, err)
+	}
+	if aType != r.versionArtifactType {
+		// Alias or foreign manifest — ensureVersionManifest will
+		// surface ErrAliasCollision when the write reaches it.
+		return nil, nil
+	}
+
+	refs, err := registry.Referrers(ctx, backend, versionDesc, r.fileArtifactType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list file referrers for %q: %w", f.OwningTag, err)
+	}
+	for i := range refs {
+		if refs[i].Annotations[FileNameAnnotation] != f.Name {
+			continue
+		}
+		if !r.allowOverwrite {
+			return nil, fmt.Errorf("%w: %s/%s/%s", ErrAlreadyExists, f.OwningRepo, f.OwningTag, f.Name)
+		}
+		return &refs[i], nil
+	}
+	return nil, nil
 }
 
 // uploadBlob picks between the buffered and streaming push paths and

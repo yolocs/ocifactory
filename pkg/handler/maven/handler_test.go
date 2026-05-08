@@ -436,3 +436,55 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 		MediaType:  detectMediaType(fn),
 	}
 }
+
+// TestHandlePut_ReuploadConflict locks the wire-level shape of the
+// re-upload contract for Maven uploads: a second PUT to the same
+// (repo, version, filename) returns 409 by default and 201 when the
+// fake registry is flipped into overwrite mode.
+func TestHandlePut_ReuploadConflict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		allowOverwrite bool
+		wantSecond     int
+	}{
+		{name: "default rejects re-upload", allowOverwrite: false, wantSecond: http.StatusConflict},
+		{name: "allow-overwrite returns 201", allowOverwrite: true, wantSecond: http.StatusCreated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			reg.AllowOverwrite = tc.allowOverwrite
+			h, err := NewHandler(reg)
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			mux := h.Mux()
+
+			send := func(body string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPut, "/com/example/project/1.0.0/project-1.0.0.jar", strings.NewReader(body))
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, req)
+				return rec
+			}
+
+			if rec := send("first jar"); rec.Code != http.StatusCreated {
+				t.Fatalf("first PUT status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+
+			rec := send("second jar")
+			if got, want := rec.Code, tc.wantSecond; got != want {
+				t.Fatalf("second PUT status=%d, want %d (body=%s)", got, want, rec.Body.String())
+			}
+			if rec.Code == http.StatusConflict {
+				if got := rec.Body.String(); !strings.Contains(got, "file already exists") {
+					t.Errorf("409 body = %q, want contains %q", got, "file already exists")
+				}
+			}
+		})
+	}
+}
