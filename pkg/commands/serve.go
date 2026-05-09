@@ -16,6 +16,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
 	"github.com/yolocs/ocifactory/pkg/auth/oidc"
+	"github.com/yolocs/ocifactory/pkg/auth/staticauthz"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/echo"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
@@ -79,6 +80,7 @@ const (
 	flagBackendAuthStaticEnvUserEnv     = "backend-auth-staticenv-user-env"
 	flagBackendAuthStaticEnvPasswordEnv = "backend-auth-staticenv-password-env"
 	flagBackendAuthDockerConfigPath     = "backend-auth-dockerconfig-path"
+	flagAuthzConfig                     = "authz-config"
 )
 
 // serveConfig is the typed view of the resolved CLI/env/default
@@ -108,6 +110,8 @@ type serveConfig struct {
 	BackendAuthStaticEnvUserEnv     string   `mapstructure:"backend-auth-staticenv-user-env"`
 	BackendAuthStaticEnvPasswordEnv string   `mapstructure:"backend-auth-staticenv-password-env"`
 	BackendAuthDockerConfigPath     string   `mapstructure:"backend-auth-dockerconfig-path"`
+
+	AuthzConfig string `mapstructure:"authz-config"`
 
 	// RegistryURL is computed by Validate from BackendRegistry. Not
 	// populated by Unmarshal — the `-` tag tells mapstructure to
@@ -310,6 +314,15 @@ func registerServeFlags(flags *pflag.FlagSet) {
 	flags.String(flagBackendAuthDockerConfigPath, "",
 		"Path to a docker-format config.json for the dockerconfig backend "+
 			"auth kind. Empty = ~/.docker/config.json.")
+
+	// Authorization (config-file policy).
+	flags.String(flagAuthzConfig, "",
+		"Path to a YAML authorization policy file. When set, every "+
+			"per-format route consults the resulting Authorizer with a "+
+			"(repo, format, op) Action and returns 403 on deny. When "+
+			"empty, no authorization check runs and every authenticated "+
+			"caller can read and write everything — fine for local dev "+
+			"but not for production. See docs/auth.md for the file format.")
 }
 
 func runServe(ctx context.Context, cfg *serveConfig) error {
@@ -320,6 +333,11 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		return fmt.Errorf("failed to build authenticator: %w", err)
 	}
 	authMW := auth.Middleware(authn)
+
+	authz, err := buildAuthz(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("failed to build authorizer: %w", err)
+	}
 
 	bp, err := buildBackendAuth(ctx, cfg)
 	if err != nil {
@@ -348,7 +366,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(r, maven.WithAuthMiddleware(authMW))
+		mh, err := maven.NewHandler(r,
+			maven.WithAuthMiddleware(authMW),
+			maven.WithAuthorizer(authz),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -365,6 +386,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),
+			python.WithAuthorizer(authz),
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)
@@ -375,7 +397,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		// backend, so reg stays nil — ObservabilityHandler treats a
 		// nil pinger as "no backend configured" and /readyz collapses
 		// to liveness, which is what we want.
-		eh := echo.NewHandler(echo.WithAuthMiddleware(authMW))
+		eh := echo.NewHandler(
+			echo.WithAuthMiddleware(authMW),
+			echo.WithAuthorizer(authz),
+		)
 		format, h = echo.RepoType, eh.Mux()
 	default:
 		return fmt.Errorf("repo-type %q is not supported", cfg.RepoType)
@@ -445,6 +470,30 @@ func buildAuthn(ctx context.Context, cfg *serveConfig) (auth.Authenticator, erro
 		// clean error.
 		return nil, fmt.Errorf("authn-kind %q is not supported (allowed: %v)", cfg.AuthnKind, supportedAuthnKinds)
 	}
+}
+
+// buildAuthz constructs the auth.Authorizer applied to every
+// per-format route. When --authz-config is empty the function
+// returns nil and a startup warning is logged — handlers treat a
+// nil authorizer as "every authenticated caller is allowed",
+// which is fine for local dev but not production. When the flag
+// is set the static config file is loaded; any parse / regex
+// error fails the startup so policy mistakes never silently let
+// callers through.
+func buildAuthz(ctx context.Context, cfg *serveConfig) (auth.Authorizer, error) {
+	logger := logging.NewFromEnv("OCIFACTORY_")
+	if cfg.AuthzConfig == "" {
+		logger.WarnContext(ctx, "no authorization policy configured (set --authz-config / "+
+			"OCIFACTORY_AUTHZ_CONFIG). Every authenticated caller can read and write everything — "+
+			"only safe for local development.")
+		return nil, nil
+	}
+	a, err := staticauthz.Load(cfg.AuthzConfig)
+	if err != nil {
+		return nil, fmt.Errorf("load authz config %q: %w", cfg.AuthzConfig, err)
+	}
+	logger.InfoContext(ctx, "authorization policy loaded", "path", cfg.AuthzConfig)
+	return a, nil
 }
 
 // buildBackendAuth constructs the credential provider ocifactory

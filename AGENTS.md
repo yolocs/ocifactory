@@ -27,13 +27,14 @@ Design pillars (in priority order):
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC) | Done, tested. OIDC-only — static passwords are out-of-tree by design. Configured via `OCIFACTORY_AUTHN_*` flags / env vars. |
 | `pkg/auth/backend` — Pluggable backend credential `Provider` interface and in-tree adapters (`anonymous`, `gcpadc`, `staticenv`, `dockerconfig`) | Done, tested. Wired into `oci.Registry` via `WithBackendAuth`. Configured via `OCIFACTORY_BACKEND_AUTH_*` flags / env vars. |
+| `pkg/auth` Authorizer — Pluggable `Authorizer` interface (`Action`, `Op`, `Check`, `AllowAll`, `DenyAll`) with read/write granularity per (repo, format, op) | Done, tested. |
+| `pkg/auth/staticauthz` — Config-file backed Authorizer (subject + action matchers, `*`/`**` globs, default deny). | Done, tested. Configured via `--authz-config` / `OCIFACTORY_AUTHZ_CONFIG`. |
 | `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven|echo` (echo runs without `--backend-registry`) |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
 | Vulnerability scanning | Not started |
-| Authorization (per-repo, per-op policy) | Not started |
 | Dockerfile / deployment | Not started |
 | CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`. |
 
@@ -170,11 +171,12 @@ These are non-negotiable. Apply them to every test in the repo:
 1. Create `pkg/handler/<format>/` with `handler.go`, the `Mux()`, and translation logic.
 2. Define `RepoType` and `ArtifactType` constants.
 3. **Accept `WithAuthMiddleware(func(http.Handler) http.Handler)` as an Option** and chain the middleware on whichever routes need authentication. The convention today (python, maven) is `router.Use(mux.MiddlewareFunc(h.authMW))` on the root router so every route is gated. Public-by-default formats (npm registry root, Go module proxy listings) chain on a sub-router and leave reads ungated; outlier endpoints with their own auth contract (npm login bootstrap, Docker token server) sit on a sub-router that doesn't chain it at all. **Do not add an open default**: in `pkg/commands/serve.go`, always pass `WithAuthMiddleware(authMW)` when constructing the handler. The handler-side option is permissive (omitting it leaves routes ungated, which is what tests want), so the gate against silent-no-auth lives in serve.go — verify it's wired before merging.
-4. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Pass `WithAuthMiddleware(authMW)` (built earlier in `runServe`) to the handler constructor.
-5. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs.
-6. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
-7. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations. Copy [`docs/repos/_template.md`](docs/repos/_template.md) — it has the headings and depth `python.md` / `maven.md` use, plus inline notes on what to call out front-and-center (e.g. operator footguns that break the second invocation of the most common client command).
-8. Update the status table in this file.
+4. **Accept `WithAuthorizer(auth.Authorizer)` as an Option** and call `auth.Check(ctx, h.authz, auth.Action{Repo, Format, Op})` at the start of every routed handler function. Map `auth.ErrUnauthorized` to 403 and any other authz error to 500. `Repo` MUST match the value the corresponding `oci.RepoFile.OwningRepo` uses, so policies are written against the same names operators see in the OCI registry. Public-by-default routes can skip the check; the call site is the single place auditors look to confirm the gate is wired.
+5. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Pass both `WithAuthMiddleware(authMW)` and `WithAuthorizer(authz)` (built earlier in `runServe`) to the handler constructor.
+6. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go` (deny-all middleware reaches every route, omitting the option leaves routes ungated, the middleware chains before the route handler runs) and a `pkg/handler/<format>/authz_test.go` that mirrors `pkg/handler/python/authz_test.go` (the authorizer fires per route with the expected (Repo, Format, Op) Action; `ErrUnauthorized` → 403; non-sentinel errors → 500).
+7. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
+8. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations. Copy [`docs/repos/_template.md`](docs/repos/_template.md) — it has the headings and depth `python.md` / `maven.md` use, plus inline notes on what to call out front-and-center (e.g. operator footguns that break the second invocation of the most common client command).
+9. Update the status table in this file.
 
 ## Roadmap (one step at a time)
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -93,6 +94,7 @@ type Handler struct {
 	renderer       *renderer.Renderer
 	indexCache     *simpleIndexCache
 	authMW         func(http.Handler) http.Handler
+	authz          auth.Authorizer
 	maxUploadBytes int64
 }
 
@@ -102,6 +104,7 @@ type Option func(*handlerConfig)
 type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
 	authMW              func(http.Handler) http.Handler
+	authz               auth.Authorizer
 	maxUploadBytes      int64
 }
 
@@ -140,6 +143,23 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
+// WithAuthorizer installs an auth.Authorizer that every route in
+// this handler consults after the request has been authenticated.
+// Each route translates the inbound HTTP request into an
+// auth.Action (Repo / Format / Op) and calls auth.Check; failures
+// short-circuit with 403 (auth.ErrUnauthorized) or 500 (any other
+// authorization-system error).
+//
+// Pass nil (or omit the option) to skip authorization entirely —
+// useful for tests and for deployments running behind another
+// authz layer. The serve command always supplies an authorizer
+// so production wiring fails closed.
+func WithAuthorizer(a auth.Authorizer) Option {
+	return func(c *handlerConfig) {
+		c.authz = a
+	}
+}
+
 // NewHandler creates a new Handler.
 func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
@@ -158,8 +178,26 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 		renderer:       r,
 		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
 		authMW:         cfg.authMW,
+		authz:          cfg.authz,
 		maxUploadBytes: cfg.maxUploadBytes,
 	}, nil
+}
+
+// authorize checks the action against the configured Authorizer
+// (if any) and writes the matching HTTP response on failure.
+// Returns true when the caller should proceed, false when an
+// error response has already been written.
+func (h *Handler) authorize(ctx context.Context, w http.ResponseWriter, act auth.Action) bool {
+	err := auth.Check(ctx, h.authz, act)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, auth.ErrUnauthorized) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	handler.WriteError(ctx, w, http.StatusInternalServerError, err, "authorization error")
+	return false
 }
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
@@ -201,6 +239,9 @@ func (h *Handler) Mux() http.Handler {
 // (already-normalized) package name; ListTags is enough to enumerate
 // them.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
+	if !h.authorize(req.Context(), w, auth.Action{Repo: "index", Format: RepoType, Op: auth.OpRead}) {
+		return
+	}
 	tags, err := h.registry.ListTags(req.Context(), "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "failed to list package index")
@@ -338,6 +379,10 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	}
 
 	normalizedName := normalize(pkgName)
+
+	if !h.authorize(ctx, w, auth.Action{Repo: "packages/" + normalizedName, Format: RepoType, Op: auth.OpWrite}) {
+		return
+	}
 
 	wheelRF := &oci.RepoFile{
 		OwningRepo: "packages/" + normalizedName,
@@ -509,6 +554,9 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 	}
 
 	pkg = normalize(pkg)
+	if !h.authorize(req.Context(), w, auth.Action{Repo: "packages/" + pkg, Format: RepoType, Op: auth.OpRead}) {
+		return
+	}
 	f := &oci.RepoFile{
 		OwningRepo: "packages/" + pkg,
 		OwningTag:  version,
@@ -527,6 +575,10 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	pkg = normalize(pkg)
+
+	if !h.authorize(req.Context(), w, auth.Action{Repo: "packages/" + pkg, Format: RepoType, Op: auth.OpRead}) {
+		return
+	}
 
 	files, ok := h.indexCache.get(pkg)
 	if !ok {

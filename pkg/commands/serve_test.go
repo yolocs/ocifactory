@@ -2,6 +2,8 @@ package commands
 
 import (
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
@@ -184,6 +187,7 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: flagBackendAuthStaticEnvUserEnv, flagName: flagBackendAuthStaticEnvUserEnv},
 		{name: flagBackendAuthStaticEnvPasswordEnv, flagName: flagBackendAuthStaticEnvPasswordEnv},
 		{name: flagBackendAuthDockerConfigPath, flagName: flagBackendAuthDockerConfigPath},
+		{name: flagAuthzConfig, flagName: flagAuthzConfig},
 	}
 
 	for _, tc := range tests {
@@ -198,6 +202,57 @@ func TestServeCmd_Flags(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildAuthz(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty config returns nil authorizer", func(t *testing.T) {
+		t.Parallel()
+		got, err := buildAuthz(t.Context(), &serveConfig{AuthzConfig: ""})
+		if err != nil {
+			t.Fatalf("buildAuthz: %v", err)
+		}
+		if got != nil {
+			t.Errorf("buildAuthz returned %T, want nil", got)
+		}
+	})
+
+	t.Run("loads config file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "authz.yaml")
+		body := `default: deny
+rules:
+  - subject:
+      issuer: https://example.com
+    allow:
+      - { repo: "*", format: "*", op: read }
+`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got, err := buildAuthz(t.Context(), &serveConfig{AuthzConfig: path})
+		if err != nil {
+			t.Fatalf("buildAuthz: %v", err)
+		}
+		if got == nil {
+			t.Fatal("buildAuthz returned nil; want a real Authorizer")
+		}
+		// Sanity-check the rule actually loaded.
+		ac := &auth.AuthContext{Issuer: "https://example.com", ID: "u"}
+		if err := got.Authorize(t.Context(), ac, auth.Action{Repo: "anything", Format: "python", Op: auth.OpRead}); err != nil {
+			t.Errorf("Authorize: %v", err)
+		}
+	})
+
+	t.Run("missing file errors", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildAuthz(t.Context(), &serveConfig{AuthzConfig: filepath.Join(t.TempDir(), "nope.yaml")})
+		if err == nil {
+			t.Errorf("buildAuthz with missing file succeeded; want error")
+		}
+	})
 }
 
 // TestServeCmd_EnvVarBindings exercises viper's resolution chain end

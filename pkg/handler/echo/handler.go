@@ -16,6 +16,7 @@ package echo
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -29,6 +30,7 @@ const RepoType = "echo"
 // Handler serves the echo routes.
 type Handler struct {
 	authMW func(http.Handler) http.Handler
+	authz  auth.Authorizer
 }
 
 // Option configures optional Handler behaviour.
@@ -36,6 +38,7 @@ type Option func(*handlerConfig)
 
 type handlerConfig struct {
 	authMW func(http.Handler) http.Handler
+	authz  auth.Authorizer
 }
 
 // WithAuthMiddleware installs an authentication middleware on every
@@ -47,13 +50,23 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
+// WithAuthorizer installs an auth.Authorizer that the echo routes
+// consult after authentication. The CI OIDC end-to-end job uses
+// this to assert authz wiring runs against a real verified
+// AuthContext.
+func WithAuthorizer(a auth.Authorizer) Option {
+	return func(c *handlerConfig) {
+		c.authz = a
+	}
+}
+
 // NewHandler creates a new echo Handler.
 func NewHandler(opts ...Option) *Handler {
 	var cfg handlerConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Handler{authMW: cfg.authMW}
+	return &Handler{authMW: cfg.authMW, authz: cfg.authz}
 }
 
 // Mux returns the echo router. Both routes are auth-gated when
@@ -94,6 +107,9 @@ type callerSummary struct {
 }
 
 func (h *Handler) handleEcho(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r, auth.Action{Repo: "echo", Format: RepoType, Op: auth.OpRead}) {
+		return
+	}
 	msg := mux.Vars(r)["message"]
 	writeJSON(w, http.StatusOK, echoResponse{
 		Message: msg,
@@ -102,9 +118,27 @@ func (h *Handler) handleEcho(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r, auth.Action{Repo: "echo", Format: RepoType, Op: auth.OpRead}) {
+		return
+	}
 	writeJSON(w, http.StatusOK, whoamiResponse{
 		Caller: callerFromContext(r),
 	})
+}
+
+// authorize translates the configured Authorizer's decision into
+// an HTTP response. Returns true on allow, false after writing an
+// error response.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, act auth.Action) bool {
+	if err := auth.Check(r.Context(), h.authz, act); err != nil {
+		if errors.Is(err, auth.ErrUnauthorized) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		} else {
+			http.Error(w, "authorization error", http.StatusInternalServerError)
+		}
+		return false
+	}
+	return true
 }
 
 func callerFromContext(r *http.Request) *callerSummary {

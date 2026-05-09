@@ -2,6 +2,7 @@ package maven
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -49,6 +51,7 @@ var (
 type Handler struct {
 	registry handler.Registry
 	authMW   func(http.Handler) http.Handler
+	authz    auth.Authorizer
 }
 
 // Option configures optional Handler behaviour.
@@ -56,6 +59,7 @@ type Option func(*handlerConfig)
 
 type handlerConfig struct {
 	authMW func(http.Handler) http.Handler
+	authz  auth.Authorizer
 }
 
 // WithAuthMiddleware installs an authentication middleware on
@@ -67,12 +71,46 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
+// WithAuthorizer installs an auth.Authorizer that every Maven
+// route consults after authentication. See python.WithAuthorizer
+// for the full contract — the wiring here is symmetric.
+func WithAuthorizer(a auth.Authorizer) Option {
+	return func(c *handlerConfig) {
+		c.authz = a
+	}
+}
+
 func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Handler{registry: registry, authMW: cfg.authMW}, nil
+	return &Handler{registry: registry, authMW: cfg.authMW, authz: cfg.authz}, nil
+}
+
+// authorize translates the configured Authorizer's decision into
+// an HTTP response. Returns true when the caller should proceed,
+// false when an error response has been written.
+func (h *Handler) authorize(ctx context.Context, w http.ResponseWriter, act auth.Action) bool {
+	err := auth.Check(ctx, h.authz, act)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, auth.ErrUnauthorized) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	handler.WriteError(ctx, w, http.StatusInternalServerError, err, "authorization error")
+	return false
+}
+
+// opForMethod maps an HTTP method onto an auth.Op. PUT/POST are
+// writes; everything else (GET/HEAD) is a read.
+func opForMethod(m string) auth.Op {
+	if m == http.MethodPut || m == http.MethodPost {
+		return auth.OpWrite
+	}
+	return auth.OpRead
 }
 
 func (h *Handler) Mux() http.Handler {
@@ -113,6 +151,9 @@ func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Reques
 		Name:       "archetype-catalog.xml",
 		MediaType:  "text/xml",
 	}
+	if !h.authorize(req.Context(), w, auth.Action{Repo: f.OwningRepo, Format: RepoType, Op: opForMethod(req.Method)}) {
+		return
+	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, f)
 	} else { // GET, HEAD
@@ -137,6 +178,9 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
 	}
+	if !h.authorize(req.Context(), w, auth.Action{Repo: f.OwningRepo, Format: RepoType, Op: opForMethod(req.Method)}) {
+		return
+	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, f)
 	} else { // GET, HEAD
@@ -159,6 +203,9 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		OwningTag:  "metadata", // For release artifact or version metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
+	}
+	if !h.authorize(req.Context(), w, auth.Action{Repo: f.OwningRepo, Format: RepoType, Op: opForMethod(req.Method)}) {
+		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, f)
@@ -184,6 +231,9 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		OwningTag:  version,
 		Name:       filename,
 		MediaType:  detectMediaType(filename),
+	}
+	if !h.authorize(req.Context(), w, auth.Action{Repo: f.OwningRepo, Format: RepoType, Op: opForMethod(req.Method)}) {
+		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, f)

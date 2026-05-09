@@ -1,4 +1,4 @@
-# Authentication
+# Authentication and authorization
 
 ocifactory has two independent identities:
 
@@ -9,9 +9,17 @@ ocifactory has two independent identities:
   adapters for ADC, env vars, and docker config; configured via
   `OCIFACTORY_BACKEND_AUTH_*`.
 
-There is no config file. Every knob is a CLI flag or environment
-variable so deployments on Cloud Run / k8s / docker compose stay a
-single deployable unit with no extra mounts.
+Authentication asks "who is calling?". A separate **authorization**
+layer (`Authorizer`, configured via `--authz-config` /
+`OCIFACTORY_AUTHZ_CONFIG`) asks "what is this caller allowed to
+do?". See the [Authorization](#authorization) section below.
+
+Authentication and backend-credential knobs are CLI flags / env
+vars so single-process deploys (Cloud Run, fly.io, ...) stay a
+mountless unit. The authorization policy is the one exception:
+operators write a YAML file describing rules and pass its path via
+`--authz-config`. Mounting a file is the natural fit for tabular
+data of unbounded size.
 
 ## Where auth runs
 
@@ -301,14 +309,153 @@ OCI backend, no real artifacts. See `pkg/handler/echo`.
   to 503, and the next request after recovery succeeds (lazy
   re-discovery on the failure path).
 
+## Authorization
+
+`pkg/auth.Authorizer` is the swap point for authorization policy.
+The interface is small:
+
+```go
+type Authorizer interface {
+    Authorize(ctx context.Context, ac *AuthContext, act Action) error
+}
+
+type Action struct {
+    Repo   string  // OCI repository path, matches RepoFile.OwningRepo
+    Format string  // "python", "maven", "echo", ...
+    Op     Op      // OpRead | OpWrite
+}
+```
+
+Per-format handlers translate the inbound HTTP request into an
+`Action` and call `auth.Check(ctx, h.authz, act)` at the start of
+every routed handler function. `auth.ErrUnauthorized` becomes
+`403 Forbidden`; any other authorizer error becomes `500
+Internal Server Error` so transient policy-system failures don't
+look like a legitimate denial.
+
+ocifactory ships:
+
+- `pkg/auth.AllowAll` — no authz, every action allowed. Used in
+  tests and behind another authz layer.
+- `pkg/auth.DenyAll` — explicit deny. Used in tests.
+- `pkg/auth/staticauthz` — config-file backed implementation.
+
+Out-of-tree implementations (OPA / Casbin / Rego, GitHub team
+membership, cloud IAM bindings, custom HTTP authz, ...) implement
+`Authorizer` directly and pass an instance through the same
+`WithAuthorizer` option from a custom main.
+
+### Static config policy (`--authz-config`)
+
+When `--authz-config=/path/to/policy.yaml` is set, ocifactory loads
+the file at startup, compiles every regex / glob, and consults it
+for every routed request. When the flag is empty, no authorization
+runs and every authenticated caller can read and write everything
+— acceptable for local dev, not for production. The startup log
+warns when no policy is configured.
+
+Schema:
+
+```yaml
+default: deny             # deny | allow (default: deny)
+rules:
+  # GitHub Actions OIDC: build-bot publishes packages/* (Python).
+  - subject:
+      issuer: https://token.actions.githubusercontent.com
+      sub_match: "^repo:my-org/build-bot:.*"
+    allow:
+      - { repo: "packages/*", format: python, op: write }
+      - { repo: "packages/*", format: python, op: read  }
+
+  # Any GH Actions job in my-org can read across formats.
+  - subject:
+      issuer: https://token.actions.githubusercontent.com
+      sub_match: "^repo:my-org/.*"
+    allow:
+      - { repo: "**", format: "*", op: read }
+
+  # Dedicated Google service account: full access.
+  - subject:
+      issuer: https://accounts.google.com
+      email: build-sa@project.iam.gserviceaccount.com
+    allow:
+      - { repo: "**", format: "*", op: "*" }
+
+  # Any Google account from the example.com domain can read.
+  - subject:
+      issuer: https://accounts.google.com
+      claims_match:
+        hd: "^example\\.com$"
+    allow:
+      - { repo: "**", op: read }
+```
+
+**Subject matchers.** Every field is optional and ANDed; an empty
+matcher matches every authenticated subject (use sparingly).
+
+| Field | Matches against | Match style |
+|---|---|---|
+| `issuer` | `AuthContext.Issuer` | exact |
+| `sub_match` | `AuthContext.ID` | regex |
+| `email` | `AuthContext.Email` | exact |
+| `claims_match` | `AuthContext.Claims[<name>]` | map of claim → regex |
+
+**Action matchers.** `repo`, `format`, and `op` accept globs:
+
+- `*` matches any single path segment (does not cross `/`).
+- `**` matches across slashes (use this for "any repo").
+- Other characters match literally — regex metacharacters in the
+  pattern are escaped, so `foo.bar` requires a literal dot.
+- An empty value means "any" (equivalent to `**`).
+
+`op` is one of `read`, `write`, or `*`.
+
+**Evaluation.** Rules are tried in order. The first rule whose
+subject matches AND whose `allow` list contains a matching action
+wins. If subject matches but no action matches, evaluation
+continues to the next rule. If no rule allows, the configured
+`default` (deny by default) decides. There is no negation / deny
+list in v1; operators who need richer expressiveness implement
+`Authorizer` themselves.
+
+**Read/write granularity.** `OpRead` covers GET/HEAD reads and
+listing endpoints (PyPI simple index, future npm registry root).
+`OpWrite` covers PUT/POST uploads. There is no separate `delete`
+or `list` op today — ocifactory does not expose a delete endpoint
+to clients, and folding listing into read avoids surprising
+operators with policy that lets a caller fetch a file they cannot
+discover.
+
+**Action repo names.** Match the OCI repo that the format handler
+uses. For Python, that is `packages/<normalized-name>` for
+artifact requests and the literal `index` for the simple-index
+list endpoint; for Maven it is the `groupId/artifactId` path. The
+echo format uses the literal `echo`. Writing a policy is a matter
+of looking at the same names that show up in the backend OCI
+registry.
+
+### 401 vs 403
+
+| Outcome | Status |
+|---|---|
+| No / invalid credential | 401 Unauthorized |
+| Issuer unreachable | 503 Service Unavailable |
+| Verified subject, lacks permission | **403 Forbidden** |
+| Authorizer itself failed | 500 Internal Server Error |
+
+The split matters for clients: 401 means "rotate / mint a token
+and retry", 403 means "your identity is fine, ask the operator
+for access".
+
 ## What's out of scope (for now)
 
-- **Authorization** — what a verified caller is allowed to do.
-  Tracked separately; today every authenticated caller can
-  read/write everything.
 - **GitHub PATs / App tokens** — opaque, not OIDC. A future
   authenticator could validate them via `api.github.com/user`,
   but it has different perf characteristics; meanwhile the
   out-of-tree pattern above is the supported path.
 - **Token revocation lists / introspection endpoints** — punt.
 - **Web UI / login flows** — API-only product.
+- **Hot-reload of the authz policy** — restart the process to
+  pick up policy changes. Operators running on Cloud Run / k8s
+  already have a clean restart story; live reload adds complexity
+  the v1 surface does not need.
