@@ -19,8 +19,8 @@ Design pillars (in priority order):
 | Area | State |
 |---|---|
 | `pkg/oci` — OCI-backed registry primitives (Add/Read/List/Delete/AppendRefs) | Done, tested with in-memory fake |
-| `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested |
-| `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested |
+| `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested. Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
+| `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
 | `pkg/handler/npm` — Routes wired up, all handlers return 501 | **Stub — next up** |
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
@@ -173,7 +173,7 @@ These are non-negotiable. Apply them to every test in the repo:
 4. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Pass `WithAuthMiddleware(authMW)` (built earlier in `runServe`) to the handler constructor.
 5. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs.
 6. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
-7. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations.
+7. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations. Copy [`docs/repos/_template.md`](docs/repos/_template.md) — it has the headings and depth `python.md` / `maven.md` use, plus inline notes on what to call out front-and-center (e.g. operator footguns that break the second invocation of the most common client command).
 8. Update the status table in this file.
 
 ## Roadmap (one step at a time)
