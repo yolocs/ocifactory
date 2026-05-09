@@ -434,6 +434,28 @@ echo format uses the literal `echo`. Writing a policy is a matter
 of looking at the same names that show up in the backend OCI
 registry.
 
+### Hot-reload
+
+The static authorizer watches the policy file and reloads on
+change. No restart is needed when an operator edits the rules.
+
+| Deploy shape | What changes | What happens |
+|---|---|---|
+| Plain file mount, edit in place | The file's contents | fsnotify on the parent dir picks up `WRITE`, debounces 100ms, re-reads the path. |
+| kubernetes ConfigMap volume | `..data` symlink swap | Same watcher catches the burst of `CREATE` / `RENAME` / `REMOVE` events the kubelet emits during rotation. The path operators reference (`/etc/ocifactory/authz.yaml`) is itself a symlink to `..data/authz.yaml`, so re-reading the original path after the swap resolves to the new file. No additional configuration needed. |
+| Atomic rename (e.g. helm upgrade) | The symlink target | Same path — the watcher sees the parent directory event and reloads. |
+
+A reload that fails to parse, validate, or compile is logged at
+`WARN` and **discarded** — the previously loaded rules stay in
+effect, so a typo on disk cannot brick authorization.
+Successful reloads log at `INFO` with the rule count for an
+audit trail.
+
+The reload is atomic at the rule-set level: every concurrent
+`Authorize` call sees either the old rule set or the new one,
+never a mix. There is no per-request locking; the swap goes
+through `atomic.Pointer`.
+
 ### 401 vs 403
 
 | Outcome | Status |
@@ -455,7 +477,3 @@ for access".
   out-of-tree pattern above is the supported path.
 - **Token revocation lists / introspection endpoints** — punt.
 - **Web UI / login flows** — API-only product.
-- **Hot-reload of the authz policy** — restart the process to
-  pick up policy changes. Operators running on Cloud Run / k8s
-  already have a clean restart story; live reload adds complexity
-  the v1 surface does not need.

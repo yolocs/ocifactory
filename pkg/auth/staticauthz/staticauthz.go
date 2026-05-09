@@ -30,7 +30,7 @@
 //   - "*"  matches any single path segment (no "/")
 //   - "**" matches across path segments (including "/")
 //   - exact strings match exactly
-//   - empty matcher field = match anything (equivalent to "*")
+//   - empty matcher field = match anything (equivalent to "**")
 //
 // Subject matchers (all optional, all must match if set):
 //   - issuer: exact string match against AuthContext.Issuer
@@ -38,19 +38,43 @@
 //   - email: exact match against AuthContext.Email
 //   - claims_match: map of claim name -> regex matched against
 //     the claim value (must be a string in the verified Claims map)
+//
+// Hot-reload. An Authorizer constructed via Load remembers its
+// source path. Calling Watch(ctx) starts a goroutine that
+// reloads the file when it changes, so operators can edit a
+// mounted ConfigMap (or push a new release of a versioned
+// policy file) without restarting the server. The reload is
+// atomic at the rule-set level — concurrent Authorize calls
+// either see the old rules or the new rules, never a mix —
+// and a malformed reload is logged and discarded so a typo
+// can't take the server's policy down. See Watch for the
+// kubernetes ConfigMap symlink-swap pattern.
 package staticauthz
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/yolocs/ocifactory/pkg/auth"
+	"github.com/yolocs/ocifactory/pkg/logging"
 	"gopkg.in/yaml.v3"
 )
+
+// reloadDebounce is how long Watch waits after the last fsnotify
+// event before re-reading the config. kubernetes ConfigMap
+// updates burst many events (new timestamped dir created, symlink
+// renamed, old dir removed); the debounce coalesces them into one
+// reload.
+const reloadDebounce = 100 * time.Millisecond
 
 // Default determines the fall-through decision when no rule
 // matches. defaultDeny is the strongly-recommended setting.
@@ -100,8 +124,22 @@ type ActionMatcher struct {
 }
 
 // Authorizer is the auth.Authorizer implementation. Construct via
-// New (from raw Config) or Load (from a YAML file on disk).
+// New (from raw Config) or Load (from a YAML file on disk). The
+// compiled rule set is held in an atomic.Pointer so Watch can
+// swap it out under live traffic without locking the Authorize
+// fast path.
 type Authorizer struct {
+	rules atomic.Pointer[ruleset]
+
+	// path is the config file path captured by Load. Empty for
+	// authorizers built via New — Watch refuses to start in that
+	// case because there is no source file to re-read.
+	path string
+}
+
+// ruleset is the immutable compiled view of a Config. Reload
+// builds a new ruleset and atomically swaps it into Authorizer.
+type ruleset struct {
 	def   Default
 	rules []compiledRule
 }
@@ -133,12 +171,41 @@ type compiledAction struct {
 }
 
 // Load reads the YAML config at path, parses it, validates it,
-// compiles every regex / glob, and returns an Authorizer ready to
-// answer Authorize calls.
+// compiles every regex / glob, and returns an Authorizer ready
+// to answer Authorize calls. The path is remembered so a
+// subsequent Watch(ctx) can pick up changes.
 func Load(path string) (*Authorizer, error) {
 	if path == "" {
 		return nil, errors.New("staticauthz: empty config path")
 	}
+	rs, err := loadRuleset(path)
+	if err != nil {
+		return nil, err
+	}
+	a := &Authorizer{path: path}
+	a.rules.Store(rs)
+	return a, nil
+}
+
+// New builds an Authorizer from an in-memory Config. Useful for
+// tests and for callers building rules programmatically. An
+// Authorizer built via New has no source path, so Watch returns
+// an error if called on it.
+func New(cfg Config) (*Authorizer, error) {
+	rs, err := compileRuleset(cfg)
+	if err != nil {
+		return nil, err
+	}
+	a := &Authorizer{}
+	a.rules.Store(rs)
+	return a, nil
+}
+
+// Path returns the source path captured by Load. Empty for
+// authorizers built via New.
+func (a *Authorizer) Path() string { return a.path }
+
+func loadRuleset(path string) (*ruleset, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("staticauthz: read %q: %w", path, err)
@@ -147,16 +214,14 @@ func Load(path string) (*Authorizer, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("staticauthz: parse %q: %w", path, err)
 	}
-	a, err := New(cfg)
+	rs, err := compileRuleset(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("staticauthz: invalid config %q: %w", path, err)
 	}
-	return a, nil
+	return rs, nil
 }
 
-// New builds an Authorizer from an in-memory Config. Useful for
-// tests and for callers building rules programmatically.
-func New(cfg Config) (*Authorizer, error) {
+func compileRuleset(cfg Config) (*ruleset, error) {
 	def := cfg.Default
 	switch def {
 	case "":
@@ -174,7 +239,7 @@ func New(cfg Config) (*Authorizer, error) {
 		}
 		rules = append(rules, cr)
 	}
-	return &Authorizer{def: def, rules: rules}, nil
+	return &ruleset{def: def, rules: rules}, nil
 }
 
 func compileRule(r Rule) (compiledRule, error) {
@@ -250,7 +315,8 @@ func (a *Authorizer) Authorize(_ context.Context, ac *auth.AuthContext, act auth
 		// invoking the authorizer directly shouldn't crash.
 		return auth.ErrUnauthorized
 	}
-	for _, r := range a.rules {
+	rs := a.rules.Load()
+	for _, r := range rs.rules {
 		if !r.subject.matches(ac) {
 			continue
 		}
@@ -260,10 +326,118 @@ func (a *Authorizer) Authorize(_ context.Context, ac *auth.AuthContext, act auth
 			}
 		}
 	}
-	if a.def == DefaultAllow {
+	if rs.def == DefaultAllow {
 		return nil
 	}
 	return auth.ErrUnauthorized
+}
+
+// Watch starts a goroutine that reloads the config when its
+// source file changes. Returns nil immediately on success — the
+// watcher runs until ctx is canceled. Returns an error
+// synchronously if the authorizer was built via New (no source
+// path) or fsnotify failed to initialize.
+//
+// Watch is designed for kubernetes ConfigMap volume mounts. K8s
+// updates a ConfigMap by writing a new timestamped directory
+// alongside the existing one and atomically renaming the
+// "..data" symlink — the file path operators reference
+// (/etc/ocifactory/authz.yaml) is itself a symlink to
+// "..data/authz.yaml", so its inode changes on every update and
+// fsnotify on the file path alone misses the swap. We watch the
+// containing directory, debounce the burst of events, and
+// re-read the original path so the symlink chain resolves to the
+// new file.
+//
+// Reload errors (file unreadable, YAML parse failure, regex
+// invalid) are logged at WARN and discarded — the previously
+// loaded rules stay in effect so a typo on disk doesn't take
+// authorization down.
+func (a *Authorizer) Watch(ctx context.Context) error {
+	if a.path == "" {
+		return errors.New("staticauthz: Watch requires Authorizer built via Load (no source path on this instance)")
+	}
+	abs, err := filepath.Abs(a.path)
+	if err != nil {
+		return fmt.Errorf("staticauthz: resolve %q: %w", a.path, err)
+	}
+	dir := filepath.Dir(abs)
+
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("staticauthz: fsnotify: %w", err)
+	}
+	if err := w.Add(dir); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("staticauthz: watch %q: %w", dir, err)
+	}
+
+	logger := logging.FromContext(ctx)
+	go a.watchLoop(ctx, w, logger)
+	return nil
+}
+
+// watchLoop is the goroutine spun up by Watch. It coalesces the
+// burst of fsnotify events k8s emits during a ConfigMap rotation
+// into a single reload after reloadDebounce of quiet, and exits
+// when ctx is canceled.
+func (a *Authorizer) watchLoop(ctx context.Context, w *fsnotify.Watcher, logger *slog.Logger) {
+	defer w.Close()
+
+	var (
+		timer  *time.Timer
+		timerC <-chan time.Time
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			// Any event in the directory could indicate the
+			// file was rewritten in place or that the k8s
+			// "..data" symlink was swapped. We don't filter on
+			// event Name because the symlink chain hides the
+			// actual filename being touched; reloading is
+			// cheap and idempotent.
+			if timer == nil {
+				timer = time.NewTimer(reloadDebounce)
+				timerC = timer.C
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(reloadDebounce)
+			}
+		case <-timerC:
+			timer = nil
+			timerC = nil
+			a.reload(ctx, logger)
+		case err, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			logger.WarnContext(ctx, "staticauthz: fsnotify error", "error", err, "path", a.path)
+		}
+	}
+}
+
+// reload re-reads the source file and atomically swaps the
+// rule set on success. Failures are logged and the previous
+// rule set stays in effect.
+func (a *Authorizer) reload(ctx context.Context, logger *slog.Logger) {
+	rs, err := loadRuleset(a.path)
+	if err != nil {
+		logger.WarnContext(ctx, "staticauthz: reload failed; keeping previous policy", "error", err, "path", a.path)
+		return
+	}
+	a.rules.Store(rs)
+	logger.InfoContext(ctx, "staticauthz: policy reloaded", "path", a.path, "rules", len(rs.rules))
 }
 
 func (s compiledSubject) matches(ac *auth.AuthContext) bool {

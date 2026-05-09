@@ -480,6 +480,12 @@ func buildAuthn(ctx context.Context, cfg *serveConfig) (auth.Authenticator, erro
 // is set the static config file is loaded; any parse / regex
 // error fails the startup so policy mistakes never silently let
 // callers through.
+//
+// On success a goroutine is spun up to watch the config file and
+// reload on changes. The watcher is wired against the request
+// context so it shuts down with the rest of the server. The
+// reloader handles kubernetes ConfigMap volume mounts (atomic
+// symlink swap on update) — see staticauthz.Authorizer.Watch.
 func buildAuthz(ctx context.Context, cfg *serveConfig) (auth.Authorizer, error) {
 	logger := logging.NewFromEnv("OCIFACTORY_")
 	if cfg.AuthzConfig == "" {
@@ -492,7 +498,10 @@ func buildAuthz(ctx context.Context, cfg *serveConfig) (auth.Authorizer, error) 
 	if err != nil {
 		return nil, fmt.Errorf("load authz config %q: %w", cfg.AuthzConfig, err)
 	}
-	logger.InfoContext(ctx, "authorization policy loaded", "path", cfg.AuthzConfig)
+	if err := a.Watch(logging.WithLogger(ctx, logger)); err != nil {
+		return nil, fmt.Errorf("watch authz config %q: %w", cfg.AuthzConfig, err)
+	}
+	logger.InfoContext(ctx, "authorization policy loaded; watching for changes", "path", cfg.AuthzConfig)
 	return a, nil
 }
 
