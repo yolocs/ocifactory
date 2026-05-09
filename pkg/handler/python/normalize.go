@@ -18,7 +18,8 @@ var pep503Separators = regexp.MustCompile(`[-_.]+`)
 // name, so a `pip install foo-bar` after `twine upload Foo_Bar` resolves
 // to the same package — the behaviour a spec-conforming PyPI client
 // expects. Migration policy for un-normalized data already in an OCI
-// backend is documented in docs/repos/python.md.
+// backend is documented in docs/repos/python.md, section "Migration:
+// pre-existing un-normalized data in the OCI backend".
 func normalize(name string) string {
 	return pep503Separators.ReplaceAllString(strings.ToLower(name), "-")
 }

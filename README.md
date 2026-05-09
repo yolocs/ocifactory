@@ -24,14 +24,18 @@ service.
 
 ## Supported formats
 
-| Format | Client | Status |
-|---|---|---|
-| Maven | `mvn`, `gradle` | ✅ Functional |
-| PyPI  | `pip`, `twine`  | ✅ Functional |
-| npm   | `npm`, `yarn`, `pnpm` | 🚧 In progress (routes wired, handlers pending) |
-| Go module proxy | `go mod`        | ⏳ Planned |
-| Debian / apt    | `apt-get`       | ⏳ Planned |
-| Pull-through caching of upstreams | — | ⏳ Phase 4 |
+| Format | Client | Status | Docs |
+|---|---|---|---|
+| Maven | `mvn`, `gradle` | ✅ Functional | [`docs/repos/maven.md`](docs/repos/maven.md) |
+| PyPI  | `pip`, `twine`  | ✅ Functional | [`docs/repos/python.md`](docs/repos/python.md) |
+| npm   | `npm`, `yarn`, `pnpm` | 🚧 In progress (routes wired, handlers pending) | — |
+| Go module proxy | `go mod`        | ⏳ Planned | — |
+| Debian / apt    | `apt-get`       | ⏳ Planned | — |
+| Pull-through caching of upstreams | — | ⏳ Phase 4 | — |
+
+Per-format operator guides live under [`docs/repos/`](docs/repos/) — URL
+layouts, supported client commands, OCI storage shape, knobs, and known
+limitations.
 
 ## Quickstart
 
@@ -52,7 +56,7 @@ Every runtime knob is a CLI flag with a matching env var — no config files.
 Common ones: `PORT`, `OCIFACTORY_REPO_TYPE`, `OCIFACTORY_BACKEND_REGISTRY`,
 `OCIFACTORY_AUTHN_*`, `OCIFACTORY_BACKEND_AUTH_*`, `OCIFACTORY_LOG_LEVEL`,
 `OCIFACTORY_LOG_FORMAT`. See [`docs/auth.md`](docs/auth.md) for the auth
-options.
+options and [`docs/repos/`](docs/repos/) for per-format guides.
 
 ## Architecture
 
