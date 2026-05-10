@@ -80,14 +80,7 @@ const (
 	flagBackendAuthStaticEnvUserEnv     = "backend-auth-staticenv-user-env"
 	flagBackendAuthStaticEnvPasswordEnv = "backend-auth-staticenv-password-env"
 	flagBackendAuthDockerConfigPath     = "backend-auth-dockerconfig-path"
-	flagDefaultNamespaceAllowAll        = "default-namespace-allow-all"
 )
-
-// defaultNamespaceName is the synthetic namespace surfaced by the
-// `--default-namespace-allow-all` operator escape hatch. It is the only
-// name the shim materialises; every other namespace still flows through
-// the real Store.
-const defaultNamespaceName = "default"
 
 // serveConfig is the typed view of the resolved CLI/env/default
 // configuration. Populated by viper.Unmarshal, which uses viper's
@@ -116,8 +109,6 @@ type serveConfig struct {
 	BackendAuthStaticEnvUserEnv     string   `mapstructure:"backend-auth-staticenv-user-env"`
 	BackendAuthStaticEnvPasswordEnv string   `mapstructure:"backend-auth-staticenv-password-env"`
 	BackendAuthDockerConfigPath     string   `mapstructure:"backend-auth-dockerconfig-path"`
-
-	DefaultNamespaceAllowAll bool `mapstructure:"default-namespace-allow-all"`
 
 	// RegistryURL is computed by Validate from BackendRegistry. Not
 	// populated by Unmarshal — the `-` tag tells mapstructure to
@@ -320,13 +311,6 @@ func registerServeFlags(flags *pflag.FlagSet) {
 	flags.String(flagBackendAuthDockerConfigPath, "",
 		"Path to a docker-format config.json for the dockerconfig backend "+
 			"auth kind. Empty = ~/.docker/config.json.")
-
-	flags.Bool(flagDefaultNamespaceAllowAll, false,
-		"Synthesize a 'default' namespace with an allow-all policy "+
-			"when none is configured in the backend. Intended for "+
-			"local development and tests — production deployments "+
-			"must register namespaces explicitly. A loud WARN log "+
-			"is emitted at startup when this flag is set.")
 }
 
 func runServe(ctx context.Context, cfg *serveConfig) error {
@@ -365,7 +349,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := buildNamespaceRegistry(ctx, r, cfg)
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
 		mh, err := maven.NewHandler(nsReg, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
@@ -379,7 +363,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := buildNamespaceRegistry(ctx, r, cfg)
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
 		ph, err := python.NewHandler(nsReg,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
@@ -498,61 +482,4 @@ func buildRecorder(enabled bool) (metrics.Recorder, http.Handler) {
 	}
 	p := metrics.NewPrometheus(nil)
 	return p, p.Handler()
-}
-
-// buildNamespaceRegistry constructs the data-plane wrapper that fronts
-// every format handler. The Store reads namespace metadata from the
-// same OCI backend the wrapper writes artifacts to — there's no
-// separate metadata database. When `--default-namespace-allow-all` is
-// set the Store is wrapped in a shim that synthesizes a "default"
-// namespace with an allow-all policy for any caller that authenticated
-// upstream; every other namespace still flows through the real Store.
-func buildNamespaceRegistry(ctx context.Context, inner *oci.Registry, cfg *serveConfig) *namespace.Registry {
-	logger := logging.NewFromEnv("OCIFACTORY_")
-	store := namespace.NewStore(inner)
-	var specStore namespace.SpecStore = store
-	if cfg.DefaultNamespaceAllowAll {
-		logger.WarnContext(ctx, "--default-namespace-allow-all set; the 'default' namespace allows all requests; do not use in production")
-		specStore = defaultNamespaceAllowAllStore{Store: store}
-	}
-	return namespace.NewRegistry(inner, specStore)
-}
-
-// defaultNamespaceAllowAllStore wraps a [*namespace.Store] and
-// synthesizes a "default" namespace with an allow-all policy when the
-// underlying Store reports it as not found. Every other namespace is
-// served verbatim from the inner Store.
-//
-// Used only when the operator sets `--default-namespace-allow-all`
-// (`OCIFACTORY_DEFAULT_NAMESPACE_ALLOW_ALL=true`); production
-// deployments register namespaces explicitly and this shim never sees
-// the request.
-type defaultNamespaceAllowAllStore struct {
-	*namespace.Store
-}
-
-// Get returns the namespace as configured by the underlying Store. The
-// "default" namespace is materialised with an allow-all policy when
-// (and only when) the inner Store reports it as not found, so an
-// operator who later registers a real "default" namespace transparently
-// takes over — no restart required.
-func (d defaultNamespaceAllowAllStore) Get(ctx context.Context, name string) (*namespace.Namespace, error) {
-	ns, err := d.Store.Get(ctx, name)
-	if err != nil && name == defaultNamespaceName && errors.Is(err, namespace.ErrNotFound) {
-		return &namespace.Namespace{
-			Name: defaultNamespaceName,
-			Spec: namespace.Spec{
-				Policy: namespace.Policy{
-					// Match any authenticated subject for both ops.
-					// SubMatch=".*" anchored to ^$ accepts any ID; the
-					// authn middleware has already rejected
-					// unauthenticated callers by the time the wrapper
-					// runs.
-					Readers: []namespace.SubjectMatcher{{SubMatch: ".*"}},
-					Writers: []namespace.SubjectMatcher{{SubMatch: ".*"}},
-				},
-			},
-		}, nil
-	}
-	return ns, err
 }

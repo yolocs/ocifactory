@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -11,10 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
-	"github.com/yolocs/ocifactory/pkg/namespace"
-	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
 
@@ -188,7 +184,6 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: flagBackendAuthStaticEnvUserEnv, flagName: flagBackendAuthStaticEnvUserEnv},
 		{name: flagBackendAuthStaticEnvPasswordEnv, flagName: flagBackendAuthStaticEnvPasswordEnv},
 		{name: flagBackendAuthDockerConfigPath, flagName: flagBackendAuthDockerConfigPath},
-		{name: flagDefaultNamespaceAllowAll, flagName: flagDefaultNamespaceAllowAll},
 	}
 
 	for _, tc := range tests {
@@ -273,121 +268,5 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("Unmarshal mismatch (-want +got):\n%s", diff)
-	}
-}
-
-// TestDefaultNamespaceAllowAllStore_GetSynthesizesDefault verifies the
-// shim materialises a "default" namespace with an allow-all-shaped
-// policy when (and only when) the underlying Store reports NotFound
-// for it. Every other namespace passes through verbatim.
-func TestDefaultNamespaceAllowAllStore_GetSynthesizesDefault(t *testing.T) {
-	t.Parallel()
-
-	fake := oci.NewFakeRegistry()
-	store := namespace.NewStore(fake)
-	shim := defaultNamespaceAllowAllStore{Store: store}
-
-	tests := []struct {
-		name       string
-		seed       *namespace.Namespace
-		query      string
-		wantPolicy bool
-		wantErr    error
-	}{
-		{
-			name:       "default synthesized when not stored",
-			query:      defaultNamespaceName,
-			wantPolicy: true,
-		},
-		{
-			name:       "default served from store when registered",
-			seed:       &namespace.Namespace{Name: defaultNamespaceName, Spec: namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}}}}},
-			query:      defaultNamespaceName,
-			wantPolicy: true,
-		},
-		{
-			name:    "other namespace surfaces NotFound verbatim",
-			query:   "alpha",
-			wantErr: namespace.ErrNotFound,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			fake := oci.NewFakeRegistry()
-			store := namespace.NewStore(fake)
-			shim := defaultNamespaceAllowAllStore{Store: store}
-			ctx := t.Context()
-			if tc.seed != nil {
-				if err := store.Put(ctx, tc.seed); err != nil {
-					t.Fatalf("seed Put: %v", err)
-				}
-			}
-
-			got, err := shim.Get(ctx, tc.query)
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("Get err = %v, want errors.Is(%v)", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Get err = %v, want nil", err)
-			}
-			if got == nil {
-				t.Fatalf("Get returned nil namespace")
-			}
-			if got.Name != tc.query {
-				t.Errorf("Get name = %q, want %q", got.Name, tc.query)
-			}
-			// The default-synthesized policy uses SubMatch=".*" on
-			// both Readers and Writers; the seeded path tests
-			// pass-through. Either way the returned spec must
-			// validate.
-			if err := got.Spec.Policy.Validate(); err != nil {
-				t.Errorf("returned spec failed Validate: %v", err)
-			}
-		})
-	}
-
-	// Sanity: the shim is itself a SpecStore (compile-time check via
-	// var-of-interface trick; the var is the canonical Go idiom).
-	var _ namespace.SpecStore = shim
-	// Static-warning escape — fake/store kept alive across the
-	// parallel subtests above so a future refactor that captures
-	// them doesn't surprise.
-	_ = fake
-	_ = store
-}
-
-// TestDefaultNamespaceAllowAllStore_AllowAllPolicyAdmitsAnonymous
-// verifies the synthesized policy admits an [auth.AlwaysAnonymous]
-// AuthContext — the canonical local-dev caller. Lives here rather
-// than in pkg/namespace because the shim itself is a serve-command
-// concern.
-func TestDefaultNamespaceAllowAllStore_AllowAllPolicyAdmitsAnonymous(t *testing.T) {
-	t.Parallel()
-
-	fake := oci.NewFakeRegistry()
-	store := namespace.NewStore(fake)
-	shim := defaultNamespaceAllowAllStore{Store: store}
-
-	ns, err := shim.Get(t.Context(), defaultNamespaceName)
-	if err != nil {
-		t.Fatalf("Get default: %v", err)
-	}
-	az, err := namespace.NewPolicyAuthorizer(ns.Spec.Policy)
-	if err != nil {
-		t.Fatalf("NewPolicyAuthorizer: %v", err)
-	}
-	// auth.AlwaysAnonymous emits Issuer="anonymous"/ID="anonymous".
-	// The SubMatch=".*" matcher must accept it for both read and write.
-	subject := &auth.AuthContext{Issuer: "anonymous", ID: "anonymous"}
-	for _, op := range []auth.Op{auth.OpRead, auth.OpWrite} {
-		if err := az.Authorize(t.Context(), subject, op); err != nil {
-			t.Errorf("Authorize(%s) for anonymous subject = %v, want allow", op, err)
-		}
 	}
 }

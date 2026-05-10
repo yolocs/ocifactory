@@ -88,16 +88,6 @@ type RegistryBackend interface {
 	DeleteTagFiles(ctx context.Context, repo string, tag string) error
 }
 
-// SpecStore is the read-side subset of [*Store] the data-plane wrapper
-// consumes. Pinned as an interface so the serve command can wrap a
-// real [*Store] with a synthetic-namespace shim (e.g. for the
-// `--default-namespace-allow-all` operator escape hatch) without
-// reaching into Store internals. Production passes [*Store] directly.
-type SpecStore interface {
-	Get(ctx context.Context, name string) (*Namespace, error)
-	SetMutationHook(hook func(name string))
-}
-
 // Registry is the data-plane wrapper that holds the cross-namespace
 // state — the authorizer cache, the package-index dedupe set, the
 // pluggable authz factory — and hands out per-namespace
@@ -116,7 +106,7 @@ type SpecStore interface {
 // authz and OwningRepo prefixing happen transparently.
 type Registry struct {
 	inner       RegistryBackend
-	store       SpecStore
+	store       *Store
 	cache       *policyCache
 	indexed     *expirable.LRU[string, struct{}]
 	indexSuffix string
@@ -170,7 +160,7 @@ func WithPolicyCacheTTL(ttl time.Duration) RegistryOption {
 // authorizer — failing to use NewRegistry (e.g. constructing the
 // fields by hand in a test) means admin mutations only take effect
 // after the cache TTL expires.
-func NewRegistry(inner RegistryBackend, store SpecStore, opts ...RegistryOption) *Registry {
+func NewRegistry(inner RegistryBackend, store *Store, opts ...RegistryOption) *Registry {
 	r := &Registry{
 		inner:       inner,
 		store:       store,

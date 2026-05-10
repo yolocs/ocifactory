@@ -27,6 +27,9 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/yolocs/ocifactory/pkg/auth/backend"
+	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // zotImage matches the version pinned by pkg/oci's streaming
@@ -79,6 +82,18 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	binary := buildBinary(t)
 
 	backendRepo := "ocifactory-int"
+	// Seed the "default" namespace directly through the Store before
+	// the subprocess starts. The data-plane wrapper polls Store.Get
+	// on demand, so the namespace just needs to exist by the time
+	// the first client request arrives — but doing it here keeps the
+	// harness deterministic and avoids racing with the first GET.
+	//
+	// The seeded policy admits the AlwaysAnonymous AuthContext the
+	// subprocess installs via --disable-authn. Production
+	// deployments register namespaces with real subject matchers and
+	// never use AlwaysAnonymous.
+	seedDefaultNamespace(t, ctx, zotURL, backendRepo)
+
 	logPath := filepath.Join(t.TempDir(), "ocifactory.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -107,11 +122,6 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 		// "anonymous" is the default but pin it explicitly so the
 		// test isn't sensitive to default changes.
 		"--backend-auth-kind=anonymous",
-		// Materialise the "default" namespace so integration tests
-		// can drive real clients at /default/... without an admin
-		// namespace-Put dance. Production deployments must register
-		// namespaces explicitly.
-		"--default-namespace-allow-all",
 	}
 	args = append(args, extraArgs...)
 
@@ -278,5 +288,35 @@ func SkipIfMissing(t *testing.T, bins ...string) {
 		if _, err := exec.LookPath(b); err != nil {
 			t.Skipf("required binary %q not found on PATH: %v", b, err)
 		}
+	}
+}
+
+// seedDefaultNamespace writes a "default" namespace into the same OCI
+// backend the ocifactory subprocess will read from. The seeded policy
+// admits the AlwaysAnonymous AuthContext that --disable-authn installs.
+//
+// Tests share zot but not the namespace metadata: each test harness
+// owns its own backendRepo prefix, so concurrent integration tests do
+// not race on the same metadata tag.
+func seedDefaultNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo string) {
+	t.Helper()
+	regURL := &url.URL{Scheme: zotURL.Scheme, Host: zotURL.Host, Path: "/" + backendRepo}
+	// Anonymous matches what the subprocess uses
+	// (--backend-auth-kind=anonymous); pin it so a default change
+	// doesn't flip behaviour silently.
+	inner, err := oci.NewRegistry(regURL, oci.WithBackendAuth(backend.Anonymous()))
+	if err != nil {
+		t.Fatalf("seed: oci.NewRegistry: %v", err)
+	}
+	store := namespace.NewStore(inner)
+	policy := namespace.Policy{
+		Readers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+		Writers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+	}
+	if err := store.Put(ctx, &namespace.Namespace{
+		Name: "default",
+		Spec: namespace.Spec{Policy: policy},
+	}); err != nil {
+		t.Fatalf("seed default namespace: %v", err)
 	}
 }
