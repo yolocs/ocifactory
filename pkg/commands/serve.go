@@ -361,7 +361,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
 		nr := namespace.NewRegistry(r, namespace.NewStore(r), namespace.WithDefaultNamespaceAllowAll(cfg.DefaultNamespaceAllowAll))
-		mh, err := maven.NewHandler(nr, maven.WithAuthMiddleware(authMW))
+		mh, err := maven.NewHandler(r,
+			maven.WithNamespaceRegistry(func(ns string) handler.Registry { return nr.For(ns) }),
+			maven.WithAuthMiddleware(authMW),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -375,7 +378,8 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
 		nr := namespace.NewRegistry(r, namespace.NewStore(r), namespace.WithDefaultNamespaceAllowAll(cfg.DefaultNamespaceAllowAll))
-		ph, err := python.NewHandler(nr,
+		ph, err := python.NewHandler(r,
+			python.WithNamespaceRegistry(func(ns string) handler.Registry { return nr.For(ns) }),
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),

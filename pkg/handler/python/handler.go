@@ -91,7 +91,8 @@ var (
 )
 
 type Handler struct {
-	registry       any
+	registry       handler.Registry
+	namespaceReg   func(string) handler.Registry
 	renderer       *renderer.Renderer
 	indexCache     *simpleIndexCache
 	authMW         func(http.Handler) http.Handler
@@ -104,6 +105,7 @@ type Option func(*handlerConfig)
 type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
 	authMW              func(http.Handler) http.Handler
+	namespaceReg        func(string) handler.Registry
 	maxUploadBytes      int64
 }
 
@@ -142,8 +144,19 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
+// WithNamespaceRegistry installs a per-request registry resolver used by
+// namespace-prefixed routes. Production serve wiring supplies this option so
+// every request is authorized and scoped by namespace before it reaches the
+// OCI backend. Tests that exercise only protocol translation omit it and use
+// the legacy root routes backed by registry directly.
+func WithNamespaceRegistry(f func(string) handler.Registry) Option {
+	return func(c *handlerConfig) {
+		c.namespaceReg = f
+	}
+}
+
 // NewHandler creates a new Handler.
-func NewHandler(registry any, opts ...Option) (*Handler, error) {
+func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL,
 		maxUploadBytes:      DefaultMaxUploadBytes,
@@ -160,6 +173,7 @@ func NewHandler(registry any, opts ...Option) (*Handler, error) {
 	}
 	return &Handler{
 		registry:       registry,
+		namespaceReg:   cfg.namespaceReg,
 		renderer:       r,
 		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
 		authMW:         cfg.authMW,
@@ -187,33 +201,23 @@ func (h *Handler) Mux() http.Handler {
 		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
-	// Handle both pip and twine operations
-	nsRouter := router.PathPrefix("/{namespace}").Subrouter()
-
-	// Handle both pip and twine operations.
-	nsRouter.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
-
-	nsRouter.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
-
-	nsRouter.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
-	nsRouter.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
-
-	nsRouter.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
-	nsRouter.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
-
-	if !h.usesNamespaceRegistry() {
-		// Legacy root routes keep unit tests that pass a raw handler.Registry focused
-		// on handler semantics; production serve always passes a namespace registry
-		// and clients should use the namespace-prefixed routes above.
-		router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
-		router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
-		router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
-		router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
-		router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
-		router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
+	if h.namespaceReg != nil {
+		nsRouter := router.PathPrefix("/{namespace}").Subrouter()
+		registerRoutes(nsRouter, h)
+	} else {
+		registerRoutes(router, h)
 	}
 
 	return router
+}
+
+func registerRoutes(router *mux.Router, h *Handler) {
+	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
+	router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
+	router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
+	router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
+	router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
+	router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
 }
 
 // handleSimpleIndex renders the root simple index — the list of every
@@ -669,24 +673,11 @@ func detectMediaType(filename string) string {
 	return "application/octet-stream"
 }
 
-func (h *Handler) usesNamespaceRegistry() bool {
-	_, ok := h.registry.(interface {
-		For(string) *namespace.ScopedRegistry
-	})
-	return ok
-}
-
 func (h *Handler) scopedRegistry(req *http.Request) handler.Registry {
-	switch r := h.registry.(type) {
-	case interface {
-		For(string) *namespace.ScopedRegistry
-	}:
-		return r.For(namespaceFromRequest(req))
-	case handler.Registry:
-		return r
-	default:
-		panic(fmt.Sprintf("registry has unsupported type %T", h.registry))
+	if h.namespaceReg != nil {
+		return h.namespaceReg(namespaceFromRequest(req))
 	}
+	return h.registry
 }
 
 func namespaceFromRequest(req *http.Request) string {

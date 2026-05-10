@@ -50,15 +50,17 @@ var (
 )
 
 type Handler struct {
-	registry any
-	authMW   func(http.Handler) http.Handler
+	registry     handler.Registry
+	namespaceReg func(string) handler.Registry
+	authMW       func(http.Handler) http.Handler
 }
 
 // Option configures optional Handler behaviour.
 type Option func(*handlerConfig)
 
 type handlerConfig struct {
-	authMW func(http.Handler) http.Handler
+	authMW       func(http.Handler) http.Handler
+	namespaceReg func(string) handler.Registry
 }
 
 // WithAuthMiddleware installs an authentication middleware on
@@ -70,7 +72,18 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
-func NewHandler(registry any, opts ...Option) (*Handler, error) {
+// WithNamespaceRegistry installs a per-request registry resolver used by
+// namespace-prefixed routes. Production serve wiring supplies this option so
+// every request is authorized and scoped by namespace before it reaches the
+// OCI backend. Tests that exercise only protocol translation omit it and use
+// the legacy root routes backed by registry directly.
+func WithNamespaceRegistry(f func(string) handler.Registry) Option {
+	return func(c *handlerConfig) {
+		c.namespaceReg = f
+	}
+}
+
+func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -78,7 +91,7 @@ func NewHandler(registry any, opts ...Option) (*Handler, error) {
 	if registry == nil {
 		return nil, fmt.Errorf("registry must not be nil")
 	}
-	return &Handler{registry: registry, authMW: cfg.authMW}, nil
+	return &Handler{registry: registry, namespaceReg: cfg.namespaceReg, authMW: cfg.authMW}, nil
 }
 
 func (h *Handler) Mux() http.Handler {
@@ -89,38 +102,21 @@ func (h *Handler) Mux() http.Handler {
 		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
-	nsRouter := router.PathPrefix("/{namespace}/maven2").Subrouter()
-
-	// 1. Archetype Catalog
-	// Handles GET, HEAD, PUT, POST for /{namespace}/maven2/archetype-catalog.xml
-	nsRouter.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-
-	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
-	// Handles GET, HEAD, PUT, POST for snapshot metadata files.
-	// Example: /{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml
-	nsRouter.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-
-	// 3. Artifact Metadata (e.g., group/artifact/maven-metadata.xml or group/artifact/version/maven-metadata.xml for releases)
-	// Handles GET, HEAD, PUT, POST for non-snapshot metadata files. This must be after snapshot metadata.
-	// Example: /{groupId}/{artifactId}/maven-metadata.xml
-	nsRouter.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-
-	// 4. Regular Artifact Files (e.g., group/artifact/version/file.jar)
-	// Handles GET, HEAD, PUT, POST for general artifact files. This is the most general route and must be last.
-	// Example: /{groupId}/{artifactId}/{version}/{filename.ext}
-	nsRouter.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-
-	if !h.usesNamespaceRegistry() {
-		// Legacy root routes keep unit tests that pass a raw handler.Registry focused
-		// on handler semantics; production serve always passes a namespace registry
-		// and clients should use /{namespace}/maven2 routes above.
-		router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-		router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-		router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
-		router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	if h.namespaceReg != nil {
+		nsRouter := router.PathPrefix("/{namespace}/maven2").Subrouter()
+		registerRoutes(nsRouter, h)
+	} else {
+		registerRoutes(router, h)
 	}
 
 	return router
+}
+
+func registerRoutes(router *mux.Router, h *Handler) {
+	router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 }
 
 // handleArchetypeCatalog handles requests for archetype-catalog.xml.
@@ -328,24 +324,11 @@ func detectMediaType(filename string) string {
 	return "application/octet-stream"
 }
 
-func (h *Handler) usesNamespaceRegistry() bool {
-	_, ok := h.registry.(interface {
-		For(string) *namespace.ScopedRegistry
-	})
-	return ok
-}
-
 func (h *Handler) scopedRegistry(req *http.Request) handler.Registry {
-	switch r := h.registry.(type) {
-	case interface {
-		For(string) *namespace.ScopedRegistry
-	}:
-		return r.For(mux.Vars(req)["namespace"])
-	case handler.Registry:
-		return r
-	default:
-		panic(fmt.Sprintf("registry has unsupported type %T", h.registry))
+	if h.namespaceReg != nil {
+		return h.namespaceReg(mux.Vars(req)["namespace"])
 	}
+	return h.registry
 }
 
 func writeRegistryError(ctx context.Context, w http.ResponseWriter, err error, public string) {

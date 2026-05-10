@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/yolocs/ocifactory/pkg/auth"
+	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
@@ -19,7 +20,7 @@ func TestNamespaceRoutes(t *testing.T) {
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
 	putMavenNamespace(t, store, "alpha", allowMavenSubjectSpec())
 	putMavenNamespace(t, store, "beta", allowMavenSubjectSpec())
-	h, err := NewHandler(reg)
+	h, err := NewHandler(fake, WithNamespaceRegistry(func(ns string) handler.Registry { return reg.For(ns) }))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestNamespaceRoutesForbidden(t *testing.T) {
 	store := namespace.NewStore(fake)
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
 	putMavenNamespace(t, store, "alpha", namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "other"}}, Writers: []namespace.SubjectMatcher{{Issuer: "other"}}}})
-	h, err := NewHandler(reg)
+	h, err := NewHandler(fake, WithNamespaceRegistry(func(ns string) handler.Registry { return reg.For(ns) }))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
