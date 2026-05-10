@@ -23,7 +23,7 @@ func TestMux_AuthGating(t *testing.T) {
 	}
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithAuthMiddleware(denyAll))
+	h, err := newHandlerWithRegistry(reg, WithAuthMiddleware(denyAll))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -34,10 +34,10 @@ func TestMux_AuthGating(t *testing.T) {
 		method string
 		path   string
 	}{
-		{name: "archetype catalog", method: http.MethodGet, path: "/archetype-catalog.xml"},
-		{name: "snapshot metadata", method: http.MethodGet, path: "/com/example/foo/1.0-SNAPSHOT/maven-metadata.xml"},
-		{name: "release metadata", method: http.MethodGet, path: "/com/example/foo/maven-metadata.xml"},
-		{name: "regular artifact", method: http.MethodPut, path: "/com/example/foo/1.0/foo-1.0.jar"},
+		{name: "archetype catalog", method: http.MethodGet, path: "/default/maven2/archetype-catalog.xml"},
+		{name: "snapshot metadata", method: http.MethodGet, path: "/default/maven2/com/example/foo/1.0-SNAPSHOT/maven-metadata.xml"},
+		{name: "release metadata", method: http.MethodGet, path: "/default/maven2/com/example/foo/maven-metadata.xml"},
+		{name: "regular artifact", method: http.MethodPut, path: "/default/maven2/com/example/foo/1.0/foo-1.0.jar"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -61,13 +61,13 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/archetype-catalog.xml", nil)
+	r := httptest.NewRequest(http.MethodGet, "/default/maven2/archetype-catalog.xml", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, r)
 	if got := w.Code; got == http.StatusUnauthorized {
@@ -85,13 +85,13 @@ func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	}))
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithAuthMiddleware(installer))
+	h, err := newHandlerWithRegistry(reg, WithAuthMiddleware(installer))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/archetype-catalog.xml", nil)
+	r := httptest.NewRequest(http.MethodGet, "/default/maven2/archetype-catalog.xml", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, r)
 	if w.Code == http.StatusUnauthorized || w.Code == http.StatusServiceUnavailable {

@@ -27,6 +27,8 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // zotImage matches the version pinned by pkg/oci's streaming
@@ -79,6 +81,8 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	binary := buildBinary(t)
 
 	backendRepo := "ocifactory-int"
+	seedDefaultNamespace(t, ctx, zotURL, backendRepo)
+
 	logPath := filepath.Join(t.TempDir(), "ocifactory.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -143,6 +147,29 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 		ZotURL:        zotURL,
 		BackendRepo:   backendRepo,
 		logFile:       logFile,
+	}
+}
+
+func seedDefaultNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo string) {
+	t.Helper()
+	backendURL, err := url.Parse(fmt.Sprintf("%s://%s/%s", zotURL.Scheme, zotURL.Host, backendRepo))
+	if err != nil {
+		t.Fatalf("parse backend URL: %v", err)
+	}
+	reg, err := oci.NewRegistry(backendURL)
+	if err != nil {
+		t.Fatalf("create namespace seed registry: %v", err)
+	}
+	store := namespace.NewStore(reg)
+	allowAnonymous := namespace.SubjectMatcher{Issuer: "anonymous"}
+	if err := store.Put(ctx, &namespace.Namespace{
+		Name: "default",
+		Spec: namespace.Spec{Policy: namespace.Policy{
+			Readers: []namespace.SubjectMatcher{allowAnonymous},
+			Writers: []namespace.SubjectMatcher{allowAnonymous},
+		}},
+	}); err != nil {
+		t.Fatalf("seed default namespace: %v", err)
 	}
 }
 

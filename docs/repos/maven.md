@@ -44,8 +44,12 @@ ocifactory.
 
 ## Quickstart
 
-After starting the server with `--allow-overwrite=true` (above),
-configure `~/.m2/settings.xml`:
+After starting the server with `--allow-overwrite=true` (above), create (or
+choose) a namespace. The examples below use `default`; see
+[`docs/namespaces.md`](../namespaces.md) for the namespace policy model and
+bootstrap options.
+
+Configure `~/.m2/settings.xml`:
 
 ```xml
 <settings>
@@ -64,7 +68,7 @@ configure `~/.m2/settings.xml`:
       <repositories>
         <repository>
           <id>ocifactory</id>
-          <url>https://ocifactory.your-domain/</url>
+          <url>https://ocifactory.your-domain/default/maven2</url>
         </repository>
       </repositories>
     </profile>
@@ -81,11 +85,11 @@ And in `pom.xml`:
 <distributionManagement>
   <repository>
     <id>ocifactory</id>
-    <url>https://ocifactory.your-domain/</url>
+    <url>https://ocifactory.your-domain/default/maven2</url>
   </repository>
   <snapshotRepository>
     <id>ocifactory</id>
-    <url>https://ocifactory.your-domain/</url>
+    <url>https://ocifactory.your-domain/default/maven2</url>
   </snapshotRepository>
 </distributionManagement>
 ```
@@ -101,11 +105,11 @@ for resolve.
 
 | Path | Purpose |
 |---|---|
-| `/{groupId}/{artifactId}/{version}/{filename}` | Regular artifact (jar, pom, sources, javadoc). |
-| `/{groupId}/{artifactId}/{version}/{filename}.{sha1,md5,sha256,sha512}` | Checksum companion. **Must arrive after the artifact it covers.** |
-| `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | Version-level snapshot metadata. |
-| `/{groupId}/{artifactId}/maven-metadata.xml` | Artifact-level metadata (mvn rewrites this on every deploy — see overwrite warning above). |
-| `/archetype-catalog.xml` | Global archetype catalog. |
+| `/{namespace}/maven2/{groupId}/{artifactId}/{version}/{filename}` | Regular artifact (jar, pom, sources, javadoc). |
+| `/{namespace}/maven2/{groupId}/{artifactId}/{version}/{filename}.{sha1,md5,sha256,sha512}` | Checksum companion. **Must arrive after the artifact it covers.** |
+| `/{namespace}/maven2/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | Version-level snapshot metadata. |
+| `/{namespace}/maven2/{groupId}/{artifactId}/maven-metadata.xml` | Artifact-level metadata (mvn rewrites this on every deploy — see overwrite warning above). |
+| `/{namespace}/maven2/archetype-catalog.xml` | Namespace archetype catalog. |
 
 `{groupId}` is the dotted Java group with `.` rewritten to `/`
 (e.g. `com.example.foo` → `/com/example/foo/`), matching standard
@@ -116,16 +120,16 @@ version segment.
 ### Concrete examples
 
 ```
-PUT /com/example/foo/1.0.0/foo-1.0.0.jar
-PUT /com/example/foo/1.0.0/foo-1.0.0.jar.sha1
-PUT /com/example/foo/1.0.0/foo-1.0.0.pom
-PUT /com/example/foo/1.0.0/foo-1.0.0.pom.sha1
-PUT /com/example/foo/maven-metadata.xml
-PUT /com/example/foo/maven-metadata.xml.sha1
+PUT /default/maven2/com/example/foo/1.0.0/foo-1.0.0.jar
+PUT /default/maven2/com/example/foo/1.0.0/foo-1.0.0.jar.sha1
+PUT /default/maven2/com/example/foo/1.0.0/foo-1.0.0.pom
+PUT /default/maven2/com/example/foo/1.0.0/foo-1.0.0.pom.sha1
+PUT /default/maven2/com/example/foo/maven-metadata.xml
+PUT /default/maven2/com/example/foo/maven-metadata.xml.sha1
 
 # Snapshot
-PUT /com/example/foo/1.1.0-SNAPSHOT/foo-1.1.0-20260101.123456-1.jar
-PUT /com/example/foo/1.1.0-SNAPSHOT/maven-metadata.xml
+PUT /default/maven2/com/example/foo/1.1.0-SNAPSHOT/foo-1.1.0-20260101.123456-1.jar
+PUT /default/maven2/com/example/foo/1.1.0-SNAPSHOT/maven-metadata.xml
 ```
 
 ## Path validation grammar
@@ -167,10 +171,10 @@ uploaded files as layers. The mapping from Maven URL to OCI tuple:
 
 | Maven URL | OCI repo | OCI tag | Layer name |
 |---|---|---|---|
-| `/{groupId}/{artifactId}/{version}/{filename}` | `{groupId}/{artifactId}` | `{version}` | `{filename}` |
-| `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
-| `/{groupId}/{artifactId}/maven-metadata.xml` | `{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
-| `/archetype-catalog.xml` | `archetype` | `latest` | `archetype-catalog.xml` |
+| `/{namespace}/maven2/{groupId}/{artifactId}/{version}/{filename}` | `<namespace>/{groupId}/{artifactId}` | `{version}` | `{filename}` |
+| `/{namespace}/maven2/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `<namespace>/{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
+| `/{namespace}/maven2/{groupId}/{artifactId}/maven-metadata.xml` | `<namespace>/{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
+| `/{namespace}/maven2/archetype-catalog.xml` | `<namespace>/archetype` | `latest` | `archetype-catalog.xml` |
 
 `{groupId}` keeps its slash form (`com/example/foo`), matching the URL.
 
@@ -217,12 +221,13 @@ public-by-default endpoints in the Maven format. The middleware chain
 runs **before** any route handler, so an unauthenticated request gets
 a `401 Unauthorized` before touching the OCI backend.
 
+After authentication, the namespace policy authorizes the operation:
+`readers` can resolve artifacts and metadata, and `writers` can deploy
+artifacts and metadata. Authorization is namespace-scoped rather than
+per-coordinate today. See [`docs/namespaces.md`](../namespaces.md).
+
 Configure the authenticator via `--authn-*` (or `--disable-authn` for
 local dev). See [`docs/auth.md`](../auth.md) for the full table.
-
-Authorization (per-coordinate, per-operation policy) is **not**
-implemented yet — every authenticated caller can read and write every
-artifact. Tracked by [#49](https://github.com/yolocs/ocifactory/issues/49).
 
 ## Operator knobs
 
@@ -249,9 +254,9 @@ are documented in [`docs/auth.md`](../auth.md) and
   raw `curl` deploys, custom uploaders, hand-rolled scripts — must
   construct the metadata themselves. The handler stores whatever bytes
   the client uploads, byte-for-byte.
-- **Single global archetype catalog.** `/archetype-catalog.xml` is one
-  OCI tag in one OCI repo (`archetype/latest`). Multi-tenant catalogs
-  (per-team, per-environment) are not supported.
+- **Namespace-level archetype catalog.** `/{namespace}/maven2/archetype-catalog.xml` is one
+  OCI tag in the namespace (`<namespace>/archetype:latest`). Per-package
+  archetype catalogs are not supported.
 - **No timestamp-based snapshot resolution synthesis.** Timestamped
   filenames like `foo-1.0-20260101.123456-1.jar` are stored as plain
   artifacts; the `<snapshot>` indirection in `maven-metadata.xml` is

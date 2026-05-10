@@ -97,7 +97,7 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 			"install",
 			"--no-cache-dir",
 			"--no-deps",
-			"--index-url", h.OcifactoryURL.String()+"/simple/",
+			"--index-url", h.OcifactoryURL.String()+"/default/simple/",
 			"--trusted-host", trustedHostFromBase(t, h.OcifactoryURL.String()),
 			fmt.Sprintf("%s==%s", pkgName, version),
 		)
@@ -113,7 +113,7 @@ func uploadWithTwine(t *testing.T, base string, whl *testWheel) {
 
 	cmd := exec.Command(
 		"twine", "upload",
-		"--repository-url", base+"/",
+		"--repository-url", base+"/default/",
 		"--non-interactive",
 		"--disable-progress-bar",
 		"--verbose",
@@ -140,7 +140,7 @@ func downloadAndCheck(t *testing.T, base, pkgName, version string, whl *testWhee
 		"--no-cache-dir",
 		"--no-deps",
 		"--dest", dst,
-		"--index-url", base+"/simple/",
+		"--index-url", base+"/default/simple/",
 		"--trusted-host", trustedHostFromBase(t, base),
 		fmt.Sprintf("%s==%s", pkgName, version),
 	)

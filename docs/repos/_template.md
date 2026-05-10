@@ -44,19 +44,21 @@ Client configuration (`pip.conf`, `~/.m2/settings.xml`, `~/.npmrc`,
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET …` | `/…` | … |
-| `PUT …` | `/…` | … |
+| `GET …` | `/{namespace}/…` | … |
+| `PUT …` | `/{namespace}/…` | … |
 
-Concrete examples for the most common deploys / fetches:
+Concrete examples for the most common deploys / fetches (use a real namespace
+such as `default`, `platform`, or `payments-prod`):
 
 ```
-GET /…
-PUT /…
+GET /default/…
+PUT /default/…
 ```
 
 Any path validation rules (`pkg/handler/<format>/paths.go` if you
 borrow the Maven pattern). Reject anything that could escape the OCI
-repo namespace at the handler boundary.
+repo namespace at the handler boundary. Link to [`docs/namespaces.md`](../namespaces.md)
+for the namespace policy model rather than duplicating it here.
 
 ## Supported client commands
 

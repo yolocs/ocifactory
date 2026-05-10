@@ -66,14 +66,14 @@ func TestHandlePut(t *testing.T) {
 	}{
 		{
 			name:       "valid jar",
-			path:       "/com/example/project/1.0.0/project-1.0.0.jar",
+			path:       "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar",
 			body:       "jar content",
 			wantStatus: http.StatusCreated,
 			wantFile:   true,
 		},
 		{
 			name:       "valid pom",
-			path:       "/com/example/project/1.0.0/project-1.0.0.pom",
+			path:       "/default/maven2/com/example/project/1.0.0/project-1.0.0.pom",
 			body:       "<project></project>",
 			wantStatus: http.StatusCreated,
 			wantFile:   true,
@@ -87,21 +87,21 @@ func TestHandlePut(t *testing.T) {
 		},
 		{
 			name:       "archetype catalog",
-			path:       "/archetype-catalog.xml",
+			path:       "/default/maven2/archetype-catalog.xml",
 			body:       "<archetype-catalog></archetype-catalog>",
 			wantStatus: http.StatusCreated,
 			wantFile:   true,
 		},
 		{
 			name:       "snapshot metadata",
-			path:       "/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
+			path:       "/default/maven2/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
 			body:       "<metadata></metadata>",
 			wantStatus: http.StatusCreated,
 			wantFile:   true,
 		},
 		{
 			name:       "release metadata",
-			path:       "/com/example/project/maven-metadata.xml",
+			path:       "/default/maven2/com/example/project/maven-metadata.xml",
 			body:       "<metadata></metadata>",
 			wantStatus: http.StatusCreated,
 			wantFile:   true,
@@ -113,9 +113,9 @@ func TestHandlePut(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(http.MethodPut, tc.path, strings.NewReader(tc.body))
@@ -162,7 +162,7 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "application/java-archive",
 			},
 			setupData:  "jar content",
-			path:       "/com/example/project/1.0.0/project-1.0.0.jar",
+			path:       "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "jar content",
@@ -176,14 +176,14 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "application/java-archive",
 			},
 			setupData:  "jar content",
-			path:       "/com/example/project/1.0.0/project-1.0.0.jar",
+			path:       "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar",
 			method:     http.MethodHead,
 			wantStatus: http.StatusOK,
 			wantBody:   "",
 		},
 		{
 			name:       "file not found",
-			path:       "/com/example/project/1.0.0/project-1.0.0.jar",
+			path:       "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar",
 			method:     http.MethodGet,
 			wantStatus: http.StatusNotFound,
 		},
@@ -202,7 +202,7 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "text/xml",
 			},
 			setupData:  "<archetype-catalog></archetype-catalog>",
-			path:       "/archetype-catalog.xml",
+			path:       "/default/maven2/archetype-catalog.xml",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "<archetype-catalog></archetype-catalog>",
@@ -216,7 +216,7 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "text/xml",
 			},
 			setupData:  "<metadata></metadata>",
-			path:       "/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
+			path:       "/default/maven2/com/example/project/1.0-SNAPSHOT/maven-metadata.xml",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "<metadata></metadata>",
@@ -230,7 +230,7 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "text/xml",
 			},
 			setupData:  "<metadata></metadata>",
-			path:       "/com/example/project/maven-metadata.xml",
+			path:       "/default/maven2/com/example/project/maven-metadata.xml",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "<metadata></metadata>",
@@ -249,9 +249,9 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
@@ -302,7 +302,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 		MediaType:  "application/java-archive",
 	}
 	const setupData = "jar content"
-	const reqPath = "/com/example/project/1.0.0/project-1.0.0.jar"
+	const reqPath = "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar"
 	const presigned = "https://cdn.example.com/blob?signature=xyz"
 
 	cases := []struct {
@@ -362,7 +362,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 				redirectErr:  tc.redirectErr,
 			}
 
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -390,6 +390,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 }
 
 func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
+	p = strings.TrimPrefix(p, "default/maven2/")
 	if strings.HasPrefix(p, "archetype-catalog.xml") {
 		return &oci.RepoFile{
 			OwningRepo: "archetype",
@@ -459,14 +460,14 @@ func TestHandlePut_ReuploadConflict(t *testing.T) {
 
 			reg := oci.NewFakeRegistry()
 			reg.AllowOverwrite = tc.allowOverwrite
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
 			mux := h.Mux()
 
 			send := func(body string) *httptest.ResponseRecorder {
-				req := httptest.NewRequest(http.MethodPut, "/com/example/project/1.0.0/project-1.0.0.jar", strings.NewReader(body))
+				req := httptest.NewRequest(http.MethodPut, "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar", strings.NewReader(body))
 				rec := httptest.NewRecorder()
 				mux.ServeHTTP(rec, req)
 				return rec

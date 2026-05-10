@@ -171,9 +171,9 @@ func TestHandlePut(t *testing.T) {
 
 			registry := oci.NewFakeRegistry()
 
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			// Create a multipart form request
@@ -211,7 +211,7 @@ func TestHandlePut(t *testing.T) {
 			}
 
 			// Create the request
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 			req.Header.Set("Content-Type", w.FormDataContentType())
 
 			resp := httptest.NewRecorder()
@@ -277,7 +277,7 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "application/x-wheel+zip",
 			},
 			setupData:  "wheel content",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/default/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "wheel content",
@@ -291,20 +291,20 @@ func TestHandleGet(t *testing.T) {
 				MediaType:  "application/x-wheel+zip",
 			},
 			setupData:  "wheel content",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/default/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodHead,
 			wantStatus: http.StatusOK,
 			wantBody:   "",
 		},
 		{
 			name:       "file not found",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/default/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodGet,
 			wantStatus: http.StatusNotFound,
 		},
 		{
 			name:       "invalid path",
-			path:       "/packages/example-pkg",
+			path:       "/default/packages/example-pkg",
 			method:     http.MethodGet,
 			wantStatus: http.StatusNotFound,
 		},
@@ -322,16 +322,16 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
 
 			// Set path values manually since we're not using a real router
-			if strings.HasPrefix(tc.path, "/packages/") && strings.Count(tc.path, "/") >= 4 {
-				parts := strings.Split(strings.TrimPrefix(tc.path, "/packages/"), "/")
+			if strings.HasPrefix(tc.path, "/default/packages/") && strings.Count(tc.path, "/") >= 4 {
+				parts := strings.Split(strings.TrimPrefix(tc.path, "/default/packages/"), "/")
 				if len(parts) >= 3 {
 					req.SetPathValue("package", parts[0])
 					req.SetPathValue("version", parts[1])
@@ -388,7 +388,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 		MediaType:  "application/x-wheel+zip",
 	}
 	const setupData = "wheel content"
-	const reqPath = "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"
+	const reqPath = "/default/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"
 	const presigned = "https://cdn.example.com/blob?signature=xyz"
 
 	cases := []struct {
@@ -448,7 +448,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 				redirectErr:  tc.redirectErr,
 			}
 
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -488,7 +488,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
+		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(time.Minute))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -503,11 +503,11 @@ func TestPackageIndexCache(t *testing.T) {
 		}
 
 		simple := func() {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
-				t.Fatalf("/simple/requests/ status=%d body=%q", resp.Code, resp.Body.String())
+				t.Fatalf("/default/simple/requests/ status=%d body=%q", resp.Code, resp.Body.String())
 			}
 		}
 
@@ -532,7 +532,7 @@ func TestPackageIndexCache(t *testing.T) {
 		// under -race.
 		const ttl = 50 * time.Millisecond
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(ttl))
+		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(ttl))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -542,7 +542,7 @@ func TestPackageIndexCache(t *testing.T) {
 		}
 
 		render := func() {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
@@ -564,7 +564,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
+		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(time.Minute))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -577,11 +577,11 @@ func TestPackageIndexCache(t *testing.T) {
 		}
 
 		render := func(pkg string) {
-			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/"+pkg+"/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
-				t.Fatalf("/simple/%s/ status=%d", pkg, resp.Code)
+				t.Fatalf("/default/simple/%s/ status=%d", pkg, resp.Code)
 			}
 		}
 
@@ -610,7 +610,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(0))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -619,7 +619,7 @@ func TestPackageIndexCache(t *testing.T) {
 		}
 
 		for i := 0; i < 3; i++ {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
@@ -693,9 +693,9 @@ func TestIndexSentinel(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			for _, up := range tc.uploads {
@@ -722,16 +722,16 @@ func TestIndexSentinel(t *testing.T) {
 
 			// handleSimpleIndex must list every uploaded package, regardless
 			// of how many versions each has.
-			req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if got, want := resp.Code, http.StatusOK; got != want {
-				t.Fatalf("/simple/ status = %d, want %d", got, want)
+				t.Fatalf("/default/simple/ status = %d, want %d", got, want)
 			}
 			body := resp.Body.String()
 			for _, pkg := range tc.wantIndexTags {
-				if !strings.Contains(body, "/simple/"+pkg+"/") {
-					t.Errorf("/simple/ body missing link for %q, got:\n%s", pkg, body)
+				if !strings.Contains(body, "/default/simple/"+pkg+"/") {
+					t.Errorf("/default/simple/ body missing link for %q, got:\n%s", pkg, body)
 				}
 			}
 		})
@@ -762,7 +762,7 @@ func uploadPackage(t *testing.T, h *Handler, pkgName, version string) int {
 		t.Fatalf("close multipart writer: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	resp := httptest.NewRecorder()
 	h.Mux().ServeHTTP(resp, req)
@@ -782,36 +782,36 @@ func TestHandleSimpleIndex(t *testing.T) {
 		{
 			name:             "empty index",
 			setupTags:        []string{},
-			path:             "/simple/",
+			path:             "/default/simple/",
 			wantStatus:       http.StatusOK,
 			wantBodyContains: []string{"Simple Index"},
 		},
 		{
 			name:       "index with packages",
 			setupTags:  []string{"package1", "package2", "example-pkg"},
-			path:       "/simple/",
+			path:       "/default/simple/",
 			wantStatus: http.StatusOK,
 			wantBodyContains: []string{
 				"Simple Index",
 				"package1",
 				"package2",
 				"example-pkg",
-				"/simple/package1/",
-				"/simple/package2/",
-				"/simple/example-pkg/",
+				"/default/simple/package1/",
+				"/default/simple/package2/",
+				"/default/simple/example-pkg/",
 			},
 		},
 		{
 			name:       "index without trailing slash",
 			setupTags:  []string{"package1", "package2"},
-			path:       "/simple",
+			path:       "/default/simple",
 			wantStatus: http.StatusOK,
 			wantBodyContains: []string{
 				"Simple Index",
 				"package1",
 				"package2",
-				"/simple/package1/",
-				"/simple/package2/",
+				"/default/simple/package1/",
+				"/default/simple/package2/",
 			},
 		},
 	}
@@ -823,9 +823,9 @@ func TestHandleSimpleIndex(t *testing.T) {
 			registry := oci.NewFakeRegistry()
 			registry.Tags["index"] = append(registry.Tags["index"], tc.setupTags...)
 
-			h, err := NewHandler(registry)
+			h, err := newHandlerWithRegistry(registry)
 			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
@@ -871,7 +871,7 @@ func TestPEP503Normalization(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -892,11 +892,11 @@ func TestPEP503Normalization(t *testing.T) {
 			}
 
 			// /simple/<queryAs>/ resolves to the same files as /simple/<normalized>/.
-			req := httptest.NewRequest(http.MethodGet, "/simple/"+tc.queryAs+"/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/default/simple/"+tc.queryAs+"/", nil)
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
-				t.Fatalf("/simple/%s/ status=%d body=%s", tc.queryAs, rec.Code, rec.Body.String())
+				t.Fatalf("/default/simple/%s/ status=%d body=%s", tc.queryAs, rec.Code, rec.Body.String())
 			}
 			body := rec.Body.String()
 			if !strings.Contains(body, tc.uploadAs+"-1.0.0.whl") {
@@ -976,7 +976,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -988,7 +988,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 				t.Fatalf("close: %v", err)
 			}
 
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 			req.Header.Set("Content-Type", mw.FormDataContentType())
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
@@ -1011,7 +1011,7 @@ func TestSimpleIndexJSON(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
+	h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(0))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1021,7 +1021,7 @@ func TestSimpleIndexJSON(t *testing.T) {
 		t.Fatalf("upload status=%d", code)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/default/simple/requests/", nil)
 	req.Header.Set("Accept", contentTypeJSONv1)
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1079,7 +1079,7 @@ func uploadFile(t *testing.T, h *Handler, pkgName, version, filename string) int
 	if err := mw.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1093,12 +1093,12 @@ func TestSimpleIndexJSONList(t *testing.T) {
 
 	reg := oci.NewFakeRegistry()
 	reg.Tags["index"] = []string{"flask", "requests"}
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/default/simple/", nil)
 	req.Header.Set("Accept", contentTypeJSONv1)
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1245,14 +1245,14 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
 
 			var req *http.Request
 			if tc.body != nil {
-				req = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(tc.body))
+				req = httptest.NewRequest(http.MethodPut, "/default/", bytes.NewReader(tc.body))
 				req.Header.Set("Content-Type", tc.ctype)
 			} else {
 				var b bytes.Buffer
@@ -1261,7 +1261,7 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 				if err := mw.Close(); err != nil {
 					t.Fatalf("close: %v", err)
 				}
-				req = httptest.NewRequest(http.MethodPut, "/", &b)
+				req = httptest.NewRequest(http.MethodPut, "/default/", &b)
 				req.Header.Set("Content-Type", mw.FormDataContentType())
 			}
 
@@ -1294,7 +1294,7 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg, WithMaxUploadBytes(tc.cap))
+			h, err := newHandlerWithRegistry(reg, WithMaxUploadBytes(tc.cap))
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -1307,7 +1307,7 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			_, _ = fw.Write(bytes.Repeat([]byte("a"), tc.bodyExtra))
 			_ = mw.Close()
 
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 			req.Header.Set("Content-Type", mw.FormDataContentType())
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
@@ -1325,12 +1325,12 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 
 	reg := oci.NewFakeRegistry()
 	reg.Tags["index"] = []string{"flask"}
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 
-	for _, path := range []string{"/simple/", "/simple/flask/"} {
+	for _, path := range []string{"/default/simple/", "/default/simple/flask/"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		h.Mux().ServeHTTP(rec, req)
@@ -1347,7 +1347,7 @@ func TestHandleFilePut_OversizedTextField(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1364,7 +1364,7 @@ func TestHandleFilePut_OversizedTextField(t *testing.T) {
 	_, _ = fw.Write([]byte("payload"))
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1381,7 +1381,7 @@ func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1398,7 +1398,7 @@ func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 	}
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1414,7 +1414,7 @@ func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1430,7 +1430,7 @@ func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	_ = mw.WriteField("md5_digest", "deadbeef")
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1454,7 +1454,7 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	t.Setenv("TMPDIR", tmp)
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1473,7 +1473,7 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	}
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/default/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1526,7 +1526,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 
 	send := func(t *testing.T, h http.Handler, body *bytes.Buffer, ctype string) *httptest.ResponseRecorder {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req := httptest.NewRequest(http.MethodPut, "/default/", body)
 		req.Header.Set("Content-Type", ctype)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -1548,7 +1548,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 
 			reg := oci.NewFakeRegistry()
 			reg.AllowOverwrite = tc.allowOverwrite
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -1593,14 +1593,14 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 	}
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
+	h, err := newHandlerWithRegistry(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 
 	for _, version := range []string{"1.0.0", "1.0.1", "2.0.0"} {
 		body, ctype := build(version)
-		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req := httptest.NewRequest(http.MethodPut, "/default/", body)
 		req.Header.Set("Content-Type", ctype)
 		rec := httptest.NewRecorder()
 		h.Mux().ServeHTTP(rec, req)

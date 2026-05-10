@@ -279,7 +279,7 @@ func TestVerifyChecksumUpload_SnapshotTimestamps(t *testing.T) {
 func TestHandlePut_ChecksumIntegration(t *testing.T) {
 	t.Parallel()
 
-	const artifactPath = "/com/example/project/1.0.0/project-1.0.0.jar"
+	const artifactPath = "/default/maven2/com/example/project/1.0.0/project-1.0.0.jar"
 	const sha1Path = artifactPath + ".sha1"
 	const md5Path = artifactPath + ".md5"
 	const artifactBody = "jar content"
@@ -341,7 +341,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -383,13 +383,13 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 		name string
 		path string
 	}{
-		{name: "traversal in repoParts", path: "/com/../etc/1.0/project-1.0.jar"},
-		{name: "traversal segment in version", path: "/com/example/project/../project-1.0.jar"},
+		{name: "traversal in repoParts", path: "/default/maven2/com/../etc/1.0/project-1.0.jar"},
+		{name: "traversal segment in version", path: "/default/maven2/com/example/project/../project-1.0.jar"},
 		// `..` as filename suffix would be stripped by gorilla/mux's
 		// route matching, but a literal `..` filename component lands
 		// in the filename mux var and must be rejected.
-		{name: "double-dot filename", path: "/com/example/project/1.0/.."},
-		{name: "doubled slash in repoParts", path: "/com//example/1.0/project-1.0.jar"},
+		{name: "double-dot filename", path: "/default/maven2/com/example/project/1.0/.."},
+		{name: "doubled slash in repoParts", path: "/default/maven2/com//example/1.0/project-1.0.jar"},
 	}
 
 	for _, tc := range cases {
@@ -397,7 +397,7 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
+			h, err := newHandlerWithRegistry(reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}

@@ -45,7 +45,7 @@ func TestMavenIntegration_RealClients(t *testing.T) {
 		// for the same reason.
 		"--allow-overwrite=true",
 	)
-	base := h.OcifactoryURL.String()
+	base := h.OcifactoryURL.String() + "/default/maven2"
 
 	// Subtests are NOT t.Parallel(): both deploys would race on
 	// /com/example/test/hello/maven-metadata.xml (the artifact-level

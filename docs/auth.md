@@ -203,12 +203,12 @@ jobs:
                        "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://ocifactory.your-domain" \
                   | jq -r .value)
           twine upload --username _oidc --password "$TOKEN" \
-            --repository-url https://ocifactory.your-domain/ dist/*
+            --repository-url https://ocifactory.your-domain/default/ dist/*
 ```
 
-The structured `sub` is the strong point — once authorization
-lands (separate issue), policy can match on it precisely (e.g.
-"`repo:owner/repo:environment:prod` may publish to `myproject`").
+The structured `sub` is the strong point: namespace policies can match it
+precisely (for example, "`repo:owner/repo:environment:prod` may write to the
+`myproject` namespace"). See [`docs/namespaces.md`](namespaces.md).
 
 ## Why no static passwords
 

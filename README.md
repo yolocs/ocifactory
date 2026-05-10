@@ -49,8 +49,12 @@ go run ./cmd/ocifactory serve \
   --port=8080
 
 # In another shell
-pip install --index-url http://localhost:8080/simple/ requests
+pip install --index-url http://localhost:8080/default/simple/ requests
 ```
+
+Artifact routes are namespace-prefixed (for example, `/default/simple/` for
+Python); create the namespace metadata before serving real clients. See
+[`docs/namespaces.md`](docs/namespaces.md).
 
 Every runtime knob is a CLI flag with a matching env var — no config files.
 Common ones: `PORT`, `OCIFACTORY_REPO_TYPE`, `OCIFACTORY_BACKEND_REGISTRY`,
@@ -61,7 +65,7 @@ options and [`docs/repos/`](docs/repos/) for per-format guides.
 ## Architecture
 
 ```
-client ──► handler/<format> ──► pkg/oci.Registry ──► OCI registry (ORAS)
+client ──► handler/<format> ──► pkg/namespace.Registry ──► pkg/oci.Registry ──► OCI registry (ORAS)
 ```
 
 One Go binary. One process. Storage offloaded entirely to your OCI registry.
