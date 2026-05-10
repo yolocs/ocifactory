@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	// DefaultPrefix is the OCI repo prefix that holds every
-	// namespace's metadata when no [WithPrefix] override is given.
-	DefaultPrefix = "_namespaces"
+	// DefaultPrefix is empty: namespace "foo" maps to the top-level
+	// OCI repo "foo", and the catalogue index lives at top-level
+	// "_index". Operators with a shared OCI registry can group
+	// everything under their own prefix via [WithPrefix].
+	DefaultPrefix = ""
 
 	indexRepoSegment  = "_index"
 	metadataTag       = "_metadata"
@@ -41,9 +43,10 @@ type Backend interface {
 	DeleteTagFiles(ctx context.Context, repo string, tag string) error
 }
 
-// Store persists namespace metadata in an OCI registry. Per-namespace
-// metadata lives at <prefix>/<name>:_metadata; an enumerable index
-// lives at <prefix>/_index, one tag per namespace. Distribution's
+// Store persists namespace metadata in an OCI registry. With the
+// default empty prefix, namespace "foo" maps to OCI repo "foo" with
+// a single tag _metadata holding the spec; the catalogue index lives
+// at top-level "_index" with one tag per namespace. Distribution's
 // _catalog endpoint is optional and inconsistently implemented across
 // registries, so we maintain the index ourselves.
 type Store struct {

@@ -25,6 +25,7 @@ var reservedNames = map[string]struct{}{
 	"npm":         {},
 	"_meta":       {},
 	"_catalog":    {},
+	"_index":      {},
 	"_namespaces": {},
 	"_packages":   {},
 }

@@ -55,6 +55,7 @@ func TestValidateName(t *testing.T) {
 		{"reserved-npm", "npm", true},
 		{"reserved-_meta", "_meta", true},
 		{"reserved-_catalog", "_catalog", true},
+		{"reserved-_index", "_index", true},
 		{"reserved-_namespaces", "_namespaces", true},
 		{"reserved-_packages", "_packages", true},
 	}

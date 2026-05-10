@@ -261,7 +261,7 @@ func TestStore_OnDiskLayout(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	body, ok := fake.Files["_namespaces/myteam/_metadata/"+specFileName]
+	body, ok := fake.Files["myteam/_metadata/"+specFileName]
 	if !ok {
 		t.Fatalf("metadata file not found, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
@@ -273,7 +273,7 @@ func TestStore_OnDiskLayout(t *testing.T) {
 		t.Errorf("on-disk spec mismatch (-want +got):\n%s", diff)
 	}
 
-	if _, ok := fake.Files["_namespaces/_index/myteam/"+indexSentinelName]; !ok {
+	if _, ok := fake.Files["_index/myteam/"+indexSentinelName]; !ok {
 		t.Errorf("expected index sentinel file, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
 }
