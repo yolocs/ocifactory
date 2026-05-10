@@ -9,8 +9,8 @@ import "encoding/json"
 // Namespace is a namespace and its spec. Name is the identifier as
 // it appears in URLs; validation rules live on [ValidateName].
 type Namespace struct {
-	Name string
-	Spec Spec
+	Name string `json:"name"`
+	Spec Spec   `json:"spec"`
 }
 
 // Spec is the persisted body of a [Namespace].
@@ -26,4 +26,12 @@ type Spec struct {
 	// across roundtrips so a newer ocifactory's keys aren't silently
 	// dropped by an older one.
 	Format map[string]json.RawMessage `json:"format,omitempty"`
+}
+
+// Validate returns nil iff s is safe to persist and enforce.
+func (s *Spec) Validate() error {
+	if s == nil {
+		return nil
+	}
+	return s.Policy.Validate()
 }

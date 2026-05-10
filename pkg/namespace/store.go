@@ -15,6 +15,11 @@ import (
 )
 
 const (
+	// ArtifactType is the OCI artifact type used for namespace metadata.
+	// It is intentionally format-independent so the admin service and
+	// every data-plane format can read the same namespace documents.
+	ArtifactType = "application/vnd.ocifactory.namespace"
+
 	// DefaultPrefix is empty: namespace "foo" maps to the top-level
 	// OCI repo "foo", and the catalogue index lives at top-level
 	// "ocifactory-namespaces". Operators with a shared OCI registry

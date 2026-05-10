@@ -443,23 +443,38 @@ func (s *ScopedRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.Rep
 	return out, nil
 }
 
-// ListPackages authorizes the bound namespace for read and returns
-// every owning-repo the wrapper has recorded a write for in the
-// namespace's package index. Tags are decoded back to their original
-// "/"-form.
+// ListPackages returns every owning-repo the wrapper has recorded a
+// write for in namespace's package index without applying data-plane
+// authorization. INTENDED FOR CONTROL-PLANE USE ONLY: callers must
+// already be on the admin trust boundary because this method can
+// enumerate any namespace's package index. Tags are decoded back to
+// their original "/"-form.
 //
 // An absent index repo is reported as an empty list — a namespace
 // that has never been written to legitimately has no packages.
+func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string, error) {
+	if err := ValidateName(namespace); err != nil {
+		return nil, err
+	}
+	return r.listPackages(ctx, namespace)
+}
+
+// ListPackages authorizes the bound namespace for read and returns
+// package-index entries for that namespace.
 func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	tags, err := s.parent.inner.ListTags(ctx, s.parent.packageIndexRepo(s.namespace))
+	return s.parent.listPackages(ctx, s.namespace)
+}
+
+func (r *Registry) listPackages(ctx context.Context, namespace string) ([]string, error) {
+	tags, err := r.inner.ListTags(ctx, r.packageIndexRepo(namespace))
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("list package index for %q: %w", s.namespace, err)
+		return nil, fmt.Errorf("list package index for %q: %w", namespace, err)
 	}
 	out := make([]string, 0, len(tags))
 	for _, t := range tags {
@@ -472,7 +487,7 @@ func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {
 			// tag is no reason to deny callers their other
 			// packages.
 			logging.FromContext(ctx).WarnContext(ctx, "namespace package index: skipping undecodable tag",
-				"namespace", s.namespace, "tag", t, "error", derr,
+				"namespace", namespace, "tag", t, "error", derr,
 			)
 			continue
 		}

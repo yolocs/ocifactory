@@ -116,6 +116,24 @@ type serveConfig struct {
 	RegistryURL *url.URL `mapstructure:"-"`
 }
 
+type backendAuthConfig struct {
+	Kind                 string
+	GCPADCScopes         []string
+	StaticEnvUserEnv     string
+	StaticEnvPasswordEnv string
+	DockerConfigPath     string
+}
+
+func (c *serveConfig) backendAuthConfig() backendAuthConfig {
+	return backendAuthConfig{
+		Kind:                 c.BackendAuthKind,
+		GCPADCScopes:         c.BackendAuthGCPADCScopes,
+		StaticEnvUserEnv:     c.BackendAuthStaticEnvUserEnv,
+		StaticEnvPasswordEnv: c.BackendAuthStaticEnvPasswordEnv,
+		DockerConfigPath:     c.BackendAuthDockerConfigPath,
+	}
+}
+
 // Validate checks that c is internally consistent and populates
 // c.RegistryURL by parsing c.BackendRegistry. Returns the joined
 // validation errors. Any URL the operator gave without an
@@ -322,7 +340,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 	}
 	authMW := auth.Middleware(authn)
 
-	bp, err := buildBackendAuth(ctx, cfg)
+	bp, err := buildBackendAuth(ctx, cfg.backendAuthConfig())
 	if err != nil {
 		return fmt.Errorf("failed to build backend credentials: %w", err)
 	}
@@ -349,7 +367,11 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		storeReg, err := newNamespaceMetadataRegistry(cfg.RegistryURL, registryOpts)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace registry: %w", err)
+		}
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
 		mh, err := maven.NewHandler(nsReg, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
@@ -363,7 +385,11 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		storeReg, err := newNamespaceMetadataRegistry(cfg.RegistryURL, registryOpts)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace registry: %w", err)
+		}
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
 		ph, err := python.NewHandler(nsReg,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
@@ -412,6 +438,12 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 	return srv.Start(ctx, h)
 }
 
+func newNamespaceMetadataRegistry(registryURL *url.URL, baseOpts []oci.RegistryOption) (*oci.Registry, error) {
+	opts := append([]oci.RegistryOption{}, baseOpts...)
+	opts = append(opts, oci.WithArtifactType(namespace.ArtifactType))
+	return oci.NewRegistry(registryURL, opts...)
+}
+
 // buildAuthn constructs the auth.Authenticator the server installs
 // in front of every protected route. Two paths:
 //
@@ -455,14 +487,14 @@ func buildAuthn(ctx context.Context, cfg *serveConfig) (auth.Authenticator, erro
 // set --backend-auth-kind / OCIFACTORY_BACKEND_AUTH_KIND, the
 // default is anonymous and a warning is logged so the implicit
 // no-credential intent isn't silent.
-func buildBackendAuth(ctx context.Context, cfg *serveConfig) (backend.Provider, error) {
+func buildBackendAuth(ctx context.Context, cfg backendAuthConfig) (backend.Provider, error) {
 	logger := logging.NewFromEnv("OCIFACTORY_")
 	bcfg := backend.Config{
-		Kind:                 cfg.BackendAuthKind,
-		GCPADCScopes:         cfg.BackendAuthGCPADCScopes,
-		StaticEnvUserEnv:     cfg.BackendAuthStaticEnvUserEnv,
-		StaticEnvPasswordEnv: cfg.BackendAuthStaticEnvPasswordEnv,
-		DockerConfigPath:     cfg.BackendAuthDockerConfigPath,
+		Kind:                 cfg.Kind,
+		GCPADCScopes:         cfg.GCPADCScopes,
+		StaticEnvUserEnv:     cfg.StaticEnvUserEnv,
+		StaticEnvPasswordEnv: cfg.StaticEnvPasswordEnv,
+		DockerConfigPath:     cfg.DockerConfigPath,
 	}
 	if bcfg.Kind == "" || bcfg.Kind == backend.KindAnonymous {
 		logger.WarnContext(ctx, "no backend credential provider configured (set --backend-auth-kind / "+

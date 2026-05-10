@@ -27,6 +27,7 @@ Design pillars (in priority order):
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC) | Done, tested. OIDC-only — static passwords are out-of-tree by design. Configured via `OCIFACTORY_AUTHN_*` flags / env vars. |
 | `pkg/auth/backend` — Pluggable backend credential `Provider` interface and in-tree adapters (`anonymous`, `gcpadc`, `staticenv`, `dockerconfig`) | Done, tested. Wired into `oci.Registry` via `WithBackendAuth`. Configured via `OCIFACTORY_BACKEND_AUTH_*` flags / env vars. |
+| `ocifactory admin serve` — control-plane namespace CRUD API | Done, tested. Operator docs: [`docs/admin.md`](docs/admin.md). |
 | `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
 | `cmd/ocifactory serve` | Works for `--repo-type=python|maven|echo` (echo runs without `--backend-registry`) |
 | Go module proxy support | Not started |
