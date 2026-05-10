@@ -2,6 +2,7 @@ package maven
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"oras.land/oras-go/v2/errdef"
 )
@@ -47,7 +50,7 @@ var (
 )
 
 type Handler struct {
-	registry handler.Registry
+	registry any
 	authMW   func(http.Handler) http.Handler
 }
 
@@ -67,10 +70,13 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
-func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
+func NewHandler(registry any, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if registry == nil {
+		return nil, fmt.Errorf("registry must not be nil")
 	}
 	return &Handler{registry: registry, authMW: cfg.authMW}, nil
 }
@@ -83,24 +89,36 @@ func (h *Handler) Mux() http.Handler {
 		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
+	nsRouter := router.PathPrefix("/{namespace}/maven2").Subrouter()
+
 	// 1. Archetype Catalog
-	// Handles GET, HEAD, PUT, POST for /archetype-catalog.xml
-	router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	// Handles GET, HEAD, PUT, POST for /{namespace}/maven2/archetype-catalog.xml
+	nsRouter.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
 	// Handles GET, HEAD, PUT, POST for snapshot metadata files.
 	// Example: /{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml
-	router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsRouter.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 3. Artifact Metadata (e.g., group/artifact/maven-metadata.xml or group/artifact/version/maven-metadata.xml for releases)
 	// Handles GET, HEAD, PUT, POST for non-snapshot metadata files. This must be after snapshot metadata.
 	// Example: /{groupId}/{artifactId}/maven-metadata.xml
-	router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsRouter.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 4. Regular Artifact Files (e.g., group/artifact/version/file.jar)
 	// Handles GET, HEAD, PUT, POST for general artifact files. This is the most general route and must be last.
 	// Example: /{groupId}/{artifactId}/{version}/{filename.ext}
-	router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsRouter.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+
+	if !h.usesNamespaceRegistry() {
+		// Legacy root routes keep unit tests that pass a raw handler.Registry focused
+		// on handler semantics; production serve always passes a namespace registry
+		// and clients should use /{namespace}/maven2 routes above.
+		router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+		router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+		router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+		router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	}
 
 	return router
 }
@@ -114,9 +132,9 @@ func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, h.scopedRegistry(req), f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, h.scopedRegistry(req), f)
 	}
 }
 
@@ -138,9 +156,9 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, h.scopedRegistry(req), f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, h.scopedRegistry(req), f)
 	}
 }
 
@@ -161,9 +179,9 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, h.scopedRegistry(req), f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, h.scopedRegistry(req), f)
 	}
 }
 
@@ -186,24 +204,24 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		MediaType:  detectMediaType(filename),
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, h.scopedRegistry(req), f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, h.scopedRegistry(req), f)
 	}
 }
 
 // handlePut processes PUT/POST requests to add a file.
-func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
+func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, registry handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	defer req.Body.Close()
 
-	body, err := h.maybeVerifyChecksum(req, f)
+	body, err := h.maybeVerifyChecksum(req, registry, f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
 		code := httpStatus(err)
 		if code == 0 {
-			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+			writeRegistryError(req.Context(), w, err, "internal error")
 			return
 		}
 		// Checksum-validation errors carry deliberately framed
@@ -212,22 +230,14 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 		return
 	}
 
-	desc, err := h.registry.AddFile(req.Context(), f, body)
+	desc, err := registry.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
 		if errors.Is(err, oci.ErrAlreadyExists) {
 			http.Error(w, "file already exists in version", http.StatusConflict)
 			return
 		}
-		if oci.HasCode(err, http.StatusUnauthorized) {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if oci.HasCode(err, http.StatusForbidden) {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+		writeRegistryError(req.Context(), w, err, "internal error")
 		return
 	}
 	logger.DebugContext(req.Context(), "added file", "descriptor", desc)
@@ -240,7 +250,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 // For checksum filenames it buffers the (always tiny) body, validates it
 // against the previously-uploaded companion artifact, and returns a
 // reader over the buffered bytes so AddFile still sees an io.Reader.
-func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Reader, error) {
+func (h *Handler) maybeVerifyChecksum(req *http.Request, registry handler.Registry, f *oci.RepoFile) (io.Reader, error) {
 	if ext, _, _ := checksumExt(f.Name); ext == "" {
 		// Forward the HTTP Content-Length so AddFile can short-circuit
 		// the peek-and-decide buffer for sized uploads (mvn deploy
@@ -259,7 +269,7 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Re
 		return nil, badRequest("checksum body exceeds %d bytes", maxChecksumBodyBytes)
 	}
 
-	if err := verifyChecksumUpload(req.Context(), h.registry, f, body); err != nil {
+	if err := verifyChecksumUpload(req.Context(), registry, f, body); err != nil {
 		return nil, err
 	}
 
@@ -267,14 +277,14 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Re
 	return bytes.NewReader(body), nil
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
+func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, registry handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	// HEAD wants headers only — never redirect. The redirect path is
 	// only worth taking when the response would otherwise transfer
 	// bytes; HEAD has no egress to save.
 	if req.Method != http.MethodHead {
-		if redirectURL, err := h.registry.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+		if redirectURL, err := registry.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
 			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return
@@ -284,22 +294,14 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.Rep
 		}
 	}
 
-	desc, r, err := h.registry.ReadFile(req.Context(), f)
+	desc, r, err := registry.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
 		if errors.Is(err, errdef.ErrNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		if oci.HasCode(err, http.StatusUnauthorized) {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if oci.HasCode(err, http.StatusForbidden) {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+		writeRegistryError(req.Context(), w, err, "internal error")
 		return
 	}
 	defer r.Close()
@@ -324,4 +326,39 @@ func detectMediaType(filename string) string {
 		return mt
 	}
 	return "application/octet-stream"
+}
+
+func (h *Handler) usesNamespaceRegistry() bool {
+	_, ok := h.registry.(interface {
+		For(string) *namespace.ScopedRegistry
+	})
+	return ok
+}
+
+func (h *Handler) scopedRegistry(req *http.Request) handler.Registry {
+	switch r := h.registry.(type) {
+	case interface {
+		For(string) *namespace.ScopedRegistry
+	}:
+		return r.For(mux.Vars(req)["namespace"])
+	case handler.Registry:
+		return r
+	default:
+		panic(fmt.Sprintf("registry has unsupported type %T", h.registry))
+	}
+}
+
+func writeRegistryError(ctx context.Context, w http.ResponseWriter, err error, public string) {
+	switch {
+	case errors.Is(err, namespace.ErrInvalidOwningRepo):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, namespace.ErrNotFound), errors.Is(err, errdef.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, auth.ErrUnauthorized), oci.HasCode(err, http.StatusForbidden):
+		http.Error(w, err.Error(), http.StatusForbidden)
+	case oci.HasCode(err, http.StatusUnauthorized):
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+	default:
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, public)
+	}
 }

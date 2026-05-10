@@ -113,6 +113,8 @@ type Registry struct {
 	factory     AuthzFactory
 	cacheTTL    time.Duration
 
+	defaultNamespaceAllowAll bool
+
 	// flight collapses concurrent first-misses for the same namespace
 	// so a cold-start burst pays one Store.Get + factory(...) rather
 	// than N. Keyed by namespace name.
@@ -144,6 +146,14 @@ func WithPackageIndexSuffix(s string) RegistryOption {
 // Defaults to [NewPolicyAuthorizer].
 func WithAuthzFactory(f AuthzFactory) RegistryOption {
 	return func(r *Registry) { r.factory = f }
+}
+
+// WithDefaultNamespaceAllowAll makes the data plane synthesize a dev-only
+// "default" namespace with allow-all authorization when the Store has no
+// persisted default namespace. Existing persisted namespace metadata still
+// wins. This is intended for tests and local development only.
+func WithDefaultNamespaceAllowAll(allow bool) RegistryOption {
+	return func(r *Registry) { r.defaultNamespaceAllowAll = allow }
 }
 
 // WithPolicyCacheTTL overrides [DefaultPolicyCacheTTL]. A value of
@@ -248,6 +258,11 @@ func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Au
 		}
 		ns, err := r.store.Get(ctx, namespace)
 		if err != nil {
+			if errors.Is(err, ErrNotFound) && r.defaultNamespaceAllowAll && namespace == "default" {
+				entry := cachedPolicy{authorizer: auth.AllowAll}
+				r.cache.put(namespace, entry)
+				return entry, nil
+			}
 			if errors.Is(err, ErrNotFound) {
 				neg := cachedPolicy{notFound: true}
 				r.cache.put(namespace, neg)

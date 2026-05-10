@@ -22,6 +22,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/metrics"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -74,6 +75,7 @@ const (
 	flagAuthnKind                       = "authn-kind"
 	flagAuthnOIDCIssuers                = "authn-oidc-issuers"
 	flagAuthnOIDCAudience               = "authn-oidc-audience"
+	flagDefaultNamespaceAllowAll        = "default-namespace-allow-all"
 	flagBackendAuthKind                 = "backend-auth-kind"
 	flagBackendAuthGCPADCScopes         = "backend-auth-gcpadc-scopes"
 	flagBackendAuthStaticEnvUserEnv     = "backend-auth-staticenv-user-env"
@@ -97,6 +99,8 @@ type serveConfig struct {
 	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
 	MetricsPath          string        `mapstructure:"metrics-path"`
+
+	DefaultNamespaceAllowAll bool `mapstructure:"default-namespace-allow-all"`
 
 	DisableAuthn      bool     `mapstructure:"disable-authn"`
 	AuthnKind         string   `mapstructure:"authn-kind"`
@@ -274,6 +278,10 @@ func registerServeFlags(flags *pflag.FlagSet) {
 		"Path on the main listener that serves Prometheus exposition. "+
 			"Operators wanting authn / network ACLs on metrics should "+
 			"front this with their own reverse proxy.")
+	flags.Bool(flagDefaultNamespaceAllowAll, false,
+		"Synthesize a dev-only default namespace with allow-all policy when "+
+			"no persisted default namespace exists. Intended for tests and local "+
+			"development only; never use in production.")
 
 	// Frontend authentication.
 	flags.Bool(flagDisableAuthn, false,
@@ -321,6 +329,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 	}
 	authMW := auth.Middleware(authn)
 
+	if cfg.DefaultNamespaceAllowAll {
+		logging.NewFromEnv("OCIFACTORY_").WarnContext(ctx, "--default-namespace-allow-all set; the 'default' namespace allows all requests; do not use in production")
+	}
+
 	bp, err := buildBackendAuth(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to build backend credentials: %w", err)
@@ -348,7 +360,8 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(r, maven.WithAuthMiddleware(authMW))
+		nr := namespace.NewRegistry(r, namespace.NewStore(r), namespace.WithDefaultNamespaceAllowAll(cfg.DefaultNamespaceAllowAll))
+		mh, err := maven.NewHandler(nr, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -361,7 +374,8 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(r,
+		nr := namespace.NewRegistry(r, namespace.NewStore(r), namespace.WithDefaultNamespaceAllowAll(cfg.DefaultNamespaceAllowAll))
+		ph, err := python.NewHandler(nr,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),

@@ -103,6 +103,7 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 		fmt.Sprintf("--backend-registry=%s://%s/%s", zotURL.Scheme, zotURL.Host, backendRepo),
 		fmt.Sprintf("--port=%d", port),
 		"--disable-authn",
+		"--default-namespace-allow-all",
 		// zot served over HTTP without auth needs no backend creds;
 		// "anonymous" is the default but pin it explicitly so the
 		// test isn't sensitive to default changes.
