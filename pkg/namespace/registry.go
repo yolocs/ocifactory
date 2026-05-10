@@ -24,10 +24,10 @@ import (
 const (
 	// defaultPackageIndexSuffix names the per-namespace OCI repo whose
 	// tags enumerate every owning-repo the wrapper has ever recorded a
-	// write for. The repo lives at "<namespace>/_packages" by default
+	// write for. The repo lives at "<namespace>/package-index" by default
 	// — operators who already park a real artifact under that name can
 	// relocate it via [WithPackageIndexSuffix].
-	defaultPackageIndexSuffix = "_packages"
+	defaultPackageIndexSuffix = "package-index"
 
 	// packageIndexSentinelFile is the file name written under the
 	// package index repo. The body is constant — the tag's existence
@@ -132,9 +132,9 @@ type Registry struct {
 // RegistryOption customises a [Registry].
 type RegistryOption func(*Registry)
 
-// WithPackageIndexSuffix overrides the default ("_packages").
-// Operators set this when their backend already has a top-level
-// "_packages" repo they want to keep — extremely unlikely, but cheap
+// WithPackageIndexSuffix overrides the default ("package-index").
+// Operators set this when their namespaces already contain a
+// "package-index" artifact repo they want to keep — extremely unlikely, but cheap
 // to make configurable.
 func WithPackageIndexSuffix(s string) RegistryOption {
 	return func(r *Registry) { r.indexSuffix = s }

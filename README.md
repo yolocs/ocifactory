@@ -39,6 +39,10 @@ limitations.
 
 ## Quickstart
 
+The server refuses to start without an explicit authn choice. For local-only
+experiments against an unauthenticated registry, pass `--disable-authn`; real
+deployments should configure OIDC as described in [`docs/auth.md`](docs/auth.md).
+
 ```bash
 go build ./...
 
@@ -54,7 +58,15 @@ Artifact routes are namespace-prefixed (for example, `/default/simple/` for
 Python), and the namespace must exist before clients can use it. Until an admin
 CLI lands, seed namespace metadata with `pkg/namespace.Store` from a small
 control-plane tool; the real-client integration harness shows the exact pattern.
-See [`docs/namespaces.md`](docs/namespaces.md).
+For a fully runnable end-to-end smoke test that starts zot, seeds a namespace,
+starts ocifactory, and drives real clients, run:
+
+```bash
+go test -tags=integration ./pkg/handler/python ./pkg/handler/maven
+```
+
+See [`docs/namespaces.md`](docs/namespaces.md) for the namespace data model and
+bootstrap pattern.
 
 Every runtime knob is a CLI flag with a matching env var — no config files.
 Common ones: `PORT`, `OCIFACTORY_REPO_TYPE`, `OCIFACTORY_BACKEND_REGISTRY`,

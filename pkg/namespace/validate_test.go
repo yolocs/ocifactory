@@ -58,6 +58,8 @@ func TestValidateName(t *testing.T) {
 		{"reserved-_index", "_index", true},
 		{"reserved-_namespaces", "_namespaces", true},
 		{"reserved-_packages", "_packages", true},
+		{"reserved-namespace-index", "namespace-index", true},
+		{"reserved-package-index", "package-index", true},
 	}
 
 	for _, tc := range tests {

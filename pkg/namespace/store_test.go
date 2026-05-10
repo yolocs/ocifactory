@@ -229,17 +229,17 @@ func TestStore_Delete_NotFound(t *testing.T) {
 func TestStore_WithPrefix_RoutesToConfiguredRepos(t *testing.T) {
 	t.Parallel()
 
-	fake, s, ctx := newTestStore(t, WithPrefix("custom/_namespaces"))
+	fake, s, ctx := newTestStore(t, WithPrefix("custom/namespaces"))
 
 	if err := s.Put(ctx, &Namespace{Name: "myteam", Spec: sampleSpec()}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	if _, ok := fake.Files["custom/_namespaces/myteam/_metadata/"+specFileName]; !ok {
-		t.Errorf("expected metadata file under custom/_namespaces/myteam/_metadata, got files: %v",
+	if _, ok := fake.Files["custom/namespaces/myteam/_metadata/"+specFileName]; !ok {
+		t.Errorf("expected metadata file under custom/namespaces/myteam/_metadata, got files: %v",
 			slices.Sorted(maps.Keys(fake.Files)))
 	}
-	indexTags, err := fake.ListTags(ctx, "custom/_namespaces/_index")
+	indexTags, err := fake.ListTags(ctx, "custom/namespaces/namespace-index")
 	if err != nil {
 		t.Fatalf("ListTags index: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestStore_OnDiskLayout(t *testing.T) {
 		t.Errorf("on-disk spec mismatch (-want +got):\n%s", diff)
 	}
 
-	if _, ok := fake.Files["_index/myteam/"+indexSentinelName]; !ok {
+	if _, ok := fake.Files["namespace-index/myteam/"+indexSentinelName]; !ok {
 		t.Errorf("expected index sentinel file, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
 }

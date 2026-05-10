@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/yolocs/ocifactory/pkg/handler/integrationtest"
+	"github.com/yolocs/ocifactory/pkg/namespace/nsutil"
 )
 
 // TestPythonIntegration_RealClients exercises the Python handler with
@@ -102,6 +103,17 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 			fmt.Sprintf("%s==%s", pkgName, version),
 		)
 	})
+
+	t.Run("namespace_policy_denies_wrong_subject", func(t *testing.T) {
+		t.Parallel()
+
+		const pkgName = "ocifactory-int-denied"
+		const version = "9.9.9"
+		h.SeedNamespace(t, "locked", nsutil.AllowIssuerSpec("not-anonymous"))
+
+		whl := newTestWheel(t, pkgName, version)
+		uploadWithTwineWantForbidden(t, h.OcifactoryURL.String(), "locked", whl)
+	})
 }
 
 // uploadWithTwine drives `twine upload` against the running
@@ -110,10 +122,34 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 // a Basic header at all.
 func uploadWithTwine(t *testing.T, base string, whl *testWheel) {
 	t.Helper()
+	uploadWithTwineToNamespace(t, base, "default", whl)
+}
 
+func uploadWithTwineToNamespace(t *testing.T, base, namespace string, whl *testWheel) {
+	t.Helper()
+	cmd := twineUploadCommand(base, namespace, whl)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("twine upload: %v\n%s", err, out)
+	}
+}
+
+func uploadWithTwineWantForbidden(t *testing.T, base, namespace string, whl *testWheel) {
+	t.Helper()
+	cmd := twineUploadCommand(base, namespace, whl)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("twine upload unexpectedly succeeded; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "403") && !strings.Contains(strings.ToLower(string(out)), "forbidden") {
+		t.Fatalf("twine upload error = %v, want 403 Forbidden; output:\n%s", err, out)
+	}
+}
+
+func twineUploadCommand(base, namespace string, whl *testWheel) *exec.Cmd {
 	cmd := exec.Command(
 		"twine", "upload",
-		"--repository-url", base+"/default/",
+		"--repository-url", base+"/"+namespace+"/",
 		"--non-interactive",
 		"--disable-progress-bar",
 		"--verbose",
@@ -123,10 +159,7 @@ func uploadWithTwine(t *testing.T, base string, whl *testWheel) {
 		"TWINE_USERNAME=integration",
 		"TWINE_PASSWORD=integration",
 	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("twine upload: %v\n%s", err, out)
-	}
+	return cmd
 }
 
 // downloadAndCheck pulls the wheel back via `pip download` and asserts

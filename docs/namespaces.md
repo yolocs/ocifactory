@@ -60,7 +60,7 @@ are matched as full strings.
 
 Namespace metadata is persisted in the OCI backend itself: namespace `payments`
 maps to OCI repo `payments` with tag `_metadata`, and the namespace catalog is
-maintained in `_index`. No sidecar database is required.
+maintained in `namespace-index`. No sidecar database is required.
 
 The namespace data model and store live in `pkg/namespace`. Until an operator
 CLI/API lands, deployments should create namespaces from their control-plane

@@ -151,8 +151,20 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	}
 }
 
+// SeedNamespace writes namespace metadata into the harness backend through the
+// same namespace.Store API production control planes use. Tests can call this
+// after Start to add non-default namespaces before a real client subprocess
+// targets them.
+func (h *Harness) SeedNamespace(t *testing.T, name string, spec namespace.Spec) {
+	t.Helper()
+	seedNamespace(t, t.Context(), h.ZotURL, h.BackendRepo, name, spec)
+}
+
 func seedNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo string, name string, spec namespace.Spec) {
 	t.Helper()
+	if zotURL.Hostname() != "127.0.0.1" && zotURL.Hostname() != "localhost" {
+		t.Fatalf("refusing to seed namespace %q into non-loopback registry %s", name, zotURL)
+	}
 	backendURL, err := url.Parse(fmt.Sprintf("%s://%s/%s", zotURL.Scheme, zotURL.Host, backendRepo))
 	if err != nil {
 		t.Fatalf("parse backend URL: %v", err)
@@ -160,9 +172,6 @@ func seedNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRe
 	reg, err := oci.NewRegistry(backendURL)
 	if err != nil {
 		t.Fatalf("create namespace seed registry: %v", err)
-	}
-	if zotURL.Hostname() != "127.0.0.1" && zotURL.Hostname() != "localhost" {
-		t.Fatalf("refusing to seed namespace %q into non-loopback registry %s", name, zotURL)
 	}
 	store := namespace.NewStore(reg)
 	nsutil.Seed(t, ctx, store, &namespace.Namespace{Name: name, Spec: spec})

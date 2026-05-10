@@ -15,19 +15,21 @@ var ErrInvalidName = errors.New("invalid namespace name")
 // by existing handlers, and OCI/internal prefixes used by the storage
 // layer.
 var reservedNames = map[string]struct{}{
-	"admin":       {},
-	"healthz":     {},
-	"readyz":      {},
-	"metrics":     {},
-	"simple":      {},
-	"maven2":      {},
-	"v2":          {},
-	"npm":         {},
-	"_meta":       {},
-	"_catalog":    {},
-	"_index":      {},
-	"_namespaces": {},
-	"_packages":   {},
+	"admin":           {},
+	"healthz":         {},
+	"readyz":          {},
+	"metrics":         {},
+	"simple":          {},
+	"maven2":          {},
+	"v2":              {},
+	"npm":             {},
+	"_meta":           {},
+	"_catalog":        {},
+	"_index":          {},
+	"_namespaces":     {},
+	"_packages":       {},
+	"namespace-index": {},
+	"package-index":   {},
 }
 
 // ValidateName returns nil iff name is a legal namespace name:

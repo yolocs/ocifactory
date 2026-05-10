@@ -731,7 +731,7 @@ func TestScopedRegistry_AppendRefs_Forwards(t *testing.T) {
 }
 
 // TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex verifies
-// BOTH the in-process indexed marker AND the backend _packages tag
+// BOTH the in-process indexed marker AND the backend package-index tag
 // are cleared.
 func TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 	t.Parallel()
@@ -938,7 +938,7 @@ func TestRegistry_PolicyCache_Singleflight(t *testing.T) {
 
 // countingBackend wraps an [oci.FakeRegistry] and counts how many
 // times the namespace metadata spec.json is read for each namespace,
-// and how many times the per-namespace _packages index repo
+// and how many times the per-namespace package-index index repo
 // receives an AddFile.
 type countingBackend struct {
 	*oci.FakeRegistry
@@ -1001,7 +1001,7 @@ func isSpecRead(f *oci.RepoFile) bool {
 }
 
 func indexRepoNamespace(owningRepo string) (string, bool) {
-	const suffix = "/_packages"
+	const suffix = "/package-index"
 	if strings.HasSuffix(owningRepo, suffix) {
 		return owningRepo[:len(owningRepo)-len(suffix)], true
 	}
