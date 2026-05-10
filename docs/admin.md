@@ -61,3 +61,12 @@ The admin service reuses the same observability endpoints as the data plane:
 - `/readyz` calls `Store.List` against the OCI-backed namespace index under the
   standard readiness timeout.
 - `/metrics` exposes Prometheus metrics when metrics are enabled.
+
+## Namespace metadata storage
+
+Namespace metadata is stored with OCI artifact type
+`application/vnd.ocifactory.namespace`, independent of the data-plane format
+served by a process. If you experimented with namespace metadata from the short
+window before this admin service existed, recreate those namespaces through the
+admin API so Python, Maven, and future repo types all read the same control-plane
+documents.

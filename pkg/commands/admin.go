@@ -23,14 +23,11 @@ const (
 )
 
 type adminServeConfig struct {
-	Port                 string `mapstructure:"port"`
-	BackendRegistry      string `mapstructure:"backend-registry"`
-	NamespacePrefix      string `mapstructure:"namespace-prefix"`
-	DisableStreamingPush bool   `mapstructure:"disable-streaming-push"`
-	DisableBlobRedirect  bool   `mapstructure:"disable-blob-redirect"`
-	AllowOverwrite       bool   `mapstructure:"allow-overwrite"`
-	EnableMetrics        bool   `mapstructure:"enable-metrics"`
-	MetricsPath          string `mapstructure:"metrics-path"`
+	Port            string `mapstructure:"port"`
+	BackendRegistry string `mapstructure:"backend-registry"`
+	NamespacePrefix string `mapstructure:"namespace-prefix"`
+	EnableMetrics   bool   `mapstructure:"enable-metrics"`
+	MetricsPath     string `mapstructure:"metrics-path"`
 
 	BackendAuthKind                 string   `mapstructure:"backend-auth-kind"`
 	BackendAuthGCPADCScopes         []string `mapstructure:"backend-auth-gcpadc-scopes"`
@@ -60,6 +57,16 @@ func (c *adminServeConfig) Validate() error {
 		c.RegistryURL = u
 	}
 	return merr
+}
+
+func (c *adminServeConfig) backendAuthConfig() backendAuthConfig {
+	return backendAuthConfig{
+		Kind:                 c.BackendAuthKind,
+		GCPADCScopes:         c.BackendAuthGCPADCScopes,
+		StaticEnvUserEnv:     c.BackendAuthStaticEnvUserEnv,
+		StaticEnvPasswordEnv: c.BackendAuthStaticEnvPasswordEnv,
+		DockerConfigPath:     c.BackendAuthDockerConfigPath,
+	}
 }
 
 func newAdminCmd() *cobra.Command {
@@ -107,12 +114,6 @@ func registerAdminServeFlags(flags *pflag.FlagSet) {
 	flags.String(flagBackendRegistry, "", "The URL to the backend OCI registry.")
 	flags.String(flagNamespacePrefix, namespace.DefaultPrefix,
 		"OCI repository prefix for namespace metadata and the global namespace index.")
-	flags.Bool(flagDisableStreamingPush, false,
-		"Force every blob upload through the buffered + monolithic path instead of streaming via chunked PATCH.")
-	flags.Bool(flagDisableBlobRedirect, false,
-		"Disable backend blob redirects for OCI registry operations.")
-	flags.Bool(flagAllowOverwrite, false,
-		"Allow overwriting OCI files that already exist. Admin namespace metadata PUT uses upsert semantics regardless of this setting.")
 	flags.Bool(flagEnableMetrics, true,
 		"Expose Prometheus metrics at --metrics-path and instrument HTTP and OCI backend layers.")
 	flags.String(flagMetricsPath, "/metrics", "Path that serves Prometheus exposition when metrics are enabled.")
@@ -129,22 +130,13 @@ func runAdminServe(ctx context.Context, cfg *adminServeConfig) error {
 	logging.NewFromEnv("OCIFACTORY_").WarnContext(ctx, "ADMIN SERVICE HAS NO INTERNAL AUTHENTICATION — deploy it behind platform/network access controls; see docs/admin.md")
 
 	rec, metricsHandler := buildRecorder(cfg.EnableMetrics)
-	bp, err := buildBackendAuth(ctx, &serveConfig{
-		BackendAuthKind:                 cfg.BackendAuthKind,
-		BackendAuthGCPADCScopes:         cfg.BackendAuthGCPADCScopes,
-		BackendAuthStaticEnvUserEnv:     cfg.BackendAuthStaticEnvUserEnv,
-		BackendAuthStaticEnvPasswordEnv: cfg.BackendAuthStaticEnvPasswordEnv,
-		BackendAuthDockerConfigPath:     cfg.BackendAuthDockerConfigPath,
-	})
+	bp, err := buildBackendAuth(ctx, cfg.backendAuthConfig())
 	if err != nil {
 		return fmt.Errorf("failed to build backend credentials: %w", err)
 	}
 
 	reg, err := oci.NewRegistry(cfg.RegistryURL,
 		oci.WithArtifactType(namespace.ArtifactType),
-		oci.WithStreamingPushDisabled(cfg.DisableStreamingPush),
-		oci.WithBlobRedirectDisabled(cfg.DisableBlobRedirect),
-		oci.WithAllowOverwrite(cfg.AllowOverwrite),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
 	)
@@ -152,6 +144,10 @@ func runAdminServe(ctx context.Context, cfg *adminServeConfig) error {
 		return fmt.Errorf("failed to create registry: %w", err)
 	}
 	store := namespace.NewStore(reg, namespace.WithPrefix(cfg.NamespacePrefix))
+	// The admin service does not authorize data-plane requests, but
+	// namespace.Registry already owns the package-index decoding logic
+	// needed for soft-delete emptiness checks. Keep it here only as a
+	// control-plane PackageLister.
 	nsReg := namespace.NewRegistry(reg, store)
 	ah, err := adminhandler.NewHandler(store, nsReg)
 	if err != nil {
@@ -163,20 +159,14 @@ func runAdminServe(ctx context.Context, cfg *adminServeConfig) error {
 	if !cfg.EnableMetrics {
 		metricsPath = ""
 	}
-	h = handler.ObservabilityHandler(h, storePinger{store: store}, metricsHandler, metricsPath)
+	h = handler.ObservabilityHandler(h, handler.PingerFunc(func(ctx context.Context) error {
+		_, err := store.List(ctx)
+		return err
+	}), metricsHandler, metricsPath)
 
 	srv, err := handler.NewServer(cfg.Port, handler.Loggeer, handler.MetricsMiddleware(rec))
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
 	return srv.Start(ctx, h)
-}
-
-type storePinger struct {
-	store *namespace.Store
-}
-
-func (p storePinger) Ping(ctx context.Context) error {
-	_, err := p.store.List(ctx)
-	return err
 }

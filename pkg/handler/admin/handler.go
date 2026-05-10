@@ -86,6 +86,9 @@ func (h *Handler) listNamespaces(w http.ResponseWriter, r *http.Request) {
 		writeInternal(r.Context(), w, err)
 		return
 	}
+	if names == nil {
+		names = []string{}
+	}
 	writeJSON(w, http.StatusOK, listResponse{Namespaces: names})
 }
 
@@ -119,6 +122,9 @@ func (h *Handler) putNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusOK
+	// The 200-vs-201 distinction is best-effort: concurrent creates can
+	// both observe ErrNotFound before either Put lands. PUT remains
+	// idempotent because Store.Put is an upsert.
 	if _, err := h.store.Get(r.Context(), name); err != nil {
 		if errors.Is(err, namespace.ErrNotFound) {
 			status = http.StatusCreated
@@ -143,6 +149,10 @@ func (h *Handler) deleteNamespace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Soft delete is a best-effort guard until cascade delete lands: an
+	// upload racing between ListPackages and Store.Delete can still leave
+	// package sentinels behind. The follow-up cascade flow owns closing
+	// that window.
 	packages, err := h.packages.ListPackages(r.Context(), name)
 	if err != nil {
 		writeAdminError(r.Context(), w, err)

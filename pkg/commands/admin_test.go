@@ -85,9 +85,6 @@ func TestAdminServeCmd_Flags(t *testing.T) {
 		flagPort,
 		flagBackendRegistry,
 		flagNamespacePrefix,
-		flagDisableStreamingPush,
-		flagAllowOverwrite,
-		flagDisableBlobRedirect,
 		flagEnableMetrics,
 		flagMetricsPath,
 		flagBackendAuthKind,
@@ -104,8 +101,18 @@ func TestAdminServeCmd_Flags(t *testing.T) {
 			}
 		})
 	}
-	if f := cmd.Flags().Lookup(flagRepoType); f != nil {
-		t.Fatalf("admin serve registered data-plane flag %q", flagRepoType)
+	notRegistered := []string{
+		flagRepoType,
+		flagDisableStreamingPush,
+		flagAllowOverwrite,
+		flagDisableBlobRedirect,
+		flagSimpleIndexCacheTTL,
+		flagPythonMaxUploadBytes,
+	}
+	for _, flagName := range notRegistered {
+		if f := cmd.Flags().Lookup(flagName); f != nil {
+			t.Fatalf("admin serve registered data-plane flag %q", flagName)
+		}
 	}
 }
 

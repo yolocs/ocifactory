@@ -26,6 +26,7 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 		method     string
 		path       string
 		body       any
+		rawBody    string
 		seed       func(t *testing.T, reg *oci.FakeRegistry, store *namespace.Store)
 		wantStatus int
 		wantBody   any
@@ -67,6 +68,22 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			wantBody:   map[string]string{"error": "readers[0]: invalid policy: matcher must populate at least one field"},
 		},
 		{
+			name:       "put malformed json",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/badjson",
+			rawBody:    `}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": "invalid JSON body: invalid character '}' looking for beginning of value"},
+		},
+		{
+			name:       "put unknown json field",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/unknownfield",
+			rawBody:    `{"bogus":true}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": "invalid JSON body: json: unknown field \"bogus\""},
+		},
+		{
 			name:   "get existing namespace",
 			method: http.MethodGet,
 			path:   "/admin/v1/namespaces/alpha",
@@ -83,6 +100,13 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			path:       "/admin/v1/namespaces/missing",
 			wantStatus: http.StatusNotFound,
 			wantBody:   map[string]string{"error": "namespace not found: missing"},
+		},
+		{
+			name:       "list namespaces empty",
+			method:     http.MethodGet,
+			path:       "/admin/v1/namespaces",
+			wantStatus: http.StatusOK,
+			wantBody:   map[string][]string{"namespaces": []string{}},
 		},
 		{
 			name:   "list namespaces",
@@ -144,7 +168,9 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 				tc.seed(t, reg, store)
 			}
 			var body []byte
-			if tc.body != nil {
+			if tc.rawBody != "" {
+				body = []byte(tc.rawBody)
+			} else if tc.body != nil {
 				var err error
 				body, err = json.Marshal(tc.body)
 				if err != nil {

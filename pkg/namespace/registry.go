@@ -445,8 +445,10 @@ func (s *ScopedRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.Rep
 
 // ListPackages returns every owning-repo the wrapper has recorded a
 // write for in namespace's package index without applying data-plane
-// authorization. It is intended for control-plane cleanup checks.
-// Tags are decoded back to their original "/"-form.
+// authorization. INTENDED FOR CONTROL-PLANE USE ONLY: callers must
+// already be on the admin trust boundary because this method can
+// enumerate any namespace's package index. Tags are decoded back to
+// their original "/"-form.
 //
 // An absent index repo is reported as an empty list — a namespace
 // that has never been written to legitimately has no packages.
