@@ -6,18 +6,14 @@ import (
 	"strings"
 )
 
-// ErrInvalidName is the sentinel returned by [ValidateName] (and by
-// [Store] methods that take a name) for any name that violates the
-// namespace naming rules.
+// ErrInvalidName is the sentinel for names rejected by [ValidateName].
 var ErrInvalidName = errors.New("invalid namespace name")
 
-// reservedNames is the conservative deny-list of names ocifactory will
-// not let an operator create. The list overlaps with built-in URL
-// prefixes (admin, healthz, …), per-format URL prefixes used by
-// existing handlers (simple, maven2, v2, npm), and the OCI/internal
-// prefixes the storage layer reserves (_namespaces, _packages, _meta,
-// _catalog). Better to over-reserve in v1 than to free a name that
-// later collides with new server-internal routing.
+// reservedNames is conservative on purpose: better to over-reserve in
+// v1 than free a name that later collides with new server-internal
+// routing. Covers built-in URL prefixes, per-format URL prefixes used
+// by existing handlers, and OCI/internal prefixes used by the storage
+// layer.
 var reservedNames = map[string]struct{}{
 	"admin":       {},
 	"healthz":     {},
@@ -33,15 +29,10 @@ var reservedNames = map[string]struct{}{
 	"_packages":   {},
 }
 
-// ValidateName returns nil iff name is a legal namespace name. Rules:
-//
-//   - Length 1-64.
-//   - Lowercase ASCII alphanumeric and '-' only.
-//   - Must start and end with an alphanumeric (no leading/trailing '-').
-//   - Must not start with '_' or '.' (reserved for internal use).
-//   - Must not be one of the reserved names listed in [reservedNames].
-//
-// Errors wrap [ErrInvalidName] so callers can use errors.Is.
+// ValidateName returns nil iff name is a legal namespace name:
+// 1-64 lowercase ASCII alphanumerics and '-', no leading/trailing
+// '-', no leading '_' or '.', not in [reservedNames]. Errors wrap
+// [ErrInvalidName].
 func ValidateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: must not be empty", ErrInvalidName)

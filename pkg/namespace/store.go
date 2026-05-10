@@ -15,80 +15,25 @@ import (
 )
 
 const (
-	// DefaultPrefix is the default OCI repo prefix that holds every
-	// namespace's metadata. Operators override it via [WithPrefix]
-	// when ocifactory shares an OCI registry with other systems and
-	// they want to park ocifactory under their own namespacing.
+	// DefaultPrefix is the OCI repo prefix that holds every
+	// namespace's metadata when no [WithPrefix] override is given.
 	DefaultPrefix = "_namespaces"
 
-	// DefaultArtifactType is the artifactType stamped onto namespace
-	// metadata manifests. Distinct from the data-plane artifactTypes
-	// (e.g. application/vnd.ocifactory.python) so an operator
-	// inspecting their OCI registry can tell metadata manifests apart
-	// at a glance.
-	DefaultArtifactType = "application/vnd.ocifactory.namespace"
-
-	// indexRepoSegment is the sub-repo under the prefix whose tags
-	// enumerate every existing namespace. Distribution's _catalog is
-	// optional and inconsistently implemented across registries, so
-	// we maintain our own index instead.
-	indexRepoSegment = "_index"
-
-	// metadataTag is the single tag every per-namespace repo carries.
-	// One tag per repo keeps the layout discoverable: an operator
-	// listing tags on _namespaces/<name> sees exactly _metadata.
-	metadataTag = "_metadata"
-
-	// specFileName is the filename of the spec layer inside the
-	// metadata manifest. The literal value is part of the on-disk
-	// layout and must not change without a migration.
-	specFileName = "spec.json"
-
-	// indexSentinelName is the filename of the placeholder layer
-	// under each tag in the index repo. The body is fixed; only the
-	// tag (= namespace name) is meaningful.
+	indexRepoSegment  = "_index"
+	metadataTag       = "_metadata"
+	specFileName      = "spec.json"
 	indexSentinelName = "present"
 )
 
-// indexSentinelBody is the constant payload of every index-repo
-// sentinel. Kept as bytes so each AddFile gets a fresh reader without
-// copying the literal at the call site.
 var indexSentinelBody = []byte("present\n")
 
-// ErrNotFound is returned by [Store.Get] (and Delete-then-cascade
-// callers) when the requested namespace does not exist. Wrapped with
-// %w by methods, so use errors.Is to check.
+// ErrNotFound is returned by [Store] methods (wrapped with %w) when
+// the requested namespace does not exist.
 var ErrNotFound = errors.New("namespace not found")
 
-// Store is the namespace persistence interface. The OCI-backed
-// implementation in this package is the only one we ship; the
-// interface exists so tests and downstream consumers can substitute
-// fakes without depending on the OCI types.
-type Store interface {
-	// Get returns the namespace with the given name. Returns
-	// [ErrNotFound] (wrapped) when the namespace does not exist.
-	Get(ctx context.Context, name string) (*Namespace, error)
-
-	// List returns the names of every namespace currently registered.
-	// Order is whatever the underlying tag listing returns.
-	List(ctx context.Context) ([]string, error)
-
-	// Put creates or updates a namespace (upsert semantics, mirroring
-	// the admin API's PUT verb).
-	Put(ctx context.Context, ns *Namespace) error
-
-	// Delete removes a namespace's metadata and index entry.
-	// Cascade onto the data-plane sub-repos is intentionally NOT
-	// performed here; that lives in a separate downstream issue so
-	// "drop the metadata" and "garbage-collect the artifacts" stay
-	// independently invocable.
-	Delete(ctx context.Context, name string) error
-}
-
 // Backend is the subset of *pkg/oci.Registry that pkg/namespace
-// depends on. It is exposed so tests can substitute pkg/oci's
-// in-memory FakeRegistry without going through a real OCI registry.
-// Production code passes *oci.Registry directly.
+// needs. It is exposed so tests can substitute pkg/oci.FakeRegistry;
+// production passes *oci.Registry directly.
 type Backend interface {
 	AddFile(ctx context.Context, f *oci.RepoFile, ro io.Reader) (*oci.FileDescriptor, error)
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
@@ -96,69 +41,45 @@ type Backend interface {
 	DeleteTagFiles(ctx context.Context, repo string, tag string) error
 }
 
-// store is the OCI-backed [Store] implementation. Constructed via
-// [NewStore]; the type is unexported because callers should depend on
-// the [Store] interface, not the concrete implementation.
-type store struct {
-	backend      Backend
-	prefix       string
-	artifactType string
+// Store persists namespace metadata in an OCI registry. Per-namespace
+// metadata lives at <prefix>/<name>:_metadata; an enumerable index
+// lives at <prefix>/_index, one tag per namespace. Distribution's
+// _catalog endpoint is optional and inconsistently implemented across
+// registries, so we maintain the index ourselves.
+type Store struct {
+	backend Backend
+	prefix  string
 }
 
-// Option configures a [store] at construction time.
-type Option func(*store)
+type Option func(*Store)
 
-// WithPrefix overrides the OCI repo prefix used for namespace
-// metadata. Defaults to [DefaultPrefix].
+// WithPrefix overrides [DefaultPrefix].
 func WithPrefix(prefix string) Option {
-	return func(s *store) { s.prefix = prefix }
+	return func(s *Store) { s.prefix = prefix }
 }
 
-// WithArtifactType overrides the artifactType stamped on namespace
-// metadata manifests. Defaults to [DefaultArtifactType]. Reserved as
-// an option so a future migration can flip the type without forcing a
-// rewrite of every operator's flag invocation.
-func WithArtifactType(at string) Option {
-	return func(s *store) { s.artifactType = at }
-}
-
-// NewStore constructs an OCI-backed namespace store. The supplied
-// backend is the metadata persistence layer; in production this is a
-// *pkg/oci.Registry, in tests it is typically a *pkg/oci.FakeRegistry.
-//
-// Returns the concrete type so callers that want to enrich the store
-// with additional methods (caches, audit hooks) in their own packages
-// can do so without an interface dance; the methods on *store satisfy
-// the [Store] interface.
-func NewStore(backend Backend, opts ...Option) *store {
-	s := &store{
-		backend:      backend,
-		prefix:       DefaultPrefix,
-		artifactType: DefaultArtifactType,
-	}
+// NewStore wraps backend in a namespace [Store]. In production
+// backend is a *pkg/oci.Registry; tests typically pass
+// *pkg/oci.FakeRegistry.
+func NewStore(backend Backend, opts ...Option) *Store {
+	s := &Store{backend: backend, prefix: DefaultPrefix}
 	for _, opt := range opts {
 		opt(s)
 	}
 	return s
 }
 
-// repoFor returns the per-namespace OCI repo path. Each namespace
-// gets its own repo so format-agnostic per-namespace state (the
-// package index from a downstream issue, future quotas, audit data)
-// can live alongside the spec without polluting the data plane.
-func (s *store) repoFor(name string) string {
+func (s *Store) repoFor(name string) string {
 	return path.Join(s.prefix, name)
 }
 
-// indexRepo returns the OCI repo path of the global index. One tag
-// per existing namespace; tag listing yields the namespace catalogue
-// without leaning on distribution's _catalog endpoint.
-func (s *store) indexRepo() string {
+func (s *Store) indexRepo() string {
 	return path.Join(s.prefix, indexRepoSegment)
 }
 
-// Get reads the metadata layer of a namespace and decodes it.
-func (s *store) Get(ctx context.Context, name string) (*Namespace, error) {
+// Get returns the namespace with the given name, or [ErrNotFound]
+// (wrapped) when it does not exist.
+func (s *Store) Get(ctx context.Context, name string) (*Namespace, error) {
 	if err := ValidateName(name); err != nil {
 		return nil, err
 	}
@@ -187,10 +108,8 @@ func (s *store) Get(ctx context.Context, name string) (*Namespace, error) {
 }
 
 // List returns the names of every registered namespace. An absent
-// index repo (no Put has ever happened) is reported as an empty list
-// rather than an error — first-Put-after-empty is a normal startup
-// state, not a failure.
-func (s *store) List(ctx context.Context) ([]string, error) {
+// index repo is reported as an empty list rather than an error.
+func (s *Store) List(ctx context.Context) ([]string, error) {
 	tags, err := s.backend.ListTags(ctx, s.indexRepo())
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
@@ -201,17 +120,16 @@ func (s *store) List(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
-// Put upserts a namespace: writes the spec layer and ensures an
-// index-repo entry exists.
+// Put upserts a namespace.
 //
-// The metadata write is delete-then-add: oci.Registry's default
-// (immutable) AddFile contract rejects re-uploads, but admin PUT
-// semantics demand upsert. Deleting the existing tag first means a
-// PUT works regardless of whether the registry was constructed with
-// WithAllowOverwrite — and since the namespace metadata path is the
-// admin plane (single-writer), we don't need stronger transactional
-// guarantees than "delete then write".
-func (s *store) Put(ctx context.Context, ns *Namespace) error {
+// Metadata: delete-then-add, since oci.Registry's default AddFile
+// contract is immutable but admin PUT semantics demand upsert.
+//
+// Index entry: AddFile with [oci.ErrAlreadyExists] swallowed. The
+// sentinel is content-identical across writes, so an idempotent
+// re-add reaches the same end state as "list + skip" without the
+// extra ListTags round-trip.
+func (s *Store) Put(ctx context.Context, ns *Namespace) error {
 	if ns == nil {
 		return errors.New("namespace must not be nil")
 	}
@@ -223,7 +141,7 @@ func (s *store) Put(ctx context.Context, ns *Namespace) error {
 		return fmt.Errorf("encode spec for %q: %w", ns.Name, err)
 	}
 
-	if err := s.backend.DeleteTagFiles(ctx, s.repoFor(ns.Name), metadataTag); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	if err := swallowNotFound(s.backend.DeleteTagFiles(ctx, s.repoFor(ns.Name), metadataTag)); err != nil {
 		return fmt.Errorf("clear namespace %q metadata: %w", ns.Name, err)
 	}
 
@@ -238,19 +156,6 @@ func (s *store) Put(ctx context.Context, ns *Namespace) error {
 		return fmt.Errorf("write namespace %q metadata: %w", ns.Name, err)
 	}
 
-	// Index-entry write is idempotent: skip when the sentinel is
-	// already there to honour the immutable-add contract on the
-	// AddFile underneath. Re-Putting the same namespace mustn't 409
-	// on the index sentinel.
-	tags, err := s.backend.ListTags(ctx, s.indexRepo())
-	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		return fmt.Errorf("list namespace index: %w", err)
-	}
-	for _, t := range tags {
-		if t == ns.Name {
-			return nil
-		}
-	}
 	indexRF := &oci.RepoFile{
 		OwningRepo: s.indexRepo(),
 		OwningTag:  ns.Name,
@@ -258,31 +163,37 @@ func (s *store) Put(ctx context.Context, ns *Namespace) error {
 		MediaType:  "text/plain",
 		Size:       int64(len(indexSentinelBody)),
 	}
-	if _, err := s.backend.AddFile(ctx, indexRF, bytes.NewReader(indexSentinelBody)); err != nil {
+	if _, err := s.backend.AddFile(ctx, indexRF, bytes.NewReader(indexSentinelBody)); err != nil && !errors.Is(err, oci.ErrAlreadyExists) {
 		return fmt.Errorf("write namespace %q index entry: %w", ns.Name, err)
 	}
 	return nil
 }
 
 // Delete removes a namespace's metadata and index entry. Returns
-// [ErrNotFound] (wrapped) when the namespace does not exist; the
-// probe avoids reporting success on a no-op delete, which would mask
-// admin-tool bugs.
+// [ErrNotFound] (wrapped) when the namespace does not exist.
 //
-// Data-plane cascade (purging artifacts under the namespace) is
-// intentionally NOT performed here — see the package doc.
-func (s *store) Delete(ctx context.Context, name string) error {
+// Data-plane cascade (purging artifacts under the namespace) is not
+// performed here — see the package doc.
+func (s *Store) Delete(ctx context.Context, name string) error {
 	if err := ValidateName(name); err != nil {
 		return err
 	}
-	if _, err := s.Get(ctx, name); err != nil {
-		return err
+	err := s.backend.DeleteTagFiles(ctx, s.repoFor(name), metadataTag)
+	if errors.Is(err, errdef.ErrNotFound) {
+		return fmt.Errorf("%w: %s", ErrNotFound, name)
 	}
-	if err := s.backend.DeleteTagFiles(ctx, s.repoFor(name), metadataTag); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	if err != nil {
 		return fmt.Errorf("delete namespace %q metadata: %w", name, err)
 	}
-	if err := s.backend.DeleteTagFiles(ctx, s.indexRepo(), name); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	if err := swallowNotFound(s.backend.DeleteTagFiles(ctx, s.indexRepo(), name)); err != nil {
 		return fmt.Errorf("delete namespace %q index entry: %w", name, err)
 	}
 	return nil
+}
+
+func swallowNotFound(err error) error {
+	if errors.Is(err, errdef.ErrNotFound) {
+		return nil
+	}
+	return err
 }

@@ -1,8 +1,10 @@
 package namespace
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 	"testing"
 
@@ -10,6 +12,12 @@ import (
 
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
+
+func newTestStore(t *testing.T, opts ...Option) (*oci.FakeRegistry, *Store, context.Context) {
+	t.Helper()
+	fake := oci.NewFakeRegistry()
+	return fake, NewStore(fake, opts...), t.Context()
+}
 
 func sampleSpec() Spec {
 	return Spec{
@@ -31,9 +39,7 @@ func sampleSpec() Spec {
 func TestStore_PutGet_Roundtrip(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	ns := &Namespace{Name: "myteam", Spec: sampleSpec()}
 	if err := s.Put(ctx, ns); err != nil {
@@ -52,9 +58,7 @@ func TestStore_PutGet_Roundtrip(t *testing.T) {
 func TestStore_Put_Updates(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	first := &Namespace{Name: "myteam", Spec: sampleSpec()}
 	if err := s.Put(ctx, first); err != nil {
@@ -83,8 +87,7 @@ func TestStore_Put_Updates(t *testing.T) {
 		t.Errorf("Get mismatch after update (-want +got):\n%s", diff)
 	}
 
-	// The index entry must remain a single tag — the second Put
-	// must not stack a duplicate sentinel.
+	// Re-Put must not stack a duplicate index sentinel.
 	names, err := s.List(ctx)
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -97,9 +100,7 @@ func TestStore_Put_Updates(t *testing.T) {
 func TestStore_Get_NotFound(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	_, err := s.Get(ctx, "missing")
 	if err == nil {
@@ -113,9 +114,7 @@ func TestStore_Get_NotFound(t *testing.T) {
 func TestStore_Get_InvalidName(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	_, err := s.Get(ctx, "_internal")
 	if !errors.Is(err, ErrInvalidName) {
@@ -126,9 +125,7 @@ func TestStore_Get_InvalidName(t *testing.T) {
 func TestStore_Put_InvalidName(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	if err := s.Put(ctx, &Namespace{Name: "BadName", Spec: sampleSpec()}); !errors.Is(err, ErrInvalidName) {
 		t.Errorf("Put error %v, want errors.Is ErrInvalidName", err)
@@ -138,9 +135,7 @@ func TestStore_Put_InvalidName(t *testing.T) {
 func TestStore_Put_NilNamespace(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	if err := s.Put(ctx, nil); err == nil {
 		t.Fatal("Put(nil) = nil, want error")
@@ -150,9 +145,7 @@ func TestStore_Put_NilNamespace(t *testing.T) {
 func TestStore_List_Empty(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	names, err := s.List(ctx)
 	if err != nil {
@@ -166,9 +159,7 @@ func TestStore_List_Empty(t *testing.T) {
 func TestStore_List_ReflectsCRUD(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	for _, name := range []string{"alpha", "beta", "gamma"} {
 		if err := s.Put(ctx, &Namespace{Name: name, Spec: sampleSpec()}); err != nil {
@@ -202,9 +193,7 @@ func TestStore_List_ReflectsCRUD(t *testing.T) {
 func TestStore_Delete_Removes(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	if err := s.Put(ctx, &Namespace{Name: "myteam", Spec: sampleSpec()}); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -230,9 +219,7 @@ func TestStore_Delete_Removes(t *testing.T) {
 func TestStore_Delete_NotFound(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	_, s, ctx := newTestStore(t)
 
 	if err := s.Delete(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Delete(missing) error %v, want errors.Is ErrNotFound", err)
@@ -242,19 +229,16 @@ func TestStore_Delete_NotFound(t *testing.T) {
 func TestStore_WithPrefix_RoutesToConfiguredRepos(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake, WithPrefix("custom/_namespaces"))
-	ctx := t.Context()
+	fake, s, ctx := newTestStore(t, WithPrefix("custom/_namespaces"))
 
 	if err := s.Put(ctx, &Namespace{Name: "myteam", Spec: sampleSpec()}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Per-namespace metadata lives at <prefix>/<name>:_metadata.
 	if _, ok := fake.Files["custom/_namespaces/myteam/_metadata/"+specFileName]; !ok {
-		t.Errorf("expected metadata file under custom/_namespaces/myteam/_metadata, got files: %v", keys(fake.Files))
+		t.Errorf("expected metadata file under custom/_namespaces/myteam/_metadata, got files: %v",
+			slices.Sorted(maps.Keys(fake.Files)))
 	}
-	// Index lives at <prefix>/_index, one tag per namespace.
 	indexTags, err := fake.ListTags(ctx, "custom/_namespaces/_index")
 	if err != nil {
 		t.Fatalf("ListTags index: %v", err)
@@ -264,24 +248,22 @@ func TestStore_WithPrefix_RoutesToConfiguredRepos(t *testing.T) {
 	}
 }
 
+// TestStore_OnDiskLayout pins the metadata path so a refactor that
+// breaks the on-disk shape trips this test rather than silently
+// migrating every operator's existing storage.
 func TestStore_OnDiskLayout(t *testing.T) {
 	t.Parallel()
 
-	fake := oci.NewFakeRegistry()
-	s := NewStore(fake)
-	ctx := t.Context()
+	fake, s, ctx := newTestStore(t)
 
 	want := sampleSpec()
 	if err := s.Put(ctx, &Namespace{Name: "myteam", Spec: want}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Pin the metadata path so a future refactor that breaks the
-	// on-disk shape trips this test rather than silently migrating
-	// every operator's existing storage.
 	body, ok := fake.Files["_namespaces/myteam/_metadata/"+specFileName]
 	if !ok {
-		t.Fatalf("metadata file not found, got files: %v", keys(fake.Files))
+		t.Fatalf("metadata file not found, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
 	var got Spec
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -291,17 +273,7 @@ func TestStore_OnDiskLayout(t *testing.T) {
 		t.Errorf("on-disk spec mismatch (-want +got):\n%s", diff)
 	}
 
-	// And the index sentinel.
 	if _, ok := fake.Files["_namespaces/_index/myteam/"+indexSentinelName]; !ok {
-		t.Errorf("expected index sentinel file, got files: %v", keys(fake.Files))
+		t.Errorf("expected index sentinel file, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
-}
-
-func keys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
 }
