@@ -267,16 +267,6 @@ func WithBlobRedirectDisabled(disabled bool) RegistryOption {
 
 // RepoFile represents a file in an OCI repository.
 type RepoFile struct {
-	// Namespace is the logical registry tenant the file belongs to.
-	// pkg/oci itself ignores this field — it is consumed by upstream
-	// wrappers (notably pkg/namespace.Registry) that prefix
-	// OwningRepo with the namespace before forwarding to oci.Registry.
-	// Carrying it on the file struct rather than as a separate
-	// argument lets handlers keep using the existing
-	// (*RepoFile)-shaped Registry methods regardless of whether
-	// they're talking to a wrapper or the raw OCI layer.
-	Namespace string
-
 	OwningRepo string // Repository the owns the file. Usually what's right after the registy host.
 	OwningTag  string // Usually the package version that owns the file.
 	RefTag     string // Tag that points to the file. Could be empty.

@@ -88,25 +88,22 @@ type RegistryBackend interface {
 	DeleteTagFiles(ctx context.Context, repo string, tag string) error
 }
 
-// Registry is the data-plane wrapper that namespace-scopes every OCI
-// operation. It:
+// Registry is the data-plane wrapper that holds the cross-namespace
+// state — the authorizer cache, the package-index dedupe set, the
+// pluggable authz factory — and hands out per-namespace
+// [ScopedRegistry] views via [Registry.For].
 //
-//   - Reads [oci.RepoFile.Namespace] from the caller-supplied file
-//     and prefixes OwningRepo with it so writes from namespace
-//     "alpha" land under "alpha/<owning-repo>" and cannot be read
-//     from namespace "beta".
-//   - Enforces the namespace's authz policy on every call. The
-//     compiled authorizer is cached behind a TTL+LRU and a
-//     singleflight collapse so the hot path is one map lookup per
-//     request and a cold-start burst pays for one compile, not N.
-//   - Maintains a per-namespace package index at
-//     "<namespace>/_packages" (one tag per owning-repo) so cascade
-//     delete and namespace listing don't depend on the OCI _catalog
-//     endpoint.
+// Handlers don't use *Registry directly; they hold a
+// *ScopedRegistry obtained per request:
 //
-// Handlers consume *Registry instead of *oci.Registry so authz
-// enforcement is a structural guarantee — a future format author
-// cannot forget to call the authorizer.
+//	ns := mux.Vars(req)["namespace"]
+//	scoped := r.For(ns)
+//	desc, err := scoped.AddFile(ctx, f, body)
+//
+// *ScopedRegistry implements the existing [pkg/handler.Registry]
+// interface, so handlers can swap a *pkg/oci.Registry for a
+// *ScopedRegistry without changing any call site — namespace-aware
+// authz and OwningRepo prefixing happen transparently.
 type Registry struct {
 	inner       RegistryBackend
 	store       *Store
@@ -186,6 +183,16 @@ func NewRegistry(inner RegistryBackend, store *Store, opts ...RegistryOption) *R
 	return r
 }
 
+// For returns a [ScopedRegistry] bound to namespace. The returned
+// view is cheap to construct (a small struct, no I/O) so handlers
+// should call it per request rather than caching it. The bound
+// namespace is enforced on every method invocation — there is no
+// way to issue a cross-namespace operation through a single
+// ScopedRegistry.
+func (r *Registry) For(namespace string) *ScopedRegistry {
+	return &ScopedRegistry{parent: r, namespace: namespace}
+}
+
 // InvalidatePolicy drops the cached authorizer for name so the next
 // request re-fetches the namespace spec. The Store calls this
 // automatically after a successful Put or Delete; admin-side code
@@ -230,8 +237,8 @@ func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Au
 
 	// singleflight collapses concurrent misses for the same namespace
 	// onto one Store.Get + factory(...) compile. The closure return
-	// value is the *cachedPolicy we then cache locally; the
-	// follower goroutines all observe the same value via singleflight.
+	// value is the cachedPolicy we then cache locally; the follower
+	// goroutines all observe the same value via singleflight.
 	v, err, _ := r.flight.Do(namespace, func() (any, error) {
 		// Re-check the cache inside the singleflight: another
 		// goroutine may have populated it between our first miss
@@ -291,8 +298,6 @@ func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
 	if cleaned != owningRepo {
 		return "", fmt.Errorf("%w: owning repo %q is not in canonical form (clean: %q)", ErrInvalidOwningRepo, owningRepo, cleaned)
 	}
-	// path.Clean turns "" → "." but we already returned for empty;
-	// any "." or ".." here is a real escape attempt.
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
 		return "", fmt.Errorf("%w: owning repo %q escapes namespace", ErrInvalidOwningRepo, owningRepo)
 	}
@@ -308,153 +313,155 @@ func (r *Registry) packageIndexRepo(namespace string) string {
 	return path.Join(namespace, r.indexSuffix)
 }
 
-// requireFile centralises the nil-pointer + namespace-required
-// guards so each public method is one line shorter.
-func requireFile(f *oci.RepoFile) error {
-	if f == nil {
-		return errors.New("RepoFile must not be nil")
-	}
-	if f.Namespace == "" {
-		return errors.New("RepoFile.Namespace must not be empty")
-	}
-	return nil
+// ScopedRegistry is a per-namespace view of a [Registry]. Every
+// method authorizes the bound namespace, prefixes OwningRepo (or the
+// raw repo string for ListTags/ListFiles/etc.) with it, and forwards
+// to the underlying OCI backend.
+//
+// The struct is intentionally cheap to construct — it carries a
+// pointer to the parent and a string. Handlers obtain one per
+// request via [Registry.For] and discard it when the request
+// finishes.
+//
+// *ScopedRegistry implements the existing [pkg/handler.Registry]
+// interface so handler code that previously held a *pkg/oci.Registry
+// can swap to a *ScopedRegistry with no signature changes.
+type ScopedRegistry struct {
+	parent    *Registry
+	namespace string
 }
 
-// AddFile authorizes f.Namespace for write, prefixes f.OwningRepo
-// with the namespace, forwards to the inner registry, and (best-
-// effort) records the owning-repo in the namespace's package index
-// so [ListPackages] can enumerate it later.
-func (r *Registry) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
-	if err := requireFile(f); err != nil {
+// Namespace returns the bound namespace name.
+func (s *ScopedRegistry) Namespace() string { return s.namespace }
+
+// AddFile authorizes the bound namespace for write, prefixes
+// f.OwningRepo with the namespace, forwards to the inner registry,
+// and (best-effort) records the owning-repo in the namespace's
+// package index.
+func (s *ScopedRegistry) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+	if f == nil {
+		return nil, errors.New("RepoFile must not be nil")
+	}
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return nil, err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpWrite); err != nil {
-		return nil, err
-	}
-	scoped, err := r.scopedFile(f)
+	scoped, err := s.parent.scopedFile(s.namespace, f)
 	if err != nil {
 		return nil, err
 	}
-	desc, err := r.inner.AddFile(ctx, scoped, body)
+	desc, err := s.parent.inner.AddFile(ctx, scoped, body)
 	if err != nil {
 		return nil, err
 	}
-	r.recordPackage(ctx, f.Namespace, f.OwningRepo)
+	s.parent.recordPackage(ctx, s.namespace, f.OwningRepo)
 	return desc, nil
 }
 
-// ReadFile authorizes f.Namespace for read and forwards to the inner
-// registry with OwningRepo prefixed.
-func (r *Registry) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
-	if err := requireFile(f); err != nil {
+// ReadFile authorizes the bound namespace for read and forwards to
+// the inner registry with OwningRepo prefixed.
+func (s *ScopedRegistry) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
+	if f == nil {
+		return nil, nil, errors.New("RepoFile must not be nil")
+	}
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, nil, err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpRead); err != nil {
-		return nil, nil, err
-	}
-	scoped, err := r.scopedFile(f)
+	scoped, err := s.parent.scopedFile(s.namespace, f)
 	if err != nil {
 		return nil, nil, err
 	}
-	return r.inner.ReadFile(ctx, scoped)
+	return s.parent.inner.ReadFile(ctx, scoped)
 }
 
-// BlobRedirectURL authorizes f.Namespace for read and forwards to
-// the inner registry with OwningRepo prefixed. Returns ("", nil)
-// when the backend serves blobs inline, mirroring [oci.Registry].
-func (r *Registry) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
-	if err := requireFile(f); err != nil {
+// BlobRedirectURL authorizes the bound namespace for read and
+// forwards to the inner registry with OwningRepo prefixed. Returns
+// ("", nil) when the backend serves blobs inline, mirroring
+// [oci.Registry].
+func (s *ScopedRegistry) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
+	if f == nil {
+		return "", errors.New("RepoFile must not be nil")
+	}
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return "", err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpRead); err != nil {
-		return "", err
-	}
-	scoped, err := r.scopedFile(f)
+	scoped, err := s.parent.scopedFile(s.namespace, f)
 	if err != nil {
 		return "", err
 	}
-	return r.inner.BlobRedirectURL(ctx, scoped)
+	return s.parent.inner.BlobRedirectURL(ctx, scoped)
 }
 
-// ListTags authorizes f.Namespace for read and returns the canonical
-// tags for f.OwningRepo within the namespace. f need only carry
-// Namespace and OwningRepo; other fields are ignored.
-func (r *Registry) ListTags(ctx context.Context, f *oci.RepoFile) ([]string, error) {
-	if err := requireFile(f); err != nil {
+// ListTags authorizes the bound namespace for read and returns the
+// canonical tags for repo within the namespace.
+func (s *ScopedRegistry) ListTags(ctx context.Context, repo string) ([]string, error) {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpRead); err != nil {
-		return nil, err
-	}
-	scoped, err := r.resolveRepo(f.Namespace, f.OwningRepo)
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return nil, err
 	}
-	return r.inner.ListTags(ctx, scoped)
+	return s.parent.inner.ListTags(ctx, scoped)
 }
 
-// ListFiles authorizes f.Namespace for read and returns every file
-// across every canonical version of f.OwningRepo within the
+// ListFiles authorizes the bound namespace for read and returns
+// every file across every canonical version of repo within the
 // namespace. The OwningRepo on each returned [oci.RepoFile] is
-// rewritten back to the namespace-relative form and the Namespace
-// field is set, so callers don't see the raw backend prefix leak
-// through. Returned slices and pointers are freshly allocated by the
-// inner registry; the wrapper makes a defensive copy of each
-// element before mutating to keep any future inner-side caching
-// safe.
-func (r *Registry) ListFiles(ctx context.Context, f *oci.RepoFile) ([]*oci.RepoFile, error) {
-	if err := requireFile(f); err != nil {
+// rewritten back to the namespace-relative form so callers don't see
+// the raw backend prefix leak through. Each returned *RepoFile is
+// freshly allocated by the wrapper so a future inner-side cache of
+// descriptors stays safe.
+func (s *ScopedRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpRead); err != nil {
-		return nil, err
-	}
-	scoped, err := r.resolveRepo(f.Namespace, f.OwningRepo)
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return nil, err
 	}
-	files, err := r.inner.ListFiles(ctx, scoped)
+	files, err := s.parent.inner.ListFiles(ctx, scoped)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]*oci.RepoFile, len(files))
 	for i, src := range files {
 		copyF := *src
-		copyF.Namespace = f.Namespace
-		copyF.OwningRepo = stripPrefix(copyF.OwningRepo, f.Namespace)
+		copyF.OwningRepo = stripPrefix(copyF.OwningRepo, s.namespace)
 		out[i] = &copyF
 	}
 	return out, nil
 }
 
-// ListPackages authorizes namespace for read and returns every
-// owning-repo the wrapper has recorded a write for in the namespace's
-// package index. Tags are decoded back to their original "/"-form.
+// ListPackages authorizes the bound namespace for read and returns
+// every owning-repo the wrapper has recorded a write for in the
+// namespace's package index. Tags are decoded back to their original
+// "/"-form.
 //
 // An absent index repo is reported as an empty list — a namespace
 // that has never been written to legitimately has no packages.
-func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string, error) {
-	if err := r.authorize(ctx, namespace, auth.OpRead); err != nil {
+func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	tags, err := r.inner.ListTags(ctx, r.packageIndexRepo(namespace))
+	tags, err := s.parent.inner.ListTags(ctx, s.parent.packageIndexRepo(s.namespace))
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("list package index for %q: %w", namespace, err)
+		return nil, fmt.Errorf("list package index for %q: %w", s.namespace, err)
 	}
 	out := make([]string, 0, len(tags))
 	for _, t := range tags {
 		decoded, derr := decodeTag(t)
 		if derr != nil {
-			// A tag that doesn't decode means an admin or a previous
-			// ocifactory version wrote a non-encoded tag. Skip it
-			// rather than failing the whole listing — the contract
-			// is "best-effort enumeration" and a stray tag is no
-			// reason to deny callers their other packages.
+			// A tag that doesn't decode means an admin or a
+			// previous ocifactory version wrote a non-encoded tag.
+			// Skip it rather than failing the whole listing — the
+			// contract is "best-effort enumeration" and a stray
+			// tag is no reason to deny callers their other
+			// packages.
 			logging.FromContext(ctx).WarnContext(ctx, "namespace package index: skipping undecodable tag",
-				"namespace", namespace, "tag", t, "error", derr,
+				"namespace", s.namespace, "tag", t, "error", derr,
 			)
 			continue
 		}
@@ -463,73 +470,63 @@ func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string
 	return out, nil
 }
 
-// AppendRefs authorizes f.Namespace for write and forwards to the
-// inner registry with OwningRepo prefixed. f need only carry
-// Namespace, OwningRepo, and OwningTag (treated as the canonical
-// tag); other fields are ignored.
-func (r *Registry) AppendRefs(ctx context.Context, f *oci.RepoFile, refs ...string) error {
-	if err := requireFile(f); err != nil {
+// AppendRefs authorizes the bound namespace for write and forwards
+// to the inner registry with repo prefixed.
+func (s *ScopedRegistry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
-	if f.OwningTag == "" {
-		return errors.New("RepoFile.OwningTag must be set for AppendRefs")
+	if canonicalTag == "" {
+		return errors.New("canonicalTag must not be empty")
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpWrite); err != nil {
-		return err
-	}
-	scoped, err := r.resolveRepo(f.Namespace, f.OwningRepo)
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return err
 	}
-	return r.inner.AppendRefs(ctx, scoped, f.OwningTag, refs...)
+	return s.parent.inner.AppendRefs(ctx, scoped, canonicalTag, refs...)
 }
 
-// DeleteRepoFiles authorizes f.Namespace for write and forwards to
-// the inner registry with OwningRepo prefixed. The package index
-// entry for f.OwningRepo is cleared after the inner delete succeeds
-// — both the in-process indexed marker AND the backend index tag —
-// so [ListPackages] no longer reports the now-empty repo. Index
-// cleanup failures are logged at WARN and do not fail the call.
-func (r *Registry) DeleteRepoFiles(ctx context.Context, f *oci.RepoFile) error {
-	if err := requireFile(f); err != nil {
+// DeleteRepoFiles authorizes the bound namespace for write and
+// forwards to the inner registry with repo prefixed. The package
+// index entry for repo is cleared after the inner delete succeeds —
+// both the in-process indexed marker AND the backend index tag — so
+// [ListPackages] no longer reports the now-empty repo. Index cleanup
+// failures are logged at WARN and do not fail the call.
+func (s *ScopedRegistry) DeleteRepoFiles(ctx context.Context, repo string) error {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
-	if err := r.authorize(ctx, f.Namespace, auth.OpWrite); err != nil {
-		return err
-	}
-	scoped, err := r.resolveRepo(f.Namespace, f.OwningRepo)
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return err
 	}
-	if err := r.inner.DeleteRepoFiles(ctx, scoped); err != nil {
+	if err := s.parent.inner.DeleteRepoFiles(ctx, scoped); err != nil {
 		return err
 	}
-	r.indexed.Remove(indexedKey(f.Namespace, f.OwningRepo))
-	encoded, encErr := encodeTag(f.OwningRepo)
+	s.parent.indexed.Remove(indexedKey(s.namespace, repo))
+	encoded, encErr := encodeTag(repo)
 	if encErr != nil {
-		// The owning-repo passed authorize() and resolveRepo() so
-		// this should never fail; treat as bug-not-vuln and log.
+		// The repo passed authorize() and resolveRepo() so this
+		// should never fail; treat as bug-not-vuln and log.
 		logging.FromContext(ctx).WarnContext(ctx, "namespace package index: encode failed on delete",
-			"namespace", f.Namespace, "owning_repo", f.OwningRepo, "error", encErr,
+			"namespace", s.namespace, "owning_repo", repo, "error", encErr,
 		)
 		return nil
 	}
-	if err := r.inner.DeleteTagFiles(ctx, r.packageIndexRepo(f.Namespace), encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	if err := s.parent.inner.DeleteTagFiles(ctx, s.parent.packageIndexRepo(s.namespace), encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		logging.FromContext(ctx).WarnContext(ctx, "namespace package index sweep failed",
-			"namespace", f.Namespace, "owning_repo", f.OwningRepo, "error", err,
+			"namespace", s.namespace, "owning_repo", repo, "error", err,
 		)
 	}
 	return nil
 }
 
 // scopedFile returns a copy of f with OwningRepo rewritten to the
-// namespace-prefixed backend form and Namespace cleared (the inner
-// OCI registry doesn't know about namespaces). Returns
-// [ErrInvalidOwningRepo] when the input would escape the namespace.
-func (r *Registry) scopedFile(f *oci.RepoFile) (*oci.RepoFile, error) {
+// namespace-prefixed backend form. Returns [ErrInvalidOwningRepo]
+// when the input would escape the namespace.
+func (r *Registry) scopedFile(namespace string, f *oci.RepoFile) (*oci.RepoFile, error) {
 	scoped := *f
-	scoped.Namespace = ""
-	resolved, err := r.resolveRepo(f.Namespace, f.OwningRepo)
+	resolved, err := r.resolveRepo(namespace, f.OwningRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -549,8 +546,7 @@ func (r *Registry) scopedFile(f *oci.RepoFile) (*oci.RepoFile, error) {
 // deleting while another goroutine still references the same
 // *sync.Mutex would let an arriving third goroutine LoadOrStore a
 // fresh mutex for the same key, "guarding" with two unrelated
-// mutexes. The map is bounded by the indexed-LRU's eviction (entries
-// never used again age out as the LRU evicts).
+// mutexes. The map is bounded by the indexed-LRU's eviction.
 func (r *Registry) recordPackage(ctx context.Context, namespace, owningRepo string) {
 	if owningRepo == "" {
 		return
@@ -568,11 +564,7 @@ func (r *Registry) recordPackage(ctx context.Context, namespace, owningRepo stri
 	// Re-check after acquiring the lock: an earlier holder may have
 	// just populated the indexed-set, in which case our backend write
 	// is wasted work the LRU re-check catches here. This re-check is
-	// the load-bearing dedupe — without it, a later concurrent
-	// arriver under a different mutex (impossible today thanks to
-	// the no-delete invariant on indexLocks, but enforced by belt-
-	// and-braces here) would race a redundant AddFile to the
-	// backend.
+	// the load-bearing dedupe.
 	if _, ok := r.indexed.Get(key); ok {
 		return
 	}
