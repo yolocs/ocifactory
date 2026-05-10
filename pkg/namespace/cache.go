@@ -8,22 +8,6 @@ import (
 	"github.com/yolocs/ocifactory/pkg/auth"
 )
 
-// DefaultPolicyCacheTTL is the default lifetime of a single entry in
-// the data-plane authz policy cache. Picked short enough that an
-// operator's `PUT namespace` lands in front of in-flight clients
-// within a one-minute window without explicit invalidation, long
-// enough that a hot namespace pulling thousands of artifacts a minute
-// pays for one Store.Get + Policy compile rather than one per request.
-const DefaultPolicyCacheTTL = 60 * time.Second
-
-// DefaultPolicyCacheSize bounds the number of distinct namespaces the
-// policy cache holds. Sized generously so even multi-tenant
-// deployments with hundreds of namespaces never evict in practice;
-// the cap exists to put a hard ceiling on memory rather than as a
-// tuning knob. A value <= 0 disables the size bound for the
-// underlying LRU and is rejected by [NewRegistry].
-const DefaultPolicyCacheSize = 1024
-
 // cachedPolicy is the value stored per namespace name in the policy
 // cache. notFound carries a negative result from [Store.Get] so a
 // burst of requests against a missing namespace doesn't repeatedly

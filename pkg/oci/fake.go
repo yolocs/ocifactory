@@ -78,28 +78,36 @@ func (r *FakeRegistry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (
 		return nil, fmt.Errorf("OwningTag must be set")
 	}
 
+	// Pre-flight checks under the lock so we can refuse the upload
+	// without consuming the body — matches the real Registry's
+	// pre-upload rejection contract that handler tests rely on for
+	// twine-retry simulation.
+	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Refuse to clobber an alias tag with a canonical version push — the
-	// real registry does the same via the artifactType HEAD probe.
 	if _, ok := r.Aliases[aliasKey(f.OwningRepo, f.OwningTag)]; ok {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: tag %q in repo %q is an alias", ErrAliasCollision, f.OwningTag, f.OwningRepo)
 	}
-
-	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
 	if _, exists := r.Files[key]; exists && !r.AllowOverwrite {
-		// Match the real Registry's pre-upload rejection: the body
-		// is not consumed, so handler tests that simulate a twine
-		// retry can re-use the same reader.
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAlreadyExists, key)
 	}
+	r.mu.Unlock()
 
+	// Read the body without holding the lock — a slow reader (e.g.
+	// one blocked on a channel) would otherwise stall every
+	// concurrent fake op. The race window is benign: a colliding
+	// concurrent upload that wins between the pre-check and the
+	// store below either gets ErrAlreadyExists itself or, with
+	// AllowOverwrite, is overwritten in turn — same outcome as a
+	// real backend racing two PUTs.
 	content, err := io.ReadAll(ro)
 	if err != nil {
 		return nil, err
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.Files[key] = content
 	r.addTagLocked(f.OwningRepo, f.OwningTag)
 

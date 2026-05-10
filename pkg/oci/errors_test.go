@@ -86,10 +86,10 @@ func TestNormalizeNotFound(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		err         error
-		wantNotFnd  bool // errors.Is(err, errdef.ErrNotFound) after normalize
-		wantHas404  bool // HasCode(err, 404) after normalize
+		name       string
+		err        error
+		wantNotFnd bool // errors.Is(err, errdef.ErrNotFound) after normalize
+		wantHas404 bool // HasCode(err, 404) after normalize
 	}{
 		{
 			name:       "nil",
