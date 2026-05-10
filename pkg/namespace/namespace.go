@@ -27,21 +27,3 @@ type Spec struct {
 	// dropped by an older one.
 	Format map[string]json.RawMessage `json:"format,omitempty"`
 }
-
-// Policy is the authz block of a [Spec].
-type Policy struct {
-	Readers []SubjectMatcher `json:"readers,omitempty"`
-	Writers []SubjectMatcher `json:"writers,omitempty"`
-}
-
-// SubjectMatcher matches an authenticated subject. All non-empty
-// fields must match for the matcher to apply.
-type SubjectMatcher struct {
-	Issuer      string            `json:"issuer,omitempty"`
-	SubMatch    string            `json:"sub_match,omitempty"`
-	Email       string            `json:"email,omitempty"`
-	ClaimsMatch map[string]string `json:"claims_match,omitempty"`
-	// Kind selects the credential family. "oidc" (default) matches
-	// OIDC identities; "basictoken" matches static-token identities.
-	Kind string `json:"kind,omitempty"`
-}
