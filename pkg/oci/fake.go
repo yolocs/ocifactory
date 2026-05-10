@@ -198,6 +198,34 @@ func (r *FakeRegistry) BlobRedirectURL(ctx context.Context, f *RepoFile) (string
 	return "", nil
 }
 
+// DeleteTagFiles mirrors *Registry.DeleteTagFiles for the in-memory
+// fake. An alias tag is unbound; a canonical tag has every file
+// keyed under it removed and the tag itself dropped from the repo's
+// tag list. A tag that doesn't exist returns errdef.ErrNotFound so
+// callers can use errors.Is to distinguish "already gone" from a
+// genuine error.
+func (r *FakeRegistry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
+	aliasK := aliasKey(repo, tag)
+	if _, ok := r.Aliases[aliasK]; ok {
+		delete(r.Aliases, aliasK)
+		return nil
+	}
+	if !slices.Contains(r.Tags[repo], tag) {
+		return fmt.Errorf("tag %q not found in repo %q: %w", tag, repo, errdef.ErrNotFound)
+	}
+	prefix := repo + "/" + tag + "/"
+	for k := range r.Files {
+		if strings.HasPrefix(k, prefix) {
+			delete(r.Files, k)
+		}
+	}
+	r.Tags[repo] = slices.DeleteFunc(r.Tags[repo], func(t string) bool { return t == tag })
+	if len(r.Tags[repo]) == 0 {
+		delete(r.Tags, repo)
+	}
+	return nil
+}
+
 func aliasKey(repo, alias string) string {
 	return repo + "/" + alias
 }
