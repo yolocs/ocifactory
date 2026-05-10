@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"oras.land/oras-go/v2/errdef"
 )
@@ -47,7 +48,7 @@ var (
 )
 
 type Handler struct {
-	registry handler.Registry
+	registry *namespace.Registry
 	authMW   func(http.Handler) http.Handler
 }
 
@@ -67,7 +68,13 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
-func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
+// NewHandler creates a new Handler.
+//
+// registry is the data-plane wrapper that hands out per-request
+// [*namespace.ScopedRegistry] views via [registry.For]. Every routed
+// handler func resolves the namespace from the request URL
+// (`/{namespace}/maven2/...`) and obtains a scoped view at the top.
+func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -75,6 +82,10 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 	return &Handler{registry: registry, authMW: cfg.authMW}, nil
 }
 
+// Mux returns the maven handler's router. Every route lives under
+// the `/{namespace}/maven2` subrouter — the `maven2/` segment after
+// the namespace makes the URL self-describing for operators routing
+// multiple format handlers behind a single hostname per namespace.
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
 	if h.authMW != nil {
@@ -83,30 +94,39 @@ func (h *Handler) Mux() http.Handler {
 		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
+	nsr := router.PathPrefix("/{namespace}/maven2").Subrouter()
+
 	// 1. Archetype Catalog
 	// Handles GET, HEAD, PUT, POST for /archetype-catalog.xml
-	router.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
 	// Handles GET, HEAD, PUT, POST for snapshot metadata files.
 	// Example: /{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml
-	router.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 3. Artifact Metadata (e.g., group/artifact/maven-metadata.xml or group/artifact/version/maven-metadata.xml for releases)
 	// Handles GET, HEAD, PUT, POST for non-snapshot metadata files. This must be after snapshot metadata.
 	// Example: /{groupId}/{artifactId}/maven-metadata.xml
-	router.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	// 4. Regular Artifact Files (e.g., group/artifact/version/file.jar)
 	// Handles GET, HEAD, PUT, POST for general artifact files. This is the most general route and must be last.
 	// Example: /{groupId}/{artifactId}/{version}/{filename.ext}
-	router.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
 
 	return router
 }
 
+// scopedFor returns the per-request [*namespace.ScopedRegistry] for
+// the namespace in req's URL. Cheap to construct; called per request.
+func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
+	return h.registry.For(mux.Vars(req)["namespace"])
+}
+
 // handleArchetypeCatalog handles requests for archetype-catalog.xml.
 func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Request) {
+	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: "archetype",
 		OwningTag:  "latest",
@@ -114,9 +134,9 @@ func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, scoped, f)
 	}
 }
 
@@ -131,6 +151,7 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
 		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
@@ -138,9 +159,9 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, scoped, f)
 	}
 }
 
@@ -154,6 +175,7 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
 		OwningTag:  "metadata", // For release artifact or version metadata
@@ -161,9 +183,9 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, scoped, f)
 	}
 }
 
@@ -179,6 +201,7 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		return
 	}
 
+	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: repoParts,
 		OwningTag:  version,
@@ -186,21 +209,24 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		MediaType:  detectMediaType(filename),
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, f)
+		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, f)
+		h.handleGet(w, req, scoped, f)
 	}
 }
 
 // handlePut processes PUT/POST requests to add a file.
-func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
+func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	defer req.Body.Close()
 
-	body, err := h.maybeVerifyChecksum(req, f)
+	body, err := h.maybeVerifyChecksum(req, scoped, f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
+		if handler.WriteNamespaceError(req.Context(), w, err) {
+			return
+		}
 		code := httpStatus(err)
 		if code == 0 {
 			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
@@ -212,9 +238,12 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 		return
 	}
 
-	desc, err := h.registry.AddFile(req.Context(), f, body)
+	desc, err := scoped.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
+		if handler.WriteNamespaceError(req.Context(), w, err) {
+			return
+		}
 		if errors.Is(err, oci.ErrAlreadyExists) {
 			http.Error(w, "file already exists in version", http.StatusConflict)
 			return
@@ -238,9 +267,10 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, f *oci.Rep
 // For non-checksum filenames it returns req.Body untouched and forwards
 // req.ContentLength via f.Size so AddFile keeps its streaming fast path.
 // For checksum filenames it buffers the (always tiny) body, validates it
-// against the previously-uploaded companion artifact, and returns a
-// reader over the buffered bytes so AddFile still sees an io.Reader.
-func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Reader, error) {
+// against the previously-uploaded companion artifact (looked up through
+// the per-request scoped registry view), and returns a reader over the
+// buffered bytes so AddFile still sees an io.Reader.
+func (h *Handler) maybeVerifyChecksum(req *http.Request, scoped handler.Registry, f *oci.RepoFile) (io.Reader, error) {
 	if ext, _, _ := checksumExt(f.Name); ext == "" {
 		// Forward the HTTP Content-Length so AddFile can short-circuit
 		// the peek-and-decide buffer for sized uploads (mvn deploy
@@ -259,7 +289,7 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Re
 		return nil, badRequest("checksum body exceeds %d bytes", maxChecksumBodyBytes)
 	}
 
-	if err := verifyChecksumUpload(req.Context(), h.registry, f, body); err != nil {
+	if err := verifyChecksumUpload(req.Context(), scoped, f, body); err != nil {
 		return nil, err
 	}
 
@@ -267,26 +297,32 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, f *oci.RepoFile) (io.Re
 	return bytes.NewReader(body), nil
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
+func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	// HEAD wants headers only — never redirect. The redirect path is
 	// only worth taking when the response would otherwise transfer
 	// bytes; HEAD has no egress to save.
 	if req.Method != http.MethodHead {
-		if redirectURL, err := h.registry.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+		if redirectURL, err := scoped.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
 			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return
 		} else if err != nil {
-			// Best-effort — fall through to the streaming path.
+			// Best-effort — fall through to the streaming path. A
+			// hard namespace authz failure surfaces from ReadFile
+			// below, so the redirect probe doesn't need its own
+			// mapping path.
 			logger.DebugContext(req.Context(), "blob redirect probe failed; falling back to streaming", "error", err)
 		}
 	}
 
-	desc, r, err := h.registry.ReadFile(req.Context(), f)
+	desc, r, err := scoped.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
+		if handler.WriteNamespaceError(req.Context(), w, err) {
+			return
+		}
 		if errors.Is(err, errdef.ErrNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return

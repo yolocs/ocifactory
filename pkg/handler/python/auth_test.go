@@ -6,14 +6,14 @@ import (
 	"testing"
 
 	"github.com/yolocs/ocifactory/pkg/auth"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// TestMux_AuthGating wires a python handler with an auth
-// middleware that always 401s and confirms every route hits the
-// gate (i.e. the handler itself is NOT reached). This is the
-// happy-case proof that WithAuthMiddleware actually chains the
-// middleware on the python router.
+// TestMux_AuthGating wires a python handler with an auth middleware
+// that always 401s and confirms every namespaced route hits the gate
+// (i.e. the handler itself is NOT reached, and the namespace wrapper
+// has no chance to deny first).
 func TestMux_AuthGating(t *testing.T) {
 	t.Parallel()
 
@@ -23,7 +23,11 @@ func TestMux_AuthGating(t *testing.T) {
 		})
 	}
 
-	reg := oci.NewFakeRegistry()
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	// A namespace registration is not even required — the denyAll
+	// middleware short-circuits before the wrapper sees the request.
 	h, err := NewHandler(reg, WithAuthMiddleware(denyAll))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -35,10 +39,10 @@ func TestMux_AuthGating(t *testing.T) {
 		method string
 		path   string
 	}{
-		{name: "simple index", method: http.MethodGet, path: "/simple/"},
-		{name: "package index", method: http.MethodGet, path: "/simple/foo/"},
-		{name: "file get", method: http.MethodGet, path: "/packages/foo/1.0/foo-1.0.tar.gz"},
-		{name: "upload", method: http.MethodPost, path: "/"},
+		{name: "simple index", method: http.MethodGet, path: "/test-ns/simple/"},
+		{name: "package index", method: http.MethodGet, path: "/test-ns/simple/foo/"},
+		{name: "file get", method: http.MethodGet, path: "/test-ns/packages/foo/1.0/foo-1.0.tar.gz"},
+		{name: "upload", method: http.MethodPost, path: "/test-ns/"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -54,51 +58,60 @@ func TestMux_AuthGating(t *testing.T) {
 }
 
 // TestMux_NoAuthMiddleware confirms that omitting WithAuthMiddleware
-// leaves the handler ungated — the default useful for tests that
-// don't care about auth and for future public-by-default formats.
+// leaves the chain ungated at the middleware layer — production
+// wiring (cmd/ocifactory serve) always supplies one. With no
+// AuthContext on the request the namespace wrapper denies the call
+// at 403, which is what the test asserts here: the failure mode is
+// "no auth context" (403), NOT "auth middleware rejected" (401). The
+// AGENTS.md rule for adding new format handlers reminds authors to
+// plumb WithAuthMiddleware on the serve.go side.
 func TestMux_NoAuthMiddleware(t *testing.T) {
 	t.Parallel()
 
-	reg := oci.NewFakeRegistry()
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
+
 	h, err := NewHandler(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
-	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
 	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, r)
+	h.Mux().ServeHTTP(w, r)
 	if got := w.Code; got == http.StatusUnauthorized {
-		t.Errorf("status = 401 with no middleware configured; default should be ungated")
+		t.Errorf("status = 401 with no middleware configured; the namespace wrapper, not the middleware, should deny")
+	}
+	if got, want := w.Code, http.StatusForbidden; got != want {
+		t.Errorf("status = %d, want %d (no AuthContext → wrapper denies)", got, want)
 	}
 }
 
 // TestMux_AuthChainsBeforeHandler proves the order: the auth
 // middleware sees the request before the format handler runs.
-// Confirms the AuthContext is on the context by the time the route's
-// handler is invoked.
 func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	t.Parallel()
 
-	const wantIssuer = "test-issuer"
+	const wantIssuer = "anonymous"
 	installer := auth.Middleware(auth.AuthenticatorFunc(func(*http.Request) (*auth.AuthContext, error) {
 		return &auth.AuthContext{Issuer: wantIssuer, ID: "u"}, nil
 	}))
 
-	reg := oci.NewFakeRegistry()
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
+
 	h, err := NewHandler(reg, WithAuthMiddleware(installer))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
-	srv := h.Mux()
 
-	r := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
 	w := httptest.NewRecorder()
-	srv.ServeHTTP(w, r)
-	// The simple index handler returns 200 on an empty index;
-	// what we care about is the auth middleware was invoked
-	// without short-circuiting.
+	h.Mux().ServeHTTP(w, r)
 	if w.Code == http.StatusUnauthorized || w.Code == http.StatusServiceUnavailable {
 		t.Errorf("status = %d; auth middleware unexpectedly rejected the request", w.Code)
 	}

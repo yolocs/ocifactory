@@ -18,6 +18,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/renderer"
 	"oras.land/oras-go/v2/errdef"
@@ -89,7 +90,7 @@ var (
 )
 
 type Handler struct {
-	registry       handler.Registry
+	registry       *namespace.Registry
 	renderer       *renderer.Renderer
 	indexCache     *simpleIndexCache
 	authMW         func(http.Handler) http.Handler
@@ -141,7 +142,13 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 }
 
 // NewHandler creates a new Handler.
-func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
+//
+// registry is the data-plane wrapper that hands out per-request
+// [*namespace.ScopedRegistry] views via [registry.For]. Every routed
+// handler func resolves the namespace from the request URL
+// (`/{namespace}/...`) and obtains a scoped view at the top — call
+// sites otherwise stay identical to the pre-namespace code.
+func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL,
 		maxUploadBytes:      DefaultMaxUploadBytes,
@@ -164,6 +171,13 @@ func NewHandler(registry handler.Registry, opts ...Option) (*Handler, error) {
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
 //
+// Every route lives under a `/{namespace}` subrouter so the handler
+// resolves the namespace from the URL on each request and routes the
+// backend op through the namespace-scoped registry view. The leading
+// segment is rejected by [namespace.ValidateName] at namespace-Put
+// time, not here — a request to an unregistered namespace produces a
+// 404 from the wrapper.
+//
 // Each route is .Name()'d so the metrics middleware uses a stable op
 // label (write / read / list) instead of a method-derived default. The
 // list label distinguishes simple-index enumeration from blob reads,
@@ -182,18 +196,28 @@ func (h *Handler) Mux() http.Handler {
 		router.Use(mux.MiddlewareFunc(h.authMW))
 	}
 
+	nsr := router.PathPrefix("/{namespace}").Subrouter()
+
 	// Handle both pip and twine operations
-	router.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
+	nsr.HandleFunc("/", h.handleFilePut).Methods("PUT", "POST").Name("write")
 
-	router.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
+	nsr.HandleFunc("/packages/{package}/{version}/{filename}", h.handleFileGet).Methods("GET", "HEAD").Name("read")
 
-	router.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
-	router.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
+	nsr.HandleFunc("/simple/{package}/", h.handlePackageIndex).Methods("GET").Name("list")
+	nsr.HandleFunc("/simple/{package}", h.handlePackageIndex).Methods("GET").Name("list")
 
-	router.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
-	router.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
+	nsr.HandleFunc("/simple/", h.handleSimpleIndex).Methods("GET").Name("list")
+	nsr.HandleFunc("/simple", h.handleSimpleIndex).Methods("GET").Name("list")
 
 	return router
+}
+
+// scopedFor returns the per-request [*namespace.ScopedRegistry] for
+// the namespace in req's URL. The view is cheap to construct (a small
+// struct, no I/O) so handlers obtain it per call rather than caching
+// across requests.
+func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
+	return h.registry.For(mux.Vars(req)["namespace"])
 }
 
 // handleSimpleIndex renders the root simple index — the list of every
@@ -201,8 +225,12 @@ func (h *Handler) Mux() http.Handler {
 // (already-normalized) package name; ListTags is enough to enumerate
 // them.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
-	tags, err := h.registry.ListTags(req.Context(), "index")
+	scoped := h.scopedFor(req)
+	tags, err := scoped.ListTags(req.Context(), "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		if handler.WriteNamespaceError(req.Context(), w, err) {
+			return
+		}
 		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "failed to list package index")
 		return
 	}
@@ -212,6 +240,7 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	ns := mux.Vars(req)["namespace"]
 	page := indexPage{Title: "Simple Index"}
 	for _, tag := range tags {
 		page.Files = append(page.Files, indexFile{
@@ -219,7 +248,7 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 			URL: (&url.URL{
 				Scheme: req.URL.Scheme,
 				Host:   req.URL.Host,
-				Path:   "/simple/" + tag + "/",
+				Path:   "/" + ns + "/simple/" + tag + "/",
 			}).String(),
 		})
 	}
@@ -242,6 +271,7 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
+	scoped := h.scopedFor(req)
 
 	if h.maxUploadBytes > 0 {
 		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
@@ -345,7 +375,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		Name:       contentName,
 		MediaType:  detectMediaType(contentName),
 	}
-	if !h.streamAddFile(ctx, w, wheelRF, contentPart) {
+	if !h.streamAddFile(ctx, scoped, w, wheelRF, contentPart) {
 		return
 	}
 
@@ -363,8 +393,11 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	// same call /simple/ already makes on the read side), so we
 	// trade an extra round-trip per upload for a clean immutable
 	// AddFile contract.
-	if err := h.ensureIndexSentinel(ctx, normalizedName); err != nil {
+	if err := h.ensureIndexSentinel(ctx, scoped, normalizedName); err != nil {
 		logger.DebugContext(ctx, "failed to ensure index sentinel", "error", err)
+		if handler.WriteNamespaceError(ctx, w, err) {
+			return
+		}
 		var maxBytesErr *http.MaxBytesError
 		switch {
 		case errors.As(err, &maxBytesErr):
@@ -396,7 +429,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		_ = p.Close()
 	}
 
-	h.indexCache.invalidate(normalizedName)
+	h.indexCache.invalidate(scoped.Namespace() + "/" + normalizedName)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -409,8 +442,8 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 // errdef.ErrNotFound from ListTags is treated as "no packages yet"
 // (zot returns it for empty repositories), matching how
 // handleSimpleIndex already absorbs the same shape.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, normalizedName string) error {
-	tags, err := h.registry.ListTags(ctx, "index")
+func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped handler.Registry, normalizedName string) error {
+	tags, err := scoped.ListTags(ctx, "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		return fmt.Errorf("list index tags: %w", err)
 	}
@@ -426,7 +459,7 @@ func (h *Handler) ensureIndexSentinel(ctx context.Context, normalizedName string
 		MediaType:  "text/plain",
 		Size:       int64(len(indexSentinelContent)),
 	}
-	if _, err := h.registry.AddFile(ctx, sentinelRF, strings.NewReader(indexSentinelContent)); err != nil {
+	if _, err := scoped.AddFile(ctx, sentinelRF, strings.NewReader(indexSentinelContent)); err != nil {
 		return fmt.Errorf("add index sentinel: %w", err)
 	}
 	return nil
@@ -473,11 +506,14 @@ func writeMultipartReadError(w http.ResponseWriter, err error, logger *slog.Logg
 // MaxBytesError is detected inline so a request body that overflows
 // h.maxUploadBytes mid-stream (e.g. while AddFile is reading the wheel
 // body) returns 413 instead of a generic 500.
-func (h *Handler) streamAddFile(ctx context.Context, w http.ResponseWriter, f *oci.RepoFile, content io.Reader) bool {
+func (h *Handler) streamAddFile(ctx context.Context, scoped handler.Registry, w http.ResponseWriter, f *oci.RepoFile, content io.Reader) bool {
 	logger := logging.FromContext(ctx)
-	desc, err := h.registry.AddFile(ctx, f, content)
+	desc, err := scoped.AddFile(ctx, f, content)
 	if err != nil {
 		logger.DebugContext(ctx, "failed to add file", "error", err)
+		if handler.WriteNamespaceError(ctx, w, err) {
+			return false
+		}
 		var maxBytesErr *http.MaxBytesError
 		switch {
 		case errors.As(err, &maxBytesErr):
@@ -516,7 +552,7 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 		MediaType:  detectMediaType(filename),
 	}
 
-	h.handleGet(w, req, f)
+	h.handleGet(w, req, h.scopedFor(req), f)
 }
 
 func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
@@ -528,11 +564,19 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	}
 	pkg = normalize(pkg)
 
-	files, ok := h.indexCache.get(pkg)
+	ns := vars["namespace"]
+	// Cache key includes the namespace so a package present in ns1
+	// doesn't get served out of cache for an identically-named
+	// package in ns2 (or, worse, leak ns1's file list there).
+	cacheKey := ns + "/" + pkg
+	files, ok := h.indexCache.get(cacheKey)
 	if !ok {
 		var err error
-		files, err = h.resolvePackageFiles(req.Context(), pkg)
+		files, err = h.resolvePackageFiles(req.Context(), h.scopedFor(req), pkg)
 		if err != nil {
+			if handler.WriteNamespaceError(req.Context(), w, err) {
+				return
+			}
 			if errors.Is(err, errdef.ErrNotFound) {
 				http.Error(w, err.Error(), http.StatusNotFound)
 				return
@@ -548,14 +592,14 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 			return
 		}
-		h.indexCache.put(pkg, files)
+		h.indexCache.put(cacheKey, files)
 	}
 
 	rendered := make([]indexFile, 0, len(files))
 	for _, f := range files {
 		rendered = append(rendered, indexFile{
 			Filename: f.Filename,
-			URL:      renderedFileURL(req, pkg, f),
+			URL:      renderedFileURL(req, ns, pkg, f),
 			Sha256:   f.Sha256,
 		})
 	}
@@ -570,8 +614,8 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 // resolvePackageFiles enumerates a package's files. The returned slice
 // is what goes into the simple-index cache; both HTML and JSON
 // renderers pivot off it.
-func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cachedFile, error) {
-	rawFiles, err := h.registry.ListFiles(ctx, "packages/"+pkg)
+func (h *Handler) resolvePackageFiles(ctx context.Context, scoped handler.Registry, pkg string) ([]cachedFile, error) {
+	rawFiles, err := scoped.ListFiles(ctx, "packages/"+pkg)
 	if err != nil {
 		return nil, err
 	}
@@ -587,11 +631,11 @@ func (h *Handler) resolvePackageFiles(ctx context.Context, pkg string) ([]cached
 	return entries, nil
 }
 
-func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {
+func renderedFileURL(req *http.Request, ns, pkg string, f cachedFile) string {
 	u := url.URL{
 		Scheme: req.URL.Scheme,
 		Host:   req.URL.Host,
-		Path:   fmt.Sprintf("/packages/%s/%s/%s", pkg, f.OwningTag, f.Filename),
+		Path:   fmt.Sprintf("/%s/packages/%s/%s/%s", ns, pkg, f.OwningTag, f.Filename),
 	}
 	if f.Sha256 != "" {
 		u.Fragment = "sha256=" + f.Sha256
@@ -599,26 +643,32 @@ func renderedFileURL(req *http.Request, pkg string, f cachedFile) string {
 	return u.String()
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, f *oci.RepoFile) {
+func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	// HEAD wants headers only — never redirect. The redirect path is
 	// only worth taking when the response would otherwise transfer
 	// bytes; HEAD has no egress to save.
 	if req.Method != http.MethodHead {
-		if redirectURL, err := h.registry.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+		if redirectURL, err := scoped.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
 			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return
 		} else if err != nil {
-			// Best-effort — fall through to the streaming path.
+			// Best-effort — fall through to the streaming path. A
+			// hard namespace authz failure surfaces from
+			// ReadFile below, so the redirect probe doesn't need
+			// its own mapping path.
 			logger.DebugContext(req.Context(), "blob redirect probe failed; falling back to streaming", "error", err)
 		}
 	}
 
-	desc, r, err := h.registry.ReadFile(req.Context(), f)
+	desc, r, err := scoped.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
+		if handler.WriteNamespaceError(req.Context(), w, err) {
+			return
+		}
 		if errors.Is(err, errdef.ErrNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return

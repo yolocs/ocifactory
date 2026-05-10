@@ -279,10 +279,13 @@ func TestVerifyChecksumUpload_SnapshotTimestamps(t *testing.T) {
 func TestHandlePut_ChecksumIntegration(t *testing.T) {
 	t.Parallel()
 
-	const artifactPath = "/com/example/project/1.0.0/project-1.0.0.jar"
-	const sha1Path = artifactPath + ".sha1"
-	const md5Path = artifactPath + ".md5"
+	artifactPath := nsPath("/com/example/project/1.0.0/project-1.0.0.jar")
+	sha1Path := artifactPath + ".sha1"
+	md5Path := artifactPath + ".md5"
 	const artifactBody = "jar content"
+	// Backend keys include the namespace prefix.
+	storedJarSha1 := testNS + "/com/example/project/1.0.0/project-1.0.0.jar.sha1"
+	storedJarMD5 := testNS + "/com/example/project/1.0.0/project-1.0.0.jar.md5"
 
 	cases := []struct {
 		name         string
@@ -303,7 +306,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			uploadBody:   hashHex(t, sha1.New(), artifactBody),
 			wantStatus:   http.StatusCreated,
 			wantStored:   true,
-			storedKey:    "com/example/project/1.0.0/project-1.0.0.jar.sha1",
+			storedKey:    storedJarSha1,
 			storedExpect: hashHex(t, sha1.New(), artifactBody),
 		},
 		{
@@ -315,7 +318,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			uploadBody:   hashHex(t, md5.New(), artifactBody),
 			wantStatus:   http.StatusCreated,
 			wantStored:   true,
-			storedKey:    "com/example/project/1.0.0/project-1.0.0.jar.md5",
+			storedKey:    storedJarMD5,
 			storedExpect: hashHex(t, md5.New(), artifactBody),
 		},
 		{
@@ -341,10 +344,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 			mux := h.Mux()
 
 			tc.setup(t, mux)
@@ -365,7 +365,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 					t.Errorf("stored checksum = %q, want %q", got, tc.storedExpect)
 				}
 			} else if !tc.wantStored && tc.uploadPath == sha1Path {
-				if _, exists := reg.Files["com/example/project/1.0.0/project-1.0.0.jar.sha1"]; exists {
+				if _, exists := reg.Files[storedJarSha1]; exists {
 					t.Errorf("checksum unexpectedly stored after rejection")
 				}
 			}
@@ -383,13 +383,13 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 		name string
 		path string
 	}{
-		{name: "traversal in repoParts", path: "/com/../etc/1.0/project-1.0.jar"},
-		{name: "traversal segment in version", path: "/com/example/project/../project-1.0.jar"},
+		{name: "traversal in repoParts", path: nsPath("/com/../etc/1.0/project-1.0.jar")},
+		{name: "traversal segment in version", path: nsPath("/com/example/project/../project-1.0.jar")},
 		// `..` as filename suffix would be stripped by gorilla/mux's
 		// route matching, but a literal `..` filename component lands
 		// in the filename mux var and must be rejected.
-		{name: "double-dot filename", path: "/com/example/project/1.0/.."},
-		{name: "doubled slash in repoParts", path: "/com//example/1.0/project-1.0.jar"},
+		{name: "double-dot filename", path: nsPath("/com/example/project/1.0/..")},
+		{name: "doubled slash in repoParts", path: nsPath("/com//example/1.0/project-1.0.jar")},
 	}
 
 	for _, tc := range cases {
@@ -397,10 +397,7 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			req := httptest.NewRequest(http.MethodPut, tc.path, strings.NewReader("x"))
 			w := httptest.NewRecorder()
@@ -413,8 +410,24 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 			if w.Code == http.StatusCreated {
 				t.Errorf("path %q produced 201; want a rejection (400/404/301)", tc.path)
 			}
-			if len(reg.Files) != 0 {
-				t.Errorf("path %q stored %d file(s); want 0", tc.path, len(reg.Files))
+			// The namespace store + wrapper write their own
+			// bookkeeping keys (_index/<ns>/present,
+			// <ns>/_metadata/spec.json, <ns>/_packages/...) on
+			// startup; skip those when asserting that no
+			// content-layout writes leaked through. A successful
+			// rejection means no key under <ns>/<maven content
+			// repo>/... appears.
+			for k := range reg.Files {
+				if strings.HasPrefix(k, "_index/") {
+					continue
+				}
+				if strings.HasPrefix(k, testNS+"/_metadata/") {
+					continue
+				}
+				if strings.HasPrefix(k, testNS+"/_packages/") {
+					continue
+				}
+				t.Errorf("path %q produced unexpected backend write %q; want 0 content writes", tc.path, k)
 			}
 		})
 	}

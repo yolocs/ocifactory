@@ -107,6 +107,11 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 		// "anonymous" is the default but pin it explicitly so the
 		// test isn't sensitive to default changes.
 		"--backend-auth-kind=anonymous",
+		// Materialise the "default" namespace so integration tests
+		// can drive real clients at /default/... without an admin
+		// namespace-Put dance. Production deployments must register
+		// namespaces explicitly.
+		"--default-namespace-allow-all",
 	}
 	args = append(args, extraArgs...)
 

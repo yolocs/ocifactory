@@ -62,15 +62,15 @@ func TestMavenIntegration_RealClients(t *testing.T) {
 
 		// Verify the four files mvn deploy is supposed to publish
 		// landed at the Maven 2 layout paths handleRegularArtifact
-		// uses.
+		// uses, under the /default/maven2/... namespace prefix.
 		expect := []struct {
 			path     string
 			notEmpty bool
 		}{
-			{path: fmt.Sprintf("/%s/%s/%s/%s-%s.jar", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
-			{path: fmt.Sprintf("/%s/%s/%s/%s-%s.pom", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
-			{path: fmt.Sprintf("/%s/%s/%s/%s-%s.jar.sha1", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
-			{path: fmt.Sprintf("/%s/%s/%s/%s-%s.jar.md5", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
+			{path: fmt.Sprintf("/default/maven2/%s/%s/%s/%s-%s.jar", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
+			{path: fmt.Sprintf("/default/maven2/%s/%s/%s/%s-%s.pom", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
+			{path: fmt.Sprintf("/default/maven2/%s/%s/%s/%s-%s.jar.sha1", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
+			{path: fmt.Sprintf("/default/maven2/%s/%s/%s/%s-%s.jar.md5", strings.ReplaceAll(groupID, ".", "/"), artifactID, version, artifactID, version), notEmpty: true},
 		}
 		for _, e := range expect {
 			body := httpGetBody(t, base+e.path)
@@ -111,8 +111,8 @@ func TestMavenIntegration_RealClients(t *testing.T) {
 		// The snapshot metadata route stores under
 		// {groupId}/{artifactId}/{version}-metadata, so
 		// maven-metadata.xml must be retrievable via the GET
-		// path.
-		mdURL := fmt.Sprintf("%s/%s/%s/%s/maven-metadata.xml",
+		// path under the /default/maven2/ prefix.
+		mdURL := fmt.Sprintf("%s/default/maven2/%s/%s/%s/maven-metadata.xml",
 			base, strings.ReplaceAll(groupID, ".", "/"), artifactID, version)
 		body := httpGetBody(t, mdURL)
 		if !strings.Contains(string(body), "<groupId>com.example.test</groupId>") {
@@ -144,7 +144,10 @@ func stageProject(t *testing.T, ocifactoryURL, version string) string {
 		t.Fatalf("read pom: %v", err)
 	}
 	pom := strings.ReplaceAll(string(pomBytes), "__VERSION__", version)
-	pom = strings.ReplaceAll(pom, "__OCIFACTORY_URL__", ocifactoryURL)
+	// Templated URL points at /default/maven2/: every URL is now
+	// namespace-prefixed and the harness materialises "default" via
+	// --default-namespace-allow-all.
+	pom = strings.ReplaceAll(pom, "__OCIFACTORY_URL__", ocifactoryURL+"/default/maven2")
 	if err := os.WriteFile(pomPath, []byte(pom), 0o600); err != nil {
 		t.Fatalf("write pom: %v", err)
 	}
@@ -161,7 +164,7 @@ func stageProject(t *testing.T, ocifactoryURL, version string) string {
 		t.Fatalf("mkdir local repo: %v", err)
 	}
 	settings = strings.ReplaceAll(settings, "__LOCAL_REPO__", localRepo)
-	settings = strings.ReplaceAll(settings, "__OCIFACTORY_URL__", ocifactoryURL)
+	settings = strings.ReplaceAll(settings, "__OCIFACTORY_URL__", ocifactoryURL+"/default/maven2")
 	settings = strings.ReplaceAll(settings, "__USERNAME__", "integration")
 	settings = strings.ReplaceAll(settings, "__PASSWORD__", "integration")
 	if err := os.WriteFile(filepath.Join(dst, "settings.xml"), []byte(settings), 0o600); err != nil {

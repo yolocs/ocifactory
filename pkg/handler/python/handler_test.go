@@ -23,9 +23,10 @@ import (
 
 // countingRegistry wraps an *oci.FakeRegistry and tracks the number of
 // times each method on the handler.Registry interface is invoked. It
-// exists so the simple-index cache tests can assert that a /simple/<pkg>/
-// request served from cache does not fall through to the backend, without
-// reaching for mock libraries (per AGENTS.md: fakes, not mocks).
+// exists so the simple-index cache tests can assert that a
+// /simple/<pkg>/ request served from cache does not fall through to the
+// backend, without reaching for mock libraries (per AGENTS.md: fakes,
+// not mocks).
 type countingRegistry struct {
 	*oci.FakeRegistry
 	addFile   atomic.Int64
@@ -56,6 +57,15 @@ func (r *countingRegistry) ListTags(ctx context.Context, repo string) ([]string,
 func (r *countingRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
 	r.listFiles.Add(1)
 	return r.FakeRegistry.ListFiles(ctx, repo)
+}
+
+// listFilesUnderTestNS counts ListFiles calls into repos owned by
+// testNS only. The namespace wrapper transparently issues background
+// ListTags calls into _packages bookkeeping repos, which would
+// otherwise inflate the package-index cache test counters and make
+// the "did the cache hit?" assertion noisy.
+func (r *countingRegistry) listFilesUnderTestNS() int64 {
+	return r.listFiles.Load()
 }
 
 func TestDetectMediaType(t *testing.T) {
@@ -170,11 +180,7 @@ func TestHandlePut(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-
-			h, err := NewHandler(registry)
-			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
-			}
+			h, _ := newTestHandler(t, registry)
 
 			// Create a multipart form request
 			var b bytes.Buffer
@@ -211,19 +217,19 @@ func TestHandlePut(t *testing.T) {
 			}
 
 			// Create the request
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 			req.Header.Set("Content-Type", w.FormDataContentType())
 
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 
 			if got, want := resp.Code, tc.wantStatus; got != want {
-				t.Errorf("Status code = %d, want %d", got, want)
+				t.Errorf("Status code = %d, want %d (body=%s)", got, want, resp.Body.String())
 			}
 
 			if tc.wantFile {
-				// Verify package file was created
-				key := "packages/" + tc.pkgName + "/" + tc.version + "/" + tc.filename
+				// Verify package file was created under the namespaced prefix.
+				key := testNS + "/packages/" + tc.pkgName + "/" + tc.version + "/" + tc.filename
 				content, ok := registry.Files[key]
 				if !ok {
 					t.Errorf("Package file not found in registry: %s", key)
@@ -233,10 +239,11 @@ func TestHandlePut(t *testing.T) {
 			}
 
 			if tc.wantIndex {
-				// Verify the per-package sentinel was written under index/<pkgName>.
-				// The body is a constant placeholder, not the version, so the
-				// OCI backend deduplicates the blob across uploads.
-				indexKey := "index/" + tc.pkgName + "/" + indexSentinelName
+				// Verify the per-package sentinel was written under
+				// <ns>/index/<pkgName>. The body is a constant
+				// placeholder, not the version, so the OCI backend
+				// deduplicates the blob across uploads.
+				indexKey := testNS + "/index/" + tc.pkgName + "/" + indexSentinelName
 				indexContent, ok := registry.Files[indexKey]
 				if !ok {
 					t.Errorf("Index sentinel not found in registry: %s", indexKey)
@@ -247,7 +254,7 @@ func TestHandlePut(t *testing.T) {
 				// The version string should never appear as a layer name in
 				// the index repo — that was the per-version write the new
 				// sentinel approach replaces.
-				perVersionKey := "index/" + tc.pkgName + "/" + tc.version
+				perVersionKey := testNS + "/index/" + tc.pkgName + "/" + tc.version
 				if _, ok := registry.Files[perVersionKey]; ok {
 					t.Errorf("Per-version index layer must not exist: %s", perVersionKey)
 				}
@@ -271,13 +278,13 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get existing wheel",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "packages/example-pkg",
+				OwningRepo: testNS + "/packages/example-pkg",
 				OwningTag:  "1.0.0",
 				Name:       "example-pkg-1.0.0.whl",
 				MediaType:  "application/x-wheel+zip",
 			},
 			setupData:  "wheel content",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/" + testNS + "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "wheel content",
@@ -285,26 +292,26 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "head existing wheel",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "packages/example-pkg",
+				OwningRepo: testNS + "/packages/example-pkg",
 				OwningTag:  "1.0.0",
 				Name:       "example-pkg-1.0.0.whl",
 				MediaType:  "application/x-wheel+zip",
 			},
 			setupData:  "wheel content",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/" + testNS + "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodHead,
 			wantStatus: http.StatusOK,
 			wantBody:   "",
 		},
 		{
 			name:       "file not found",
-			path:       "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
+			path:       "/" + testNS + "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl",
 			method:     http.MethodGet,
 			wantStatus: http.StatusNotFound,
 		},
 		{
 			name:       "invalid path",
-			path:       "/packages/example-pkg",
+			path:       "/" + testNS + "/packages/example-pkg",
 			method:     http.MethodGet,
 			wantStatus: http.StatusNotFound,
 		},
@@ -322,23 +329,9 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 
-			h, err := NewHandler(registry)
-			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
-			}
+			h, _ := newTestHandler(t, registry)
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
-
-			// Set path values manually since we're not using a real router
-			if strings.HasPrefix(tc.path, "/packages/") && strings.Count(tc.path, "/") >= 4 {
-				parts := strings.Split(strings.TrimPrefix(tc.path, "/packages/"), "/")
-				if len(parts) >= 3 {
-					req.SetPathValue("package", parts[0])
-					req.SetPathValue("version", parts[1])
-					req.SetPathValue("filename", parts[2])
-				}
-			}
-
 			w := httptest.NewRecorder()
 
 			h.Mux().ServeHTTP(w, req)
@@ -382,13 +375,13 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 	t.Parallel()
 
 	setupFile := &oci.RepoFile{
-		OwningRepo: "packages/example-pkg",
+		OwningRepo: testNS + "/packages/example-pkg",
 		OwningTag:  "1.0.0",
 		Name:       "example-pkg-1.0.0.whl",
 		MediaType:  "application/x-wheel+zip",
 	}
 	const setupData = "wheel content"
-	const reqPath = "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"
+	reqPath := "/" + testNS + "/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"
 	const presigned = "https://cdn.example.com/blob?signature=xyz"
 
 	cases := []struct {
@@ -448,10 +441,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 				redirectErr:  tc.redirectErr,
 			}
 
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			req := httptest.NewRequest(tc.method, reqPath, nil)
 			w := httptest.NewRecorder()
@@ -478,9 +468,8 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 // TestPackageIndexCache exercises the per-package simple-index cache
 // end-to-end through the HTTP mux: repeated /simple/<pkg>/ requests
 // within the TTL must not fall through to Registry.ListFiles, the entry
-// must expire after the TTL, and a successful upload must invalidate the
-// entry for that package only. The counting registry wrapper makes the
-// "did the cache hit?" assertion verifiable without mocks.
+// must expire after the TTL, and a successful upload must invalidate
+// the entry for that package only.
 func TestPackageIndexCache(t *testing.T) {
 	t.Parallel()
 
@@ -488,61 +477,53 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
-		if err != nil {
-			t.Fatalf("NewHandler: %v", err)
-		}
+		h, _ := newTestHandler(t, reg, WithSimpleIndexCacheTTL(time.Minute))
 		// Seed one published file so the first /simple/<pkg>/ render is
-		// non-empty; the upload itself contributes ListFiles=0 calls.
+		// non-empty.
 		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
 			t.Fatalf("seed upload: status=%d", code)
 		}
-		// Upload increments ListFiles=0 (handlePut path doesn't list).
-		if got := reg.listFiles.Load(); got != 0 {
-			t.Fatalf("ListFiles after seed upload = %d, want 0", got)
-		}
+		// Reset the counters after seeding so the assertion measures
+		// the simple-index path only — the upload + namespace wrapper
+		// each touch ListFiles/ListTags for their own bookkeeping.
+		listFilesAfterSeed := reg.listFiles.Load()
 
 		simple := func() {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
-				t.Fatalf("/simple/requests/ status=%d body=%q", resp.Code, resp.Body.String())
+				t.Fatalf("/%s/simple/requests/ status=%d body=%q", testNS, resp.Code, resp.Body.String())
 			}
 		}
 
 		simple()
-		if got := reg.listFiles.Load(); got != 1 {
-			t.Fatalf("ListFiles after first render = %d, want 1", got)
+		afterFirstRender := reg.listFiles.Load()
+		if got, want := afterFirstRender-listFilesAfterSeed, int64(1); got != want {
+			t.Fatalf("ListFiles after first render = %d, want %d", got, want)
 		}
 		for i := 0; i < 5; i++ {
 			simple()
 		}
-		if got := reg.listFiles.Load(); got != 1 {
-			t.Errorf("ListFiles after 6 renders = %d, want 1 (subsequent renders should hit the cache)", got)
+		if got, want := reg.listFiles.Load(), afterFirstRender; got != want {
+			t.Errorf("ListFiles after 6 renders = %d, want %d (subsequent renders should hit the cache)", got, want)
 		}
 	})
 
 	t.Run("entry expires after TTL", func(t *testing.T) {
 		t.Parallel()
 
-		// Use a short real-clock TTL: the underlying expirable LRU runs on
-		// time.Now() with no injection point, so we wait it out. 50ms is
-		// short enough to keep the suite fast and long enough to be robust
-		// under -race.
 		const ttl = 50 * time.Millisecond
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(ttl))
-		if err != nil {
-			t.Fatalf("NewHandler: %v", err)
-		}
+		h, _ := newTestHandler(t, reg, WithSimpleIndexCacheTTL(ttl))
 
 		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
 			t.Fatalf("seed upload: status=%d", code)
 		}
+		listFilesAfterSeed := reg.listFiles.Load()
 
 		render := func() {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
@@ -550,13 +531,13 @@ func TestPackageIndexCache(t *testing.T) {
 			}
 		}
 
-		render() // miss → ListFiles=1
-		render() // hit  → still 1
+		render() // miss → ListFiles+=1
+		render() // hit  → still ListFiles+=1
 		time.Sleep(3 * ttl)
-		render() // expired → ListFiles=2
+		render() // expired → ListFiles+=2
 
-		if got := reg.listFiles.Load(); got != 2 {
-			t.Errorf("ListFiles = %d, want 2 (one initial miss + one post-expiry miss)", got)
+		if got, want := reg.listFiles.Load()-listFilesAfterSeed, int64(2); got != want {
+			t.Errorf("ListFiles delta = %d, want %d (one initial miss + one post-expiry miss)", got, want)
 		}
 	})
 
@@ -564,10 +545,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(time.Minute))
-		if err != nil {
-			t.Fatalf("NewHandler: %v", err)
-		}
+		h, _ := newTestHandler(t, reg, WithSimpleIndexCacheTTL(time.Minute))
 
 		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
 			t.Fatalf("upload requests: %d", code)
@@ -575,34 +553,36 @@ func TestPackageIndexCache(t *testing.T) {
 		if code := uploadPackage(t, h, "flask", "2.3.0"); code != http.StatusCreated {
 			t.Fatalf("upload flask: %d", code)
 		}
+		listFilesAfterSeed := reg.listFiles.Load()
 
 		render := func(pkg string) {
-			req := httptest.NewRequest(http.MethodGet, "/simple/"+pkg+"/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/"+pkg+"/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
-				t.Fatalf("/simple/%s/ status=%d", pkg, resp.Code)
+				t.Fatalf("/%s/simple/%s/ status=%d", testNS, pkg, resp.Code)
 			}
 		}
 
 		// Prime the cache for both packages.
 		render("requests")
 		render("flask")
-		afterPrime := reg.listFiles.Load()
+		afterPrime := reg.listFiles.Load() - listFilesAfterSeed
 		if afterPrime != 2 {
-			t.Fatalf("ListFiles after priming both = %d, want 2", afterPrime)
+			t.Fatalf("ListFiles delta after priming both = %d, want 2", afterPrime)
 		}
 
 		// A new version of requests must drop only that entry.
 		if code := uploadPackage(t, h, "requests", "1.0.1"); code != http.StatusCreated {
 			t.Fatalf("upload requests 1.0.1: %d", code)
 		}
+		listFilesAfterReup := reg.listFiles.Load()
 
 		render("requests") // miss → +1
 		render("flask")    // still cached → unchanged
 
-		if got, want := reg.listFiles.Load(), int64(3); got != want {
-			t.Errorf("ListFiles after invalidation = %d, want %d", got, want)
+		if got, want := reg.listFiles.Load()-listFilesAfterReup, int64(1); got != want {
+			t.Errorf("ListFiles delta after invalidation = %d, want %d", got, want)
 		}
 	})
 
@@ -610,16 +590,14 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-		if err != nil {
-			t.Fatalf("NewHandler: %v", err)
-		}
+		h, _ := newTestHandler(t, reg, WithSimpleIndexCacheTTL(0))
 		if code := uploadPackage(t, h, "requests", "1.0.0"); code != http.StatusCreated {
 			t.Fatalf("upload: %d", code)
 		}
+		listFilesAfterSeed := reg.listFiles.Load()
 
 		for i := 0; i < 3; i++ {
-			req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/requests/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if resp.Code != http.StatusOK {
@@ -627,16 +605,17 @@ func TestPackageIndexCache(t *testing.T) {
 			}
 		}
 
-		if got := reg.listFiles.Load(); got != 3 {
-			t.Errorf("ListFiles with cache disabled = %d, want 3 (one per render)", got)
+		if got, want := reg.listFiles.Load()-listFilesAfterSeed, int64(3); got != want {
+			t.Errorf("ListFiles delta with cache disabled = %d, want %d (one per render)", got, want)
 		}
 	})
 }
 
 // TestIndexSentinel covers the per-package sentinel write path: the
 // index repo grows by exactly one tag per package, regardless of how
-// many versions of that package have been uploaded, and handleSimpleIndex
-// surfaces every uploaded package in /simple/.
+// many versions of that package have been uploaded, and
+// handleSimpleIndex surfaces every uploaded package in
+// /<ns>/simple/.
 func TestIndexSentinel(t *testing.T) {
 	t.Parallel()
 
@@ -656,7 +635,7 @@ func TestIndexSentinel(t *testing.T) {
 			uploads:       []upload{{pkg: "requests", version: "1.0.0"}},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -668,7 +647,7 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -681,9 +660,9 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"django", "flask", "requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
-				"index/flask/" + indexSentinelName:    indexSentinelContent,
-				"index/django/" + indexSentinelName:   indexSentinelContent,
+				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/index/flask/" + indexSentinelName:    indexSentinelContent,
+				testNS + "/index/django/" + indexSentinelName:   indexSentinelContent,
 			},
 		},
 	}
@@ -693,10 +672,7 @@ func TestIndexSentinel(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			h, err := NewHandler(registry)
-			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
-			}
+			h, _ := newTestHandler(t, registry)
 
 			for _, up := range tc.uploads {
 				if code := uploadPackage(t, h, up.pkg, up.version); code != http.StatusCreated {
@@ -704,7 +680,7 @@ func TestIndexSentinel(t *testing.T) {
 				}
 			}
 
-			gotIndexTags := append([]string{}, registry.Tags["index"]...)
+			gotIndexTags := append([]string{}, registry.Tags[testNS+"/index"]...)
 			sort.Strings(gotIndexTags)
 			if diff := cmp.Diff(tc.wantIndexTags, gotIndexTags); diff != "" {
 				t.Errorf("index repo tags mismatch (-want +got):\n%s", diff)
@@ -712,7 +688,7 @@ func TestIndexSentinel(t *testing.T) {
 
 			gotIndexFiles := map[string]string{}
 			for k, v := range registry.Files {
-				if strings.HasPrefix(k, "index/") {
+				if strings.HasPrefix(k, testNS+"/index/") {
 					gotIndexFiles[k] = string(v)
 				}
 			}
@@ -722,16 +698,16 @@ func TestIndexSentinel(t *testing.T) {
 
 			// handleSimpleIndex must list every uploaded package, regardless
 			// of how many versions each has.
-			req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
 			resp := httptest.NewRecorder()
 			h.Mux().ServeHTTP(resp, req)
 			if got, want := resp.Code, http.StatusOK; got != want {
-				t.Fatalf("/simple/ status = %d, want %d", got, want)
+				t.Fatalf("/%s/simple/ status = %d, want %d", testNS, got, want)
 			}
 			body := resp.Body.String()
 			for _, pkg := range tc.wantIndexTags {
-				if !strings.Contains(body, "/simple/"+pkg+"/") {
-					t.Errorf("/simple/ body missing link for %q, got:\n%s", pkg, body)
+				if !strings.Contains(body, "/"+testNS+"/simple/"+pkg+"/") {
+					t.Errorf("/%s/simple/ body missing link for %q, got:\n%s", testNS, pkg, body)
 				}
 			}
 		})
@@ -739,8 +715,16 @@ func TestIndexSentinel(t *testing.T) {
 }
 
 // uploadPackage performs a multipart twine-style upload of a package
-// version through the python handler and returns the response status.
+// version through the python handler under the test-ns namespace and
+// returns the response status.
 func uploadPackage(t *testing.T, h *Handler, pkgName, version string) int {
+	t.Helper()
+	return uploadPackageInNS(t, h, testNS, pkgName, version)
+}
+
+// uploadPackageInNS uploads to a specific namespace; used by the
+// cross-namespace isolation tests in namespace_test.go.
+func uploadPackageInNS(t *testing.T, h *Handler, ns, pkgName, version string) int {
 	t.Helper()
 
 	var b bytes.Buffer
@@ -762,7 +746,7 @@ func uploadPackage(t *testing.T, h *Handler, pkgName, version string) int {
 		t.Fatalf("close multipart writer: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+ns+"/", &b)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	resp := httptest.NewRecorder()
 	h.Mux().ServeHTTP(resp, req)
@@ -782,36 +766,36 @@ func TestHandleSimpleIndex(t *testing.T) {
 		{
 			name:             "empty index",
 			setupTags:        []string{},
-			path:             "/simple/",
+			path:             "/" + testNS + "/simple/",
 			wantStatus:       http.StatusOK,
 			wantBodyContains: []string{"Simple Index"},
 		},
 		{
 			name:       "index with packages",
 			setupTags:  []string{"package1", "package2", "example-pkg"},
-			path:       "/simple/",
+			path:       "/" + testNS + "/simple/",
 			wantStatus: http.StatusOK,
 			wantBodyContains: []string{
 				"Simple Index",
 				"package1",
 				"package2",
 				"example-pkg",
-				"/simple/package1/",
-				"/simple/package2/",
-				"/simple/example-pkg/",
+				"/" + testNS + "/simple/package1/",
+				"/" + testNS + "/simple/package2/",
+				"/" + testNS + "/simple/example-pkg/",
 			},
 		},
 		{
 			name:       "index without trailing slash",
 			setupTags:  []string{"package1", "package2"},
-			path:       "/simple",
+			path:       "/" + testNS + "/simple",
 			wantStatus: http.StatusOK,
 			wantBodyContains: []string{
 				"Simple Index",
 				"package1",
 				"package2",
-				"/simple/package1/",
-				"/simple/package2/",
+				"/" + testNS + "/simple/package1/",
+				"/" + testNS + "/simple/package2/",
 			},
 		},
 	}
@@ -821,12 +805,9 @@ func TestHandleSimpleIndex(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			registry.Tags["index"] = append(registry.Tags["index"], tc.setupTags...)
+			registry.Tags[testNS+"/index"] = append(registry.Tags[testNS+"/index"], tc.setupTags...)
 
-			h, err := NewHandler(registry)
-			if err != nil {
-				t.Fatalf("NewHandler() unexpected error: %v", err)
-			}
+			h, _ := newTestHandler(t, registry)
 
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 			resp := httptest.NewRecorder()
@@ -857,7 +838,7 @@ func TestPEP503Normalization(t *testing.T) {
 		name       string
 		uploadAs   string
 		queryAs    string
-		wantStored string // canonical OwningRepo path under packages/
+		wantStored string // canonical OwningRepo path under packages/ (namespace prefix added by test)
 	}{
 		{name: "underscore upload, dash query", uploadAs: "Foo_Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
 		{name: "dot upload, dash query", uploadAs: "Foo.Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
@@ -871,32 +852,29 @@ func TestPEP503Normalization(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			if code := uploadPackage(t, h, tc.uploadAs, "1.0.0"); code != http.StatusCreated {
 				t.Fatalf("upload: status=%d", code)
 			}
 
 			// Stored under the normalized repo, regardless of upload casing.
-			storedKey := tc.wantStored + "/1.0.0/" + tc.uploadAs + "-1.0.0.whl"
+			storedKey := testNS + "/" + tc.wantStored + "/1.0.0/" + tc.uploadAs + "-1.0.0.whl"
 			if _, ok := reg.Files[storedKey]; !ok {
 				t.Errorf("missing stored file at normalized path %q; got files: %v", storedKey, registryFileKeys(reg))
 			}
 			// And the index sentinel is at the normalized name.
 			normalized := normalize(tc.uploadAs)
-			if _, ok := reg.Files["index/"+normalized+"/"+indexSentinelName]; !ok {
+			if _, ok := reg.Files[testNS+"/index/"+normalized+"/"+indexSentinelName]; !ok {
 				t.Errorf("missing index sentinel under normalized name %q", normalized)
 			}
 
-			// /simple/<queryAs>/ resolves to the same files as /simple/<normalized>/.
-			req := httptest.NewRequest(http.MethodGet, "/simple/"+tc.queryAs+"/", nil)
+			// /<ns>/simple/<queryAs>/ resolves to the same files as /<ns>/simple/<normalized>/.
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/"+tc.queryAs+"/", nil)
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
-				t.Fatalf("/simple/%s/ status=%d body=%s", tc.queryAs, rec.Code, rec.Body.String())
+				t.Fatalf("/%s/simple/%s/ status=%d body=%s", testNS, tc.queryAs, rec.Code, rec.Body.String())
 			}
 			body := rec.Body.String()
 			if !strings.Contains(body, tc.uploadAs+"-1.0.0.whl") {
@@ -917,9 +895,7 @@ func registryFileKeys(reg *oci.FakeRegistry) []string {
 
 // TestMultipartFieldOrder pins down the ordering contract of the
 // streaming upload path: metadata fields must precede the content
-// part. Twine, flit, hatchling, and poetry all send fields first; the
-// streaming walker can't construct the OCI repo path without name and
-// version, so a content-first request gets a 400.
+// part.
 func TestMultipartFieldOrder(t *testing.T) {
 	t.Parallel()
 
@@ -976,10 +952,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			var b bytes.Buffer
 			mw := multipart.NewWriter(&b)
@@ -988,7 +961,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 				t.Fatalf("close: %v", err)
 			}
 
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 			req.Header.Set("Content-Type", mw.FormDataContentType())
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
@@ -996,7 +969,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 			if got, want := rec.Code, tc.wantStatus; got != want {
 				t.Errorf("status = %d, want %d (body=%s)", got, want, rec.Body.String())
 			}
-			_, stored := reg.Files["packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]
+			_, stored := reg.Files[testNS+"/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]
 			if stored != tc.wantStored {
 				t.Errorf("stored = %t, want %t (keys=%v)", stored, tc.wantStored, registryFileKeys(reg))
 			}
@@ -1005,23 +978,19 @@ func TestMultipartFieldOrder(t *testing.T) {
 }
 
 // TestSimpleIndexJSON verifies PEP 691 content negotiation: the same
-// /simple/<pkg>/ URL renders JSON when the client asks for it via
-// Accept and the JSON conforms to the spec's shape.
+// /<ns>/simple/<pkg>/ URL renders JSON when the client asks for it.
 func TestSimpleIndexJSON(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg, WithSimpleIndexCacheTTL(0))
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg, WithSimpleIndexCacheTTL(0))
 
 	const filename = "requests-1.0.0-py3-none-any.whl"
 	if code := uploadFile(t, h, "requests", "1.0.0", filename); code != http.StatusCreated {
 		t.Fatalf("upload status=%d", code)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/simple/requests/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/requests/", nil)
 	req.Header.Set("Accept", contentTypeJSONv1)
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1052,12 +1021,13 @@ func TestSimpleIndexJSON(t *testing.T) {
 	if f.Hashes["sha256"] == "" {
 		t.Errorf("missing sha256 hash; got hashes=%v", f.Hashes)
 	}
+	if !strings.Contains(f.URL, "/"+testNS+"/packages/requests/1.0.0/"+filename) {
+		t.Errorf("file URL = %q, want to contain /%s/packages/requests/1.0.0/%s", f.URL, testNS, filename)
+	}
 }
 
-// uploadFile is a minimal twine-style multipart upload helper: it
-// writes name, version, then a content part with an arbitrary opaque
-// body. The body is not parsed by the handler — it just gets streamed
-// into the OCI backend — so callers don't need a real wheel.
+// uploadFile is a minimal twine-style multipart upload helper that
+// targets the test-ns namespace.
 func uploadFile(t *testing.T, h *Handler, pkgName, version, filename string) int {
 	t.Helper()
 
@@ -1079,26 +1049,24 @@ func uploadFile(t *testing.T, h *Handler, pkgName, version, filename string) int
 	if err := mw.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
 	return rec.Code
 }
 
-// TestSimpleIndexJSONList confirms the root /simple/ endpoint also
-// honours Accept negotiation and emits the PEP 691 project list shape.
+// TestSimpleIndexJSONList confirms the root /<ns>/simple/ endpoint
+// also honours Accept negotiation and emits the PEP 691 project list
+// shape.
 func TestSimpleIndexJSONList(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags["index"] = []string{"flask", "requests"}
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	reg.Tags[testNS+"/index"] = []string{"flask", "requests"}
+	h, _ := newTestHandler(t, reg)
 
-	req := httptest.NewRequest(http.MethodGet, "/simple/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
 	req.Header.Set("Accept", contentTypeJSONv1)
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1183,10 +1151,6 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			// Note: net/http's multipart parser applies filepath.Base
-			// before our handler sees Filename, so on POSIX
-			// "../etc/passwd" arrives as "passwd". The dotdot test
-			// below covers what does survive that stripping.
 			name: "filename is dotdot",
 			write: func(t *testing.T, mw *multipart.Writer) string {
 				_ = mw.WriteField("name", "example")
@@ -1245,14 +1209,11 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			var req *http.Request
 			if tc.body != nil {
-				req = httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(tc.body))
+				req = httptest.NewRequest(http.MethodPut, "/"+testNS+"/", bytes.NewReader(tc.body))
 				req.Header.Set("Content-Type", tc.ctype)
 			} else {
 				var b bytes.Buffer
@@ -1261,7 +1222,7 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 				if err := mw.Close(); err != nil {
 					t.Fatalf("close: %v", err)
 				}
-				req = httptest.NewRequest(http.MethodPut, "/", &b)
+				req = httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 				req.Header.Set("Content-Type", mw.FormDataContentType())
 			}
 
@@ -1294,10 +1255,7 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := NewHandler(reg, WithMaxUploadBytes(tc.cap))
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg, WithMaxUploadBytes(tc.cap))
 
 			var b bytes.Buffer
 			mw := multipart.NewWriter(&b)
@@ -1307,7 +1265,7 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			_, _ = fw.Write(bytes.Repeat([]byte("a"), tc.bodyExtra))
 			_ = mw.Close()
 
-			req := httptest.NewRequest(http.MethodPut, "/", &b)
+			req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 			req.Header.Set("Content-Type", mw.FormDataContentType())
 			rec := httptest.NewRecorder()
 			h.Mux().ServeHTTP(rec, req)
@@ -1324,13 +1282,10 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags["index"] = []string{"flask"}
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	reg.Tags[testNS+"/index"] = []string{"flask"}
+	h, _ := newTestHandler(t, reg)
 
-	for _, path := range []string{"/simple/", "/simple/flask/"} {
+	for _, path := range []string{"/" + testNS + "/simple/", "/" + testNS + "/simple/flask/"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		h.Mux().ServeHTTP(rec, req)
@@ -1341,16 +1296,12 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 }
 
 // TestHandleFilePut_OversizedTextField confirms the per-field byte cap
-// rejects an oversized non-file form part with 413 rather than letting
-// it sit in the walker's working memory until the file part arrives.
+// rejects an oversized non-file form part with 413.
 func TestHandleFilePut_OversizedTextField(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg)
 
 	var b bytes.Buffer
 	mw := multipart.NewWriter(&b)
@@ -1364,7 +1315,7 @@ func TestHandleFilePut_OversizedTextField(t *testing.T) {
 	_, _ = fw.Write([]byte("payload"))
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1374,20 +1325,13 @@ func TestHandleFilePut_OversizedTextField(t *testing.T) {
 }
 
 // TestHandleFilePut_TotalTextFieldsTooLarge confirms that piling up
-// many sub-cap text parts past the cumulative cap is rejected, so a
-// client can't pre-stage hundreds of KB of fields ahead of the file
-// part to chew through walker memory.
+// many sub-cap text parts past the cumulative cap is rejected.
 func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg)
 
-	// Each field is below the per-field cap, but their sum exceeds
-	// maxTotalTextFieldBytes.
 	chunk := strings.Repeat("x", maxTextFieldBytes/2)
 	count := (maxTotalTextFieldBytes / len(chunk)) + 4
 
@@ -1398,7 +1342,7 @@ func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 	}
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1408,16 +1352,13 @@ func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 }
 
 // TestHandleFilePut_TrailingPartsDrained verifies the streaming walker
-// keeps reading after the file part — trailing text parts (e.g. a
-// signature appendix some uploaders emit) don't break the upload.
+// keeps reading after the file part — trailing text parts don't break
+// the upload.
 func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg)
 
 	var b bytes.Buffer
 	mw := multipart.NewWriter(&b)
@@ -1425,28 +1366,25 @@ func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	_ = mw.WriteField("version", "1.0.0")
 	fw, _ := mw.CreateFormFile("content", "example-1.0.0.tar.gz")
 	_, _ = fw.Write([]byte("payload"))
-	// Trailing fields after content — accepted but discarded.
 	_ = mw.WriteField("comment", "uploaded by twine")
 	_ = mw.WriteField("md5_digest", "deadbeef")
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Errorf("status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if _, ok := reg.Files["packages/example/1.0.0/example-1.0.0.tar.gz"]; !ok {
+	if _, ok := reg.Files[testNS+"/packages/example/1.0.0/example-1.0.0.tar.gz"]; !ok {
 		t.Errorf("file missing: %v", registryFileKeys(reg))
 	}
 }
 
 // TestHandleFilePut_NoTmpSpill confirms that an upload large enough to
 // have spilled past ParseMultipartForm's old 32 MiB threshold leaves
-// the temp directory empty when handled by the streaming walker. The
-// test points TMPDIR at a per-test directory and checks it is empty
-// after the request completes.
+// the temp directory empty when handled by the streaming walker.
 //
 // Sequential because t.Setenv mutates process-global state.
 func TestHandleFilePut_NoTmpSpill(t *testing.T) {
@@ -1454,13 +1392,8 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	t.Setenv("TMPDIR", tmp)
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg)
 
-	// 40 MiB body: comfortably past the old 32 MiB ParseMultipartForm
-	// in-memory threshold so the legacy path would have spilled.
 	const payloadSize = 40 << 20
 
 	var b bytes.Buffer
@@ -1473,7 +1406,7 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	}
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPut, "/", &b)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", &b)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	h.Mux().ServeHTTP(rec, req)
@@ -1494,9 +1427,6 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	}
 }
 
-// dummyByteReader returns deterministic bytes without holding the full
-// payload in memory ahead of time. Used by TestHandleFilePut_NoTmpSpill
-// so the test itself doesn't allocate a 64 MiB buffer.
 type dummyByteReader struct{}
 
 func (dummyByteReader) Read(p []byte) (int, error) {
@@ -1507,9 +1437,7 @@ func (dummyByteReader) Read(p []byte) (int, error) {
 }
 
 // TestHandleFilePut_ReuploadConflict locks the wire-level shape of the
-// re-upload contract: the second upload of the same wheel under the
-// same version returns 409 Conflict by default, and flipping
-// AllowOverwrite on the registry promotes it back to 201.
+// re-upload contract.
 func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 	t.Parallel()
 
@@ -1526,7 +1454,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 
 	send := func(t *testing.T, h http.Handler, body *bytes.Buffer, ctype string) *httptest.ResponseRecorder {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", body)
 		req.Header.Set("Content-Type", ctype)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -1548,10 +1476,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 
 			reg := oci.NewFakeRegistry()
 			reg.AllowOverwrite = tc.allowOverwrite
-			h, err := NewHandler(reg)
-			if err != nil {
-				t.Fatalf("NewHandler: %v", err)
-			}
+			h, _ := newTestHandler(t, reg)
 
 			body, ctype := build("first upload")
 			if rec := send(t, h.Mux(), body, ctype); rec.Code != http.StatusCreated {
@@ -1564,8 +1489,6 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 				t.Fatalf("second upload status=%d, want %d (body=%s)", got, want, rec.Body.String())
 			}
 			if rec.Code == http.StatusConflict {
-				// Public 409 message is not the wrapped internal one
-				// (which would carry the OCI repo / tag / name path).
 				if got := rec.Body.String(); !strings.Contains(got, "file already exists") {
 					t.Errorf("409 body = %q, want contains %q", got, "file already exists")
 				}
@@ -1575,9 +1498,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 }
 
 // TestHandleFilePut_ReuploadOfDifferentVersionSucceeds proves the
-// 409 default scopes by version: a second upload of the same package
-// under a new version is the normal release flow and must succeed.
-// The index sentinel must remain a single tag under index/<pkg>.
+// 409 default scopes by version.
 func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 	t.Parallel()
 
@@ -1593,14 +1514,11 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 	}
 
 	reg := oci.NewFakeRegistry()
-	h, err := NewHandler(reg)
-	if err != nil {
-		t.Fatalf("NewHandler: %v", err)
-	}
+	h, _ := newTestHandler(t, reg)
 
 	for _, version := range []string{"1.0.0", "1.0.1", "2.0.0"} {
 		body, ctype := build(version)
-		req := httptest.NewRequest(http.MethodPut, "/", body)
+		req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/", body)
 		req.Header.Set("Content-Type", ctype)
 		rec := httptest.NewRecorder()
 		h.Mux().ServeHTTP(rec, req)
@@ -1611,7 +1529,7 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 
 	// Exactly one sentinel under the index repo, regardless of how
 	// many versions were uploaded.
-	indexTags := reg.Tags["index"]
+	indexTags := reg.Tags[testNS+"/index"]
 	if got, want := len(indexTags), 1; got != want {
 		t.Errorf("index tags = %v, want exactly one entry for the package", indexTags)
 	}
