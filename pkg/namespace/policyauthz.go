@@ -61,7 +61,7 @@ func (a *policyAuthorizer) Authorize(_ context.Context, ac *auth.AuthContext, op
 	case auth.OpWrite:
 		matchers = a.writers
 	default:
-		return fmt.Errorf("unknown op %q for %s: %w", op, ac, auth.ErrUnauthorized)
+		return fmt.Errorf("policyAuthorizer: %q: %w", op, auth.ErrUnknownOp)
 	}
 	for _, m := range matchers {
 		if m.matches(ac) {

@@ -54,6 +54,15 @@ func (f AuthorizerFunc) Authorize(ctx context.Context, ac *AuthContext, op Op) e
 // caller can use [errors.Is].
 var ErrUnauthorized = errors.New("unauthorized")
 
+// ErrUnknownOp signals that an [Authorizer] was asked about an [Op]
+// it does not recognize. This is a programmer / wiring error
+// (e.g. a handler passing a custom op string an authorizer was not
+// configured for), not an authorization failure — callers should
+// surface it as 5xx, not 403, so the bug is visible. Distinct from
+// [ErrUnauthorized] so a "fail closed" deny doesn't silently mask
+// a misconfiguration.
+var ErrUnknownOp = errors.New("unknown op")
+
 // String returns a stable per-caller identity suitable for audit
 // logs, of the form "<issuer>#<id>". Empty fields are preserved so
 // the output is unambiguous when one side is missing

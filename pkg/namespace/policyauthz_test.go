@@ -10,6 +10,30 @@ import (
 
 const ghIssuer = "https://token.actions.githubusercontent.com"
 
+func TestPolicyAuthorizer_UnknownOpReturnsErrUnknownOp(t *testing.T) {
+	t.Parallel()
+
+	a, err := namespace.NewPolicyAuthorizer(namespace.Policy{
+		Readers: []namespace.SubjectMatcher{{Issuer: ghIssuer}},
+		Writers: []namespace.SubjectMatcher{{Issuer: ghIssuer}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicyAuthorizer: %v", err)
+	}
+	ac := &auth.AuthContext{Issuer: ghIssuer, ID: "x"}
+
+	err = a.Authorize(t.Context(), ac, auth.Op("delete"))
+	if err == nil {
+		t.Fatalf("Authorize(unknown op): nil, want error wrapping ErrUnknownOp")
+	}
+	if !errors.Is(err, auth.ErrUnknownOp) {
+		t.Errorf("Authorize(unknown op) = %v, want errors.Is(ErrUnknownOp)", err)
+	}
+	if errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("Authorize(unknown op) = %v, must NOT wrap ErrUnauthorized", err)
+	}
+}
+
 func TestNewPolicyAuthorizer_RejectsInvalidPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -258,13 +282,70 @@ func TestPolicyAuthorizer_Authorize(t *testing.T) {
 			wantAllow: true,
 		},
 		{
-			name: "unknown-op-denied",
+			// Numeric claims arrive as float64 from encoding/json.
+			// json.Marshal renders them without trailing ".0" when
+			// integral, so the regex matches the bare digits.
+			name: "claims-match-numeric",
 			policy: namespace.Policy{
-				Readers: []namespace.SubjectMatcher{{Issuer: ghIssuer}},
-				Writers: []namespace.SubjectMatcher{{Issuer: ghIssuer}},
+				Writers: []namespace.SubjectMatcher{{
+					Issuer:      ghIssuer,
+					ClaimsMatch: map[string]string{"iat": `[0-9]+`},
+				}},
 			},
-			ac: &auth.AuthContext{Issuer: ghIssuer, ID: "x"},
-			op: auth.Op("delete"),
+			ac: &auth.AuthContext{
+				Issuer: ghIssuer,
+				ID:     "x",
+				Claims: map[string]any{"iat": float64(1234567890)},
+			},
+			op:        auth.OpWrite,
+			wantAllow: true,
+		},
+		{
+			name: "claims-match-numeric-mismatch",
+			policy: namespace.Policy{
+				Writers: []namespace.SubjectMatcher{{
+					Issuer:      ghIssuer,
+					ClaimsMatch: map[string]string{"iat": "999"},
+				}},
+			},
+			ac: &auth.AuthContext{
+				Issuer: ghIssuer,
+				ID:     "x",
+				Claims: map[string]any{"iat": float64(1234567890)},
+			},
+			op: auth.OpWrite,
+		},
+		{
+			name: "claims-match-boolean",
+			policy: namespace.Policy{
+				Readers: []namespace.SubjectMatcher{{
+					Issuer:      ghIssuer,
+					ClaimsMatch: map[string]string{"email_verified": "true"},
+				}},
+			},
+			ac: &auth.AuthContext{
+				Issuer: ghIssuer,
+				ID:     "x",
+				Claims: map[string]any{"email_verified": true},
+			},
+			op:        auth.OpRead,
+			wantAllow: true,
+		},
+		{
+			name: "claims-match-null-mismatch",
+			policy: namespace.Policy{
+				Readers: []namespace.SubjectMatcher{{
+					Issuer:      ghIssuer,
+					ClaimsMatch: map[string]string{"nbf": "[0-9]+"},
+				}},
+			},
+			ac: &auth.AuthContext{
+				Issuer: ghIssuer,
+				ID:     "x",
+				// JSON null encodes as "null", which won't match a digits regex.
+				Claims: map[string]any{"nbf": nil},
+			},
+			op: auth.OpRead,
 		},
 	}
 
