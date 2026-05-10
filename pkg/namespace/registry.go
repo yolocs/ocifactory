@@ -24,10 +24,13 @@ import (
 const (
 	// defaultPackageIndexSuffix names the per-namespace OCI repo whose
 	// tags enumerate every owning-repo the wrapper has ever recorded a
-	// write for. The repo lives at "<namespace>/_packages" by default
-	// — operators who already park a real artifact under that name can
-	// relocate it via [WithPackageIndexSuffix].
-	defaultPackageIndexSuffix = "_packages"
+	// write for. The repo lives at "<namespace>/ocifactory-packages"
+	// by default — operators who already park a real artifact under
+	// that name can relocate it via [WithPackageIndexSuffix]. The
+	// literal must satisfy the OCI distribution name regex (path
+	// segments start with [a-z0-9]); a leading "_" is rejected
+	// client-side by oras-go.
+	defaultPackageIndexSuffix = "ocifactory-packages"
 
 	// packageIndexSentinelFile is the file name written under the
 	// package index repo. The body is constant — the tag's existence
@@ -132,10 +135,10 @@ type Registry struct {
 // RegistryOption customises a [Registry].
 type RegistryOption func(*Registry)
 
-// WithPackageIndexSuffix overrides the default ("_packages").
-// Operators set this when their backend already has a top-level
-// "_packages" repo they want to keep — extremely unlikely, but cheap
-// to make configurable.
+// WithPackageIndexSuffix overrides the default
+// ("ocifactory-packages"). Operators set this when their backend
+// already has a per-namespace "ocifactory-packages" repo they want to
+// keep — extremely unlikely, but cheap to make configurable.
 func WithPackageIndexSuffix(s string) RegistryOption {
 	return func(r *Registry) { r.indexSuffix = s }
 }

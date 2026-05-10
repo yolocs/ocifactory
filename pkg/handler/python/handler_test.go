@@ -59,15 +59,6 @@ func (r *countingRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.R
 	return r.FakeRegistry.ListFiles(ctx, repo)
 }
 
-// listFilesUnderTestNS counts ListFiles calls into repos owned by
-// testNS only. The namespace wrapper transparently issues background
-// ListTags calls into _packages bookkeeping repos, which would
-// otherwise inflate the package-index cache test counters and make
-// the "did the cache hit?" assertion noisy.
-func (r *countingRegistry) listFilesUnderTestNS() int64 {
-	return r.listFiles.Load()
-}
-
 func TestDetectMediaType(t *testing.T) {
 	t.Parallel()
 

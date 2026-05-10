@@ -411,20 +411,20 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 				t.Errorf("path %q produced 201; want a rejection (400/404/301)", tc.path)
 			}
 			// The namespace store + wrapper write their own
-			// bookkeeping keys (_index/<ns>/present,
-			// <ns>/_metadata/spec.json, <ns>/_packages/...) on
-			// startup; skip those when asserting that no
+			// bookkeeping keys (ocifactory-namespaces/<ns>/present,
+			// <ns>/_metadata/spec.json, <ns>/ocifactory-packages/...)
+			// on startup; skip those when asserting that no
 			// content-layout writes leaked through. A successful
 			// rejection means no key under <ns>/<maven content
 			// repo>/... appears.
 			for k := range reg.Files {
-				if strings.HasPrefix(k, "_index/") {
+				if strings.HasPrefix(k, "ocifactory-namespaces/") {
 					continue
 				}
 				if strings.HasPrefix(k, testNS+"/_metadata/") {
 					continue
 				}
-				if strings.HasPrefix(k, testNS+"/_packages/") {
+				if strings.HasPrefix(k, testNS+"/ocifactory-packages/") {
 					continue
 				}
 				t.Errorf("path %q produced unexpected backend write %q; want 0 content writes", tc.path, k)

@@ -145,8 +145,9 @@ func stageProject(t *testing.T, ocifactoryURL, version string) string {
 	}
 	pom := strings.ReplaceAll(string(pomBytes), "__VERSION__", version)
 	// Templated URL points at /default/maven2/: every URL is now
-	// namespace-prefixed and the harness materialises "default" via
-	// --default-namespace-allow-all.
+	// namespace-prefixed and the harness seeds "default" via the
+	// Store.Put before the subprocess starts (see
+	// integrationtest.seedDefaultNamespace).
 	pom = strings.ReplaceAll(pom, "__OCIFACTORY_URL__", ocifactoryURL+"/default/maven2")
 	if err := os.WriteFile(pomPath, []byte(pom), 0o600); err != nil {
 		t.Fatalf("write pom: %v", err)

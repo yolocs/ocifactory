@@ -1,8 +1,6 @@
 package python
 
 import (
-	"bytes"
-	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -250,28 +248,3 @@ func TestNamespace_NoAuthForbiddenAtWrapper(t *testing.T) {
 		t.Errorf("status = %d, want %d (wrapper must deny nil AuthContext even with AllowAll factory)", got, want)
 	}
 }
-
-// uploadPackageInNSRaw is the raw form of uploadPackageInNS for
-// scenarios where the test wants the response body, not just the
-// status code.
-func uploadPackageInNSRaw(t *testing.T, h http.Handler, ns, pkgName, version string) *httptest.ResponseRecorder {
-	t.Helper()
-
-	var b bytes.Buffer
-	mw := multipart.NewWriter(&b)
-	_ = mw.WriteField("name", pkgName)
-	_ = mw.WriteField("version", version)
-	fw, _ := mw.CreateFormFile("content", pkgName+"-"+version+".whl")
-	_, _ = fw.Write([]byte("payload-" + pkgName + "-" + version))
-	_ = mw.Close()
-
-	req := httptest.NewRequest(http.MethodPut, "/"+ns+"/", &b)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-// Compile-time exercise: keep uploadPackageInNSRaw referenced so a
-// future test that needs it doesn't need to redefine the helper.
-var _ = uploadPackageInNSRaw

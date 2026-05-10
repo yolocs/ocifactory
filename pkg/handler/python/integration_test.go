@@ -108,9 +108,10 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 // ocifactory. With --disable-authn the server takes any credential,
 // but twine requires non-empty username/password in the env to send
 // a Basic header at all. The repo URL is prefixed with /default/
-// because every URL now lives under a namespace; the harness boots
-// with --default-namespace-allow-all so a real client doesn't need
-// to register a namespace first.
+// because every URL now lives under a namespace; the harness seeds
+// a "default" namespace via Store.Put before starting the subprocess
+// (see seedDefaultNamespace) so a real client doesn't need an admin
+// namespace-Put step.
 func uploadWithTwine(t *testing.T, base string, whl *testWheel) {
 	t.Helper()
 

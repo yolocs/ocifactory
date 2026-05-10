@@ -14,20 +14,31 @@ var ErrInvalidName = errors.New("invalid namespace name")
 // routing. Covers built-in URL prefixes, per-format URL prefixes used
 // by existing handlers, and OCI/internal prefixes used by the storage
 // layer.
+//
+// The "ocifactory-namespaces" entry is load-bearing: it's the actual
+// top-level repo segment that holds the namespace catalogue (see
+// [indexRepoSegment]). A namespace with that name would write its
+// _metadata tag into the same repo as the catalogue's per-namespace
+// sentinel tags, conflating the two.
+//
+// The "_*" entries are kept as documentation of historical reserved
+// shapes; the leading-"_" check above already rejects them, so the
+// map lookup never sees them.
 var reservedNames = map[string]struct{}{
-	"admin":       {},
-	"healthz":     {},
-	"readyz":      {},
-	"metrics":     {},
-	"simple":      {},
-	"maven2":      {},
-	"v2":          {},
-	"npm":         {},
-	"_meta":       {},
-	"_catalog":    {},
-	"_index":      {},
-	"_namespaces": {},
-	"_packages":   {},
+	"admin":                 {},
+	"healthz":               {},
+	"readyz":                {},
+	"metrics":               {},
+	"simple":                {},
+	"maven2":                {},
+	"v2":                    {},
+	"npm":                   {},
+	"ocifactory-namespaces": {},
+	"_meta":                 {},
+	"_catalog":              {},
+	"_index":                {},
+	"_namespaces":           {},
+	"_packages":             {},
 }
 
 // ValidateName returns nil iff name is a legal namespace name:
