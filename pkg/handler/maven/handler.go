@@ -88,6 +88,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 // multiple format handlers behind a single hostname per namespace.
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
+	router.Use(mux.MiddlewareFunc(handler.RouteNameOpMiddleware))
 	if h.authMW != nil {
 		// Maven's whole route surface is private — every
 		// route requires a verified AuthContext.
@@ -96,24 +97,24 @@ func (h *Handler) Mux() http.Handler {
 
 	nsr := router.PathPrefix("/{namespace}/maven2").Subrouter()
 
+	readMethods := []string{http.MethodGet, http.MethodHead}
+	writeMethods := []string{http.MethodPut, http.MethodPost}
+
 	// 1. Archetype Catalog
-	// Handles GET, HEAD, PUT, POST for /archetype-catalog.xml
-	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(readMethods...).Name("read")
+	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(writeMethods...).Name("write")
 
 	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
-	// Handles GET, HEAD, PUT, POST for snapshot metadata files.
-	// Example: /{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml
-	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(readMethods...).Name("read")
+	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(writeMethods...).Name("write")
 
-	// 3. Artifact Metadata (e.g., group/artifact/maven-metadata.xml or group/artifact/version/maven-metadata.xml for releases)
-	// Handles GET, HEAD, PUT, POST for non-snapshot metadata files. This must be after snapshot metadata.
-	// Example: /{groupId}/{artifactId}/maven-metadata.xml
-	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	// 3. Artifact Metadata (release; must be registered after snapshot).
+	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(readMethods...).Name("read")
+	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(writeMethods...).Name("write")
 
-	// 4. Regular Artifact Files (e.g., group/artifact/version/file.jar)
-	// Handles GET, HEAD, PUT, POST for general artifact files. This is the most general route and must be last.
-	// Example: /{groupId}/{artifactId}/{version}/{filename.ext}
-	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+	// 4. Regular Artifact Files. Most general; must be last.
+	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(readMethods...).Name("read")
+	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(writeMethods...).Name("write")
 
 	return router
 }
@@ -224,7 +225,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 	body, err := h.maybeVerifyChecksum(req, scoped, f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
-		if handler.WriteNamespaceError(req.Context(), w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		code := httpStatus(err)
@@ -241,7 +242,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 	desc, err := scoped.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
-		if handler.WriteNamespaceError(req.Context(), w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		if errors.Is(err, oci.ErrAlreadyExists) {
@@ -320,7 +321,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped han
 	desc, r, err := scoped.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
-		if handler.WriteNamespaceError(req.Context(), w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		if errors.Is(err, errdef.ErrNotFound) {

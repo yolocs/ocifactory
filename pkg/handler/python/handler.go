@@ -228,7 +228,7 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 	scoped := h.scopedFor(req)
 	tags, err := scoped.ListTags(req.Context(), "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		if handler.WriteNamespaceError(req.Context(), w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "failed to list package index")
@@ -395,7 +395,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	// AddFile contract.
 	if err := h.ensureIndexSentinel(ctx, scoped, normalizedName); err != nil {
 		logger.DebugContext(ctx, "failed to ensure index sentinel", "error", err)
-		if handler.WriteNamespaceError(ctx, w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		var maxBytesErr *http.MaxBytesError
@@ -511,7 +511,7 @@ func (h *Handler) streamAddFile(ctx context.Context, scoped handler.Registry, w 
 	desc, err := scoped.AddFile(ctx, f, content)
 	if err != nil {
 		logger.DebugContext(ctx, "failed to add file", "error", err)
-		if handler.WriteNamespaceError(ctx, w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return false
 		}
 		var maxBytesErr *http.MaxBytesError
@@ -574,7 +574,7 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 		var err error
 		files, err = h.resolvePackageFiles(req.Context(), h.scopedFor(req), pkg)
 		if err != nil {
-			if handler.WriteNamespaceError(req.Context(), w, err) {
+			if handler.WriteNamespaceError(w, err) {
 				return
 			}
 			if errors.Is(err, errdef.ErrNotFound) {
@@ -666,7 +666,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped han
 	desc, r, err := scoped.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
-		if handler.WriteNamespaceError(req.Context(), w, err) {
+		if handler.WriteNamespaceError(w, err) {
 			return
 		}
 		if errors.Is(err, errdef.ErrNotFound) {

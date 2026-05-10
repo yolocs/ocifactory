@@ -1,7 +1,9 @@
 package maven
 
 import (
+	"context"
 	"crypto/sha1"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,6 +38,7 @@ func TestNamespace_UnknownNamespace404(t *testing.T) {
 		{name: "regular artifact GET", method: http.MethodGet, path: "/ghost/maven2/com/example/foo/1.0.0/foo-1.0.0.jar"},
 		{name: "regular artifact PUT", method: http.MethodPut, path: "/ghost/maven2/com/example/foo/1.0.0/foo-1.0.0.jar"},
 		{name: "release metadata GET", method: http.MethodGet, path: "/ghost/maven2/com/example/foo/maven-metadata.xml"},
+		{name: "snapshot metadata GET", method: http.MethodGet, path: "/ghost/maven2/com/example/foo/1.0-SNAPSHOT/maven-metadata.xml"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,6 +50,71 @@ func TestNamespace_UnknownNamespace404(t *testing.T) {
 				t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestNamespace_InvalidNamespaceName400 confirms a malformed namespace
+// segment surfaces as 400, not 500.
+func TestNamespace_InvalidNamespaceName400(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "uppercase", path: "/UPPER/maven2/com/example/foo/1.0.0/foo-1.0.0.jar"},
+		{name: "leading underscore", path: "/_index/maven2/com/example/foo/1.0.0/foo-1.0.0.jar"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			w := httptest.NewRecorder()
+			h.Mux().ServeHTTP(w, r)
+			if got, want := w.Code, http.StatusBadRequest; got != want {
+				t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestNamespace_AuthzErrorFailsClosed pins fail-closed behaviour when
+// the Authorizer returns a non-sentinel error mid-request.
+func TestNamespace_AuthzErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store,
+		namespace.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) {
+			return auth.AuthorizerFunc(func(_ context.Context, _ *auth.AuthContext, _ auth.Op) error {
+				return errors.New("transient backend lookup failure")
+			}), nil
+		}),
+		namespace.WithPolicyCacheTTL(0),
+	)
+	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
+
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, nsPath("/archetype-catalog.xml"), nil)
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, r)
+	if w.Code >= 200 && w.Code < 300 {
+		t.Errorf("status = %d, want non-2xx (Authorizer error must fail closed)", w.Code)
 	}
 }
 
@@ -198,6 +266,32 @@ func TestNamespace_CrossNamespaceIsolation_Checksum(t *testing.T) {
 	mux.ServeHTTP(w, r)
 	if got, want := w.Code, http.StatusBadRequest; got != want {
 		t.Errorf("beta sha1 upload status=%d, want %d (body=%s)", got, want, w.Body.String())
+	}
+}
+
+// TestNamespace_ReservedIndexRepoRejected confirms a writer cannot
+// reach the wrapper's own per-namespace package-index repo via a
+// maven URL that names "ocifactory-packages" as the first repo
+// segment.
+func TestNamespace_ReservedIndexRepoRejected(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
+
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodPut, nsPath("/ocifactory-packages/1.0.0/x.jar"), strings.NewReader("jar"))
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, r)
+	if got, want := w.Code, http.StatusBadRequest; got != want {
+		t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
 	}
 }
 

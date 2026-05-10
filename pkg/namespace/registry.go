@@ -304,6 +304,14 @@ func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
 		return "", fmt.Errorf("%w: owning repo %q escapes namespace", ErrInvalidOwningRepo, owningRepo)
 	}
+	// The first path segment of the namespace package index repo is
+	// reserved: a write that landed there would mix user artifacts in
+	// with the wrapper's own sentinel tags. Maven's regex-y URL routes
+	// can otherwise reach it, so the check lives at the resolver — the
+	// chokepoint every per-format handler funnels through.
+	if cleaned == r.indexSuffix || strings.HasPrefix(cleaned, r.indexSuffix+"/") {
+		return "", fmt.Errorf("%w: owning repo %q uses reserved prefix %q", ErrInvalidOwningRepo, owningRepo, r.indexSuffix)
+	}
 	return path.Join(namespace, cleaned), nil
 }
 

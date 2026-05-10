@@ -1,6 +1,8 @@
 package python
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +47,75 @@ func TestNamespace_UnknownNamespace404(t *testing.T) {
 				t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestNamespace_InvalidNamespaceName400 confirms a malformed namespace
+// segment surfaces as 400, not 500 — WriteNamespaceError maps
+// ErrInvalidName to BadRequest.
+func TestNamespace_InvalidNamespaceName400(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "uppercase", path: "/UPPER/simple/"},
+		{name: "leading underscore", path: "/_index/simple/"},
+		{name: "leading dash", path: "/-bad/simple/"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			w := httptest.NewRecorder()
+			h.Mux().ServeHTTP(w, r)
+			if got, want := w.Code, http.StatusBadRequest; got != want {
+				t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestNamespace_AuthzErrorFailsClosed pins the behaviour when the
+// configured Authorizer returns a non-sentinel error mid-request: the
+// handler must not 2xx. A non-2xx (4xx or 5xx) is acceptable; what we
+// pin is "never silently allow the operation".
+func TestNamespace_AuthzErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	store := namespace.NewStore(fake)
+	reg := namespace.NewRegistry(fake, store,
+		namespace.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) {
+			return auth.AuthorizerFunc(func(_ context.Context, _ *auth.AuthContext, _ auth.Op) error {
+				return errors.New("transient backend lookup failure")
+			}), nil
+		}),
+		namespace.WithPolicyCacheTTL(0),
+	)
+	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
+
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, r)
+	if w.Code >= 200 && w.Code < 300 {
+		t.Errorf("status = %d, want non-2xx (Authorizer error must fail closed)", w.Code)
 	}
 }
 

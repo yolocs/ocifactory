@@ -28,24 +28,17 @@ type Registry interface {
 	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
 }
 
-// WriteNamespaceError maps the sentinel errors raised by
-// *namespace.ScopedRegistry — ErrNotFound (unknown namespace),
-// auth.ErrUnauthorized (subject denied or AuthContext missing), and
-// ErrInvalidOwningRepo (malformed / escape-attempting repo) — to HTTP
-// 4xx responses. Returns true when err matched a namespace sentinel and
-// a response was written; returns false (with no response written) when
-// err is nil or unrelated, leaving the caller to handle the remaining
-// branches (errdef.ErrNotFound for a missing artifact, oci.HasCode
-// translations, etc.).
-//
-// Lives in pkg/handler so every format handler maps these errors the
-// same way without re-deriving the status codes.
-func WriteNamespaceError(_ context.Context, w http.ResponseWriter, err error) bool {
+// WriteNamespaceError translates namespace sentinel errors to HTTP
+// 4xx responses and returns whether it wrote a response. When err is
+// nil or unrelated, returns false and writes nothing — the caller
+// handles remaining branches (errdef.ErrNotFound, oci.HasCode, ...).
+func WriteNamespaceError(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false
 	}
 	switch {
-	case errors.Is(err, namespace.ErrInvalidOwningRepo):
+	case errors.Is(err, namespace.ErrInvalidName),
+		errors.Is(err, namespace.ErrInvalidOwningRepo):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return true
 	case errors.Is(err, namespace.ErrNotFound):

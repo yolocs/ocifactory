@@ -202,6 +202,40 @@ func TestScopedRegistry_NamespaceEscape(t *testing.T) {
 	}
 }
 
+// TestScopedRegistry_RejectsReservedIndexSuffix proves the wrapper
+// refuses to route a user-supplied owning-repo into the per-namespace
+// package-index repo. Without this check a maven-style handler that
+// builds OwningRepo from URL path segments could plant tags in the
+// wrapper's own sentinel repo.
+func TestScopedRegistry_RejectsReservedIndexSuffix(t *testing.T) {
+	t.Parallel()
+
+	_, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	tests := []struct {
+		name       string
+		owningRepo string
+	}{
+		{name: "exact", owningRepo: "ocifactory-packages"},
+		{name: "prefix", owningRepo: "ocifactory-packages/com/example/foo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := scoped.AddFile(ctx, newRepoFile(tc.owningRepo, "1.0.0", "f.txt"), strings.NewReader(defaultBody))
+			if err == nil {
+				t.Fatalf("AddFile owningRepo=%q = nil, want ErrInvalidOwningRepo", tc.owningRepo)
+			}
+			if !errors.Is(err, namespace.ErrInvalidOwningRepo) {
+				t.Errorf("AddFile owningRepo=%q err = %v, want errors.Is(ErrInvalidOwningRepo)", tc.owningRepo, err)
+			}
+		})
+	}
+}
+
 func TestScopedRegistry_NamespaceNotFound(t *testing.T) {
 	t.Parallel()
 
