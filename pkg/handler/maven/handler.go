@@ -50,8 +50,8 @@ var (
 )
 
 type Handler struct {
-	registryForNamespace func(string) handler.Registry
-	authMW               func(http.Handler) http.Handler
+	registry *namespace.Registry
+	authMW   func(http.Handler) http.Handler
 }
 
 // Option configures optional Handler behaviour.
@@ -81,7 +81,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	if registry == nil {
 		return nil, fmt.Errorf("registry must not be nil")
 	}
-	return &Handler{registryForNamespace: func(ns string) handler.Registry { return registry.For(ns) }, authMW: cfg.authMW}, nil
+	return &Handler{registry: registry, authMW: cfg.authMW}, nil
 }
 
 func (h *Handler) Mux() http.Handler {
@@ -318,12 +318,12 @@ func registerRoutes(router *mux.Router, h *Handler) {
 }
 
 func (h *Handler) scopedRegistry(req *http.Request) handler.Registry {
-	return h.registryForNamespace(mux.Vars(req)["namespace"])
+	return h.registry.For(mux.Vars(req)["namespace"])
 }
 
 func writeRegistryError(ctx context.Context, w http.ResponseWriter, err error, public string) {
 	switch {
-	case errors.Is(err, namespace.ErrInvalidOwningRepo):
+	case errors.Is(err, namespace.ErrInvalidName), errors.Is(err, namespace.ErrInvalidOwningRepo):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, namespace.ErrNotFound), errors.Is(err, errdef.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)

@@ -24,7 +24,7 @@ func TestMux_AuthGating(t *testing.T) {
 	}
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg, WithAuthMiddleware(denyAll))
+	h, err := newHandlerWithRegistry(t, reg, WithAuthMiddleware(denyAll))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 	}))
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg, WithAuthMiddleware(installer))
+	h, err := newHandlerWithRegistry(t, reg, WithAuthMiddleware(installer))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}

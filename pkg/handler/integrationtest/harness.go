@@ -28,6 +28,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/namespace/nsutil"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -81,7 +82,7 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	binary := buildBinary(t)
 
 	backendRepo := "ocifactory-int"
-	seedDefaultNamespace(t, ctx, zotURL, backendRepo)
+	seedNamespace(t, ctx, zotURL, backendRepo, "default", nsutil.AllowIssuerSpec("anonymous"))
 
 	logPath := filepath.Join(t.TempDir(), "ocifactory.log")
 	logFile, err := os.Create(logPath)
@@ -150,7 +151,7 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	}
 }
 
-func seedDefaultNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo string) {
+func seedNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo string, name string, spec namespace.Spec) {
 	t.Helper()
 	backendURL, err := url.Parse(fmt.Sprintf("%s://%s/%s", zotURL.Scheme, zotURL.Host, backendRepo))
 	if err != nil {
@@ -160,17 +161,11 @@ func seedDefaultNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, ba
 	if err != nil {
 		t.Fatalf("create namespace seed registry: %v", err)
 	}
-	store := namespace.NewStore(reg)
-	allowAnonymous := namespace.SubjectMatcher{Issuer: "anonymous"}
-	if err := store.Put(ctx, &namespace.Namespace{
-		Name: "default",
-		Spec: namespace.Spec{Policy: namespace.Policy{
-			Readers: []namespace.SubjectMatcher{allowAnonymous},
-			Writers: []namespace.SubjectMatcher{allowAnonymous},
-		}},
-	}); err != nil {
-		t.Fatalf("seed default namespace: %v", err)
+	if zotURL.Hostname() != "127.0.0.1" && zotURL.Hostname() != "localhost" {
+		t.Fatalf("refusing to seed namespace %q into non-loopback registry %s", name, zotURL)
 	}
+	store := namespace.NewStore(reg)
+	nsutil.Seed(t, ctx, store, &namespace.Namespace{Name: name, Spec: spec})
 }
 
 func startZot(t *testing.T, ctx context.Context) (testcontainers.Container, *url.URL) {

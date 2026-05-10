@@ -91,11 +91,11 @@ var (
 )
 
 type Handler struct {
-	registryForNamespace func(string) handler.Registry
-	renderer             *renderer.Renderer
-	indexCache           *simpleIndexCache
-	authMW               func(http.Handler) http.Handler
-	maxUploadBytes       int64
+	registry       *namespace.Registry
+	renderer       *renderer.Renderer
+	indexCache     *simpleIndexCache
+	authMW         func(http.Handler) http.Handler
+	maxUploadBytes int64
 }
 
 // Option configures optional Handler behaviour.
@@ -161,11 +161,11 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}
 	return &Handler{
-		registryForNamespace: func(ns string) handler.Registry { return registry.For(ns) },
-		renderer:             r,
-		indexCache:           newSimpleIndexCache(cfg.simpleIndexCacheTTL),
-		authMW:               cfg.authMW,
-		maxUploadBytes:       cfg.maxUploadBytes,
+		registry:       registry,
+		renderer:       r,
+		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
+		authMW:         cfg.authMW,
+		maxUploadBytes: cfg.maxUploadBytes,
 	}, nil
 }
 
@@ -370,7 +370,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		switch {
 		case errors.As(err, &maxBytesErr):
 			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
-		case errors.Is(err, namespace.ErrInvalidOwningRepo):
+		case errors.Is(err, namespace.ErrInvalidName), errors.Is(err, namespace.ErrInvalidOwningRepo):
 			http.Error(w, err.Error(), http.StatusBadRequest)
 		case errors.Is(err, namespace.ErrNotFound) || errors.Is(err, errdef.ErrNotFound):
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -489,7 +489,7 @@ func (h *Handler) streamAddFile(ctx context.Context, w http.ResponseWriter, regi
 			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
 		case errors.Is(err, oci.ErrAlreadyExists):
 			http.Error(w, "file already exists in version", http.StatusConflict)
-		case errors.Is(err, namespace.ErrInvalidOwningRepo):
+		case errors.Is(err, namespace.ErrInvalidName), errors.Is(err, namespace.ErrInvalidOwningRepo):
 			http.Error(w, err.Error(), http.StatusBadRequest)
 		case errors.Is(err, namespace.ErrNotFound) || errors.Is(err, errdef.ErrNotFound):
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -659,7 +659,7 @@ func registerRoutes(router *mux.Router, h *Handler) {
 }
 
 func (h *Handler) scopedRegistry(req *http.Request) handler.Registry {
-	return h.registryForNamespace(namespaceFromRequest(req))
+	return h.registry.For(namespaceFromRequest(req))
 }
 
 func namespaceFromRequest(req *http.Request) string {
@@ -682,7 +682,7 @@ func cacheKey(namespace, pkg string) string {
 
 func writeRegistryError(ctx context.Context, w http.ResponseWriter, err error, public string) {
 	switch {
-	case errors.Is(err, namespace.ErrInvalidOwningRepo):
+	case errors.Is(err, namespace.ErrInvalidName), errors.Is(err, namespace.ErrInvalidOwningRepo):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, namespace.ErrNotFound), errors.Is(err, errdef.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)

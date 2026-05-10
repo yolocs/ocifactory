@@ -303,7 +303,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			uploadBody:   hashHex(t, sha1.New(), artifactBody),
 			wantStatus:   http.StatusCreated,
 			wantStored:   true,
-			storedKey:    "com/example/project/1.0.0/project-1.0.0.jar.sha1",
+			storedKey:    "default/com/example/project/1.0.0/project-1.0.0.jar.sha1",
 			storedExpect: hashHex(t, sha1.New(), artifactBody),
 		},
 		{
@@ -315,7 +315,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			uploadBody:   hashHex(t, md5.New(), artifactBody),
 			wantStatus:   http.StatusCreated,
 			wantStored:   true,
-			storedKey:    "com/example/project/1.0.0/project-1.0.0.jar.md5",
+			storedKey:    "default/com/example/project/1.0.0/project-1.0.0.jar.md5",
 			storedExpect: hashHex(t, md5.New(), artifactBody),
 		},
 		{
@@ -341,7 +341,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -365,7 +365,7 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 					t.Errorf("stored checksum = %q, want %q", got, tc.storedExpect)
 				}
 			} else if !tc.wantStored && tc.uploadPath == sha1Path {
-				if _, exists := reg.Files["com/example/project/1.0.0/project-1.0.0.jar.sha1"]; exists {
+				if _, exists := reg.Files["default/com/example/project/1.0.0/project-1.0.0.jar.sha1"]; exists {
 					t.Errorf("checksum unexpectedly stored after rejection")
 				}
 			}
@@ -397,11 +397,12 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
 
+			filesBefore := len(reg.Files)
 			req := httptest.NewRequest(http.MethodPut, tc.path, strings.NewReader("x"))
 			w := httptest.NewRecorder()
 			h.Mux().ServeHTTP(w, req)
@@ -413,8 +414,8 @@ func TestHandlePut_PathTraversal(t *testing.T) {
 			if w.Code == http.StatusCreated {
 				t.Errorf("path %q produced 201; want a rejection (400/404/301)", tc.path)
 			}
-			if len(reg.Files) != 0 {
-				t.Errorf("path %q stored %d file(s); want 0", tc.path, len(reg.Files))
+			if len(reg.Files) != filesBefore {
+				t.Errorf("path %q stored %d new file(s); want 0", tc.path, len(reg.Files)-filesBefore)
 			}
 		})
 	}

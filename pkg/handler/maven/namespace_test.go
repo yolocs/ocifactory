@@ -1,6 +1,7 @@
 package maven
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/namespace/nsutil"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -17,8 +19,8 @@ func TestNamespaceRoutes(t *testing.T) {
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
-	putMavenNamespace(t, store, "alpha", allowMavenSubjectSpec())
-	putMavenNamespace(t, store, "beta", allowMavenSubjectSpec())
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "alpha", Spec: nsutil.AllowIssuerSpec("issuer")})
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "beta", Spec: nsutil.AllowIssuerSpec("issuer")})
 	h, err := NewHandler(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -26,12 +28,23 @@ func TestNamespaceRoutes(t *testing.T) {
 	mux := h.Mux()
 	ctx := auth.WithAuthContext(t.Context(), &auth.AuthContext{Issuer: "issuer", ID: "alice"})
 
-	req := httptest.NewRequest(http.MethodPut, "/alpha/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", strings.NewReader("jar"))
-	req = req.WithContext(ctx)
-	resp := httptest.NewRecorder()
-	mux.ServeHTTP(resp, req)
-	if resp.Code != http.StatusCreated {
-		t.Fatalf("put status=%d body=%s", resp.Code, resp.Body.String())
+	seededPaths := []struct {
+		path string
+		body string
+	}{
+		{path: "/alpha/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", body: "jar"},
+		{path: "/alpha/maven2/archetype-catalog.xml", body: "<archetype-catalog/>"},
+		{path: "/alpha/maven2/com/example/demo/1.0-SNAPSHOT/maven-metadata.xml", body: "<snapshot/>"},
+		{path: "/alpha/maven2/com/example/demo/maven-metadata.xml", body: "<metadata/>"},
+	}
+	for _, seeded := range seededPaths {
+		req := httptest.NewRequest(http.MethodPut, seeded.path, strings.NewReader(seeded.body))
+		req = req.WithContext(ctx)
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+		if resp.Code != http.StatusCreated {
+			t.Fatalf("put %s status=%d body=%s", seeded.path, resp.Code, resp.Body.String())
+		}
 	}
 
 	for _, tc := range []struct {
@@ -39,9 +52,13 @@ func TestNamespaceRoutes(t *testing.T) {
 		url  string
 		want int
 	}{
-		{name: "same namespace", url: "/alpha/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", want: http.StatusOK},
+		{name: "same namespace artifact", url: "/alpha/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", want: http.StatusOK},
+		{name: "same namespace archetype", url: "/alpha/maven2/archetype-catalog.xml", want: http.StatusOK},
+		{name: "same namespace snapshot metadata", url: "/alpha/maven2/com/example/demo/1.0-SNAPSHOT/maven-metadata.xml", want: http.StatusOK},
+		{name: "same namespace artifact metadata", url: "/alpha/maven2/com/example/demo/maven-metadata.xml", want: http.StatusOK},
 		{name: "other namespace", url: "/beta/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", want: http.StatusNotFound},
 		{name: "unknown namespace", url: "/missing/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", want: http.StatusNotFound},
+		{name: "invalid namespace", url: "/_meta/maven2/com/example/demo/1.0.0/demo-1.0.0.jar", want: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -61,7 +78,7 @@ func TestNamespaceRoutesForbidden(t *testing.T) {
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
-	putMavenNamespace(t, store, "alpha", namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "other"}}, Writers: []namespace.SubjectMatcher{{Issuer: "other"}}}})
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "alpha", Spec: nsutil.AllowIssuerSpec("other")})
 	h, err := NewHandler(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -74,13 +91,17 @@ func TestNamespaceRoutesForbidden(t *testing.T) {
 	}
 }
 
-func putMavenNamespace(t *testing.T, store *namespace.Store, name string, spec namespace.Spec) {
-	t.Helper()
-	if err := store.Put(t.Context(), &namespace.Namespace{Name: name, Spec: spec}); err != nil {
-		t.Fatalf("put namespace %s: %v", name, err)
-	}
-}
+func TestWriteRegistryErrorBadRequest(t *testing.T) {
+	t.Parallel()
 
-func allowMavenSubjectSpec() namespace.Spec {
-	return namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "issuer"}}, Writers: []namespace.SubjectMatcher{{Issuer: "issuer"}}}}
+	for _, err := range []error{
+		fmt.Errorf("%w: _meta", namespace.ErrInvalidName),
+		fmt.Errorf("%w: ../escape", namespace.ErrInvalidOwningRepo),
+	} {
+		rec := httptest.NewRecorder()
+		writeRegistryError(t.Context(), rec, err, "internal")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status=%d want=%d for %v", rec.Code, http.StatusBadRequest, err)
+		}
+	}
 }

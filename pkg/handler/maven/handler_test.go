@@ -113,9 +113,9 @@ func TestHandlePut(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(http.MethodPut, tc.path, strings.NewReader(tc.body))
@@ -156,7 +156,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get existing jar",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "com/example/project",
+				OwningRepo: "default/com/example/project",
 				OwningTag:  "1.0.0",
 				Name:       "project-1.0.0.jar",
 				MediaType:  "application/java-archive",
@@ -170,7 +170,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "head existing jar",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "com/example/project",
+				OwningRepo: "default/com/example/project",
 				OwningTag:  "1.0.0",
 				Name:       "project-1.0.0.jar",
 				MediaType:  "application/java-archive",
@@ -196,7 +196,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get archetype catalog",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "archetype",
+				OwningRepo: "default/archetype",
 				OwningTag:  "latest",
 				Name:       "archetype-catalog.xml",
 				MediaType:  "text/xml",
@@ -210,7 +210,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get snapshot metadata",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "com/example/project",
+				OwningRepo: "default/com/example/project",
 				OwningTag:  "1.0-SNAPSHOT-metadata",
 				Name:       "maven-metadata.xml",
 				MediaType:  "text/xml",
@@ -224,7 +224,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get release metadata",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "com/example/project",
+				OwningRepo: "default/com/example/project",
 				OwningTag:  "metadata",
 				Name:       "maven-metadata.xml",
 				MediaType:  "text/xml",
@@ -249,9 +249,9 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
@@ -296,7 +296,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 	t.Parallel()
 
 	setupFile := &oci.RepoFile{
-		OwningRepo: "com/example/project",
+		OwningRepo: "default/com/example/project",
 		OwningTag:  "1.0.0",
 		Name:       "project-1.0.0.jar",
 		MediaType:  "application/java-archive",
@@ -362,7 +362,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 				redirectErr:  tc.redirectErr,
 			}
 
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -393,7 +393,7 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 	p = strings.TrimPrefix(p, "default/maven2/")
 	if strings.HasPrefix(p, "archetype-catalog.xml") {
 		return &oci.RepoFile{
-			OwningRepo: "archetype",
+			OwningRepo: "default/archetype",
 			OwningTag:  "latest",
 			Name:       p,
 			MediaType:  "text/xml",
@@ -410,16 +410,16 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 		if strings.Contains(parts[len(parts)-2], "-SNAPSHOT") {
 			// This is a version level maven-metadata.xml for snapshots.
 			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-				OwningTag:  parts[len(parts)-2] + "-metadata",       // versionId-metadata
+				OwningRepo: "default/" + strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
+				OwningTag:  parts[len(parts)-2] + "-metadata",                    // versionId-metadata
 				Name:       fn,
 				MediaType:  "text/xml",
 			}
 		} else {
 			// This is a group/artifact level maven-metadata.xml for releases.
 			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
-				OwningTag:  "metadata",                              // metadata
+				OwningRepo: "default/" + strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
+				OwningTag:  "metadata",                                           // metadata
 				Name:       fn,
 				MediaType:  "text/xml",
 			}
@@ -431,8 +431,8 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 	}
 
 	return &oci.RepoFile{
-		OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-		OwningTag:  parts[len(parts)-2],                     // versionId
+		OwningRepo: "default/" + strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
+		OwningTag:  parts[len(parts)-2],                                  // versionId
 		Name:       fn,
 		MediaType:  detectMediaType(fn),
 	}
@@ -460,7 +460,7 @@ func TestHandlePut_ReuploadConflict(t *testing.T) {
 
 			reg := oci.NewFakeRegistry()
 			reg.AllowOverwrite = tc.allowOverwrite
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}

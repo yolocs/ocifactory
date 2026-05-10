@@ -2,6 +2,7 @@ package python
 
 import (
 	"bytes"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/namespace/nsutil"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -19,8 +21,8 @@ func TestNamespaceRoutes(t *testing.T) {
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
-	putPythonNamespace(t, store, "alpha", allowPythonSubjectSpec())
-	putPythonNamespace(t, store, "beta", allowPythonSubjectSpec())
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "alpha", Spec: nsutil.AllowIssuerSpec("issuer")})
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "beta", Spec: nsutil.AllowIssuerSpec("issuer")})
 	h, err := NewHandler(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -39,13 +41,30 @@ func TestNamespaceRoutes(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name string
-		url  string
-		want int
+		name         string
+		url          string
+		want         int
+		wantContains []string
 	}{
-		{name: "same namespace", url: "/alpha/simple/demo/", want: http.StatusOK},
+		{
+			name: "same namespace index",
+			url:  "/alpha/simple/demo/",
+			want: http.StatusOK,
+			wantContains: []string{
+				"/alpha/packages/demo/1.0.0/demo-1.0.0.whl",
+			},
+		},
+		{
+			name: "same namespace root",
+			url:  "/alpha/simple/",
+			want: http.StatusOK,
+			wantContains: []string{
+				"/alpha/simple/demo/",
+			},
+		},
 		{name: "other namespace", url: "/beta/packages/demo/1.0.0/demo-1.0.0.whl", want: http.StatusNotFound},
 		{name: "unknown namespace", url: "/missing/simple/", want: http.StatusNotFound},
+		{name: "invalid namespace", url: "/_meta/simple/", want: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -54,6 +73,11 @@ func TestNamespaceRoutes(t *testing.T) {
 			mux.ServeHTTP(resp, req)
 			if resp.Code != tc.want {
 				t.Errorf("status=%d want=%d body=%s", resp.Code, tc.want, resp.Body.String())
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(resp.Body.String(), want) {
+					t.Errorf("body missing %q; got:\n%s", want, resp.Body.String())
+				}
 			}
 		})
 	}
@@ -65,7 +89,7 @@ func TestNamespaceRoutesForbidden(t *testing.T) {
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
 	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
-	putPythonNamespace(t, store, "alpha", namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "other"}}, Writers: []namespace.SubjectMatcher{{Issuer: "other"}}}})
+	nsutil.Seed(t, t.Context(), store, &namespace.Namespace{Name: "alpha", Spec: nsutil.AllowIssuerSpec("other")})
 	h, err := NewHandler(reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -101,13 +125,17 @@ func pythonUploadBody(t *testing.T, pkg, version, filename, content string) (*st
 	return strings.NewReader(b.String()), w.FormDataContentType()
 }
 
-func putPythonNamespace(t *testing.T, store *namespace.Store, name string, spec namespace.Spec) {
-	t.Helper()
-	if err := store.Put(t.Context(), &namespace.Namespace{Name: name, Spec: spec}); err != nil {
-		t.Fatalf("put namespace %s: %v", name, err)
-	}
-}
+func TestWriteRegistryErrorBadRequest(t *testing.T) {
+	t.Parallel()
 
-func allowPythonSubjectSpec() namespace.Spec {
-	return namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Issuer: "issuer"}}, Writers: []namespace.SubjectMatcher{{Issuer: "issuer"}}}}
+	for _, err := range []error{
+		fmt.Errorf("%w: _meta", namespace.ErrInvalidName),
+		fmt.Errorf("%w: ../escape", namespace.ErrInvalidOwningRepo),
+	} {
+		rec := httptest.NewRecorder()
+		writeRegistryError(t.Context(), rec, err, "internal")
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status=%d want=%d for %v", rec.Code, http.StatusBadRequest, err)
+		}
+	}
 }

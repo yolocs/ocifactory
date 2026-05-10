@@ -171,9 +171,9 @@ func TestHandlePut(t *testing.T) {
 
 			registry := oci.NewFakeRegistry()
 
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			// Create a multipart form request
@@ -223,7 +223,7 @@ func TestHandlePut(t *testing.T) {
 
 			if tc.wantFile {
 				// Verify package file was created
-				key := "packages/" + tc.pkgName + "/" + tc.version + "/" + tc.filename
+				key := "default/packages/" + tc.pkgName + "/" + tc.version + "/" + tc.filename
 				content, ok := registry.Files[key]
 				if !ok {
 					t.Errorf("Package file not found in registry: %s", key)
@@ -236,7 +236,7 @@ func TestHandlePut(t *testing.T) {
 				// Verify the per-package sentinel was written under index/<pkgName>.
 				// The body is a constant placeholder, not the version, so the
 				// OCI backend deduplicates the blob across uploads.
-				indexKey := "index/" + tc.pkgName + "/" + indexSentinelName
+				indexKey := "default/index/" + tc.pkgName + "/" + indexSentinelName
 				indexContent, ok := registry.Files[indexKey]
 				if !ok {
 					t.Errorf("Index sentinel not found in registry: %s", indexKey)
@@ -247,7 +247,7 @@ func TestHandlePut(t *testing.T) {
 				// The version string should never appear as a layer name in
 				// the index repo — that was the per-version write the new
 				// sentinel approach replaces.
-				perVersionKey := "index/" + tc.pkgName + "/" + tc.version
+				perVersionKey := "default/index/" + tc.pkgName + "/" + tc.version
 				if _, ok := registry.Files[perVersionKey]; ok {
 					t.Errorf("Per-version index layer must not exist: %s", perVersionKey)
 				}
@@ -271,7 +271,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get existing wheel",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "packages/example-pkg",
+				OwningRepo: "default/packages/example-pkg",
 				OwningTag:  "1.0.0",
 				Name:       "example-pkg-1.0.0.whl",
 				MediaType:  "application/x-wheel+zip",
@@ -285,7 +285,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "head existing wheel",
 			setupFile: &oci.RepoFile{
-				OwningRepo: "packages/example-pkg",
+				OwningRepo: "default/packages/example-pkg",
 				OwningTag:  "1.0.0",
 				Name:       "example-pkg-1.0.0.whl",
 				MediaType:  "application/x-wheel+zip",
@@ -322,9 +322,9 @@ func TestHandleGet(t *testing.T) {
 				}
 			}
 
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(tc.method, tc.path, nil)
@@ -382,7 +382,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 	t.Parallel()
 
 	setupFile := &oci.RepoFile{
-		OwningRepo: "packages/example-pkg",
+		OwningRepo: "default/packages/example-pkg",
 		OwningTag:  "1.0.0",
 		Name:       "example-pkg-1.0.0.whl",
 		MediaType:  "application/x-wheel+zip",
@@ -448,7 +448,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 				redirectErr:  tc.redirectErr,
 			}
 
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -488,7 +488,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(time.Minute))
+		h, err := newHandlerWithRegistry(t, reg, WithSimpleIndexCacheTTL(time.Minute))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -532,7 +532,7 @@ func TestPackageIndexCache(t *testing.T) {
 		// under -race.
 		const ttl = 50 * time.Millisecond
 		reg := newCountingRegistry()
-		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(ttl))
+		h, err := newHandlerWithRegistry(t, reg, WithSimpleIndexCacheTTL(ttl))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -564,7 +564,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(time.Minute))
+		h, err := newHandlerWithRegistry(t, reg, WithSimpleIndexCacheTTL(time.Minute))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -610,7 +610,7 @@ func TestPackageIndexCache(t *testing.T) {
 		t.Parallel()
 
 		reg := newCountingRegistry()
-		h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(0))
+		h, err := newHandlerWithRegistry(t, reg, WithSimpleIndexCacheTTL(0))
 		if err != nil {
 			t.Fatalf("NewHandler: %v", err)
 		}
@@ -656,7 +656,7 @@ func TestIndexSentinel(t *testing.T) {
 			uploads:       []upload{{pkg: "requests", version: "1.0.0"}},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
+				"default/index/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -668,7 +668,7 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
+				"default/index/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -681,9 +681,9 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"django", "flask", "requests"},
 			wantIndexFiles: map[string]string{
-				"index/requests/" + indexSentinelName: indexSentinelContent,
-				"index/flask/" + indexSentinelName:    indexSentinelContent,
-				"index/django/" + indexSentinelName:   indexSentinelContent,
+				"default/index/requests/" + indexSentinelName: indexSentinelContent,
+				"default/index/flask/" + indexSentinelName:    indexSentinelContent,
+				"default/index/django/" + indexSentinelName:   indexSentinelContent,
 			},
 		},
 	}
@@ -693,9 +693,9 @@ func TestIndexSentinel(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			for _, up := range tc.uploads {
@@ -704,7 +704,7 @@ func TestIndexSentinel(t *testing.T) {
 				}
 			}
 
-			gotIndexTags := append([]string{}, registry.Tags["index"]...)
+			gotIndexTags := append([]string{}, registry.Tags["default/index"]...)
 			sort.Strings(gotIndexTags)
 			if diff := cmp.Diff(tc.wantIndexTags, gotIndexTags); diff != "" {
 				t.Errorf("index repo tags mismatch (-want +got):\n%s", diff)
@@ -712,7 +712,7 @@ func TestIndexSentinel(t *testing.T) {
 
 			gotIndexFiles := map[string]string{}
 			for k, v := range registry.Files {
-				if strings.HasPrefix(k, "index/") {
+				if strings.HasPrefix(k, "default/index/") {
 					gotIndexFiles[k] = string(v)
 				}
 			}
@@ -821,11 +821,11 @@ func TestHandleSimpleIndex(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			registry.Tags["index"] = append(registry.Tags["index"], tc.setupTags...)
+			registry.Tags["default/index"] = append(registry.Tags["default/index"], tc.setupTags...)
 
-			h, err := newHandlerWithRegistry(registry)
+			h, err := newHandlerWithRegistry(t, registry)
 			if err != nil {
-				t.Fatalf("newHandlerWithRegistry() unexpected error: %v", err)
+				t.Fatalf("newHandlerWithRegistry(t, ) unexpected error: %v", err)
 			}
 
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
@@ -859,11 +859,11 @@ func TestPEP503Normalization(t *testing.T) {
 		queryAs    string
 		wantStored string // canonical OwningRepo path under packages/
 	}{
-		{name: "underscore upload, dash query", uploadAs: "Foo_Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
-		{name: "dot upload, dash query", uploadAs: "Foo.Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
-		{name: "mixed upload, dash query", uploadAs: "Foo._-_Bar", queryAs: "foo-bar", wantStored: "packages/foo-bar"},
-		{name: "uppercase upload, lowercase query", uploadAs: "REQUESTS", queryAs: "requests", wantStored: "packages/requests"},
-		{name: "dash upload, dot query", uploadAs: "foo-bar", queryAs: "foo.bar", wantStored: "packages/foo-bar"},
+		{name: "underscore upload, dash query", uploadAs: "Foo_Bar", queryAs: "foo-bar", wantStored: "default/packages/foo-bar"},
+		{name: "dot upload, dash query", uploadAs: "Foo.Bar", queryAs: "foo-bar", wantStored: "default/packages/foo-bar"},
+		{name: "mixed upload, dash query", uploadAs: "Foo._-_Bar", queryAs: "foo-bar", wantStored: "default/packages/foo-bar"},
+		{name: "uppercase upload, lowercase query", uploadAs: "REQUESTS", queryAs: "requests", wantStored: "default/packages/requests"},
+		{name: "dash upload, dot query", uploadAs: "foo-bar", queryAs: "foo.bar", wantStored: "default/packages/foo-bar"},
 	}
 
 	for _, tc := range cases {
@@ -871,7 +871,7 @@ func TestPEP503Normalization(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -887,7 +887,7 @@ func TestPEP503Normalization(t *testing.T) {
 			}
 			// And the index sentinel is at the normalized name.
 			normalized := normalize(tc.uploadAs)
-			if _, ok := reg.Files["index/"+normalized+"/"+indexSentinelName]; !ok {
+			if _, ok := reg.Files["default/index/"+normalized+"/"+indexSentinelName]; !ok {
 				t.Errorf("missing index sentinel under normalized name %q", normalized)
 			}
 
@@ -976,7 +976,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -996,7 +996,7 @@ func TestMultipartFieldOrder(t *testing.T) {
 			if got, want := rec.Code, tc.wantStatus; got != want {
 				t.Errorf("status = %d, want %d (body=%s)", got, want, rec.Body.String())
 			}
-			_, stored := reg.Files["packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]
+			_, stored := reg.Files["default/packages/example-pkg/1.0.0/example-pkg-1.0.0.whl"]
 			if stored != tc.wantStored {
 				t.Errorf("stored = %t, want %t (keys=%v)", stored, tc.wantStored, registryFileKeys(reg))
 			}
@@ -1011,7 +1011,7 @@ func TestSimpleIndexJSON(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg, WithSimpleIndexCacheTTL(0))
+	h, err := newHandlerWithRegistry(t, reg, WithSimpleIndexCacheTTL(0))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1092,8 +1092,8 @@ func TestSimpleIndexJSONList(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags["index"] = []string{"flask", "requests"}
-	h, err := newHandlerWithRegistry(reg)
+	reg.Tags["default/index"] = []string{"flask", "requests"}
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1245,7 +1245,7 @@ func TestHandleFilePut_BadInputs(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -1294,7 +1294,7 @@ func TestHandleFilePut_MaxUploadBytes(t *testing.T) {
 			t.Parallel()
 
 			reg := oci.NewFakeRegistry()
-			h, err := newHandlerWithRegistry(reg, WithMaxUploadBytes(tc.cap))
+			h, err := newHandlerWithRegistry(t, reg, WithMaxUploadBytes(tc.cap))
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -1324,8 +1324,8 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags["index"] = []string{"flask"}
-	h, err := newHandlerWithRegistry(reg)
+	reg.Tags["default/index"] = []string{"flask"}
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1347,7 +1347,7 @@ func TestHandleFilePut_OversizedTextField(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1381,7 +1381,7 @@ func TestHandleFilePut_TotalTextFieldsTooLarge(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1414,7 +1414,7 @@ func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1437,7 +1437,7 @@ func TestHandleFilePut_TrailingPartsDrained(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Errorf("status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if _, ok := reg.Files["packages/example/1.0.0/example-1.0.0.tar.gz"]; !ok {
+	if _, ok := reg.Files["default/packages/example/1.0.0/example-1.0.0.tar.gz"]; !ok {
 		t.Errorf("file missing: %v", registryFileKeys(reg))
 	}
 }
@@ -1454,7 +1454,7 @@ func TestHandleFilePut_NoTmpSpill(t *testing.T) {
 	t.Setenv("TMPDIR", tmp)
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1548,7 +1548,7 @@ func TestHandleFilePut_ReuploadConflict(t *testing.T) {
 
 			reg := oci.NewFakeRegistry()
 			reg.AllowOverwrite = tc.allowOverwrite
-			h, err := newHandlerWithRegistry(reg)
+			h, err := newHandlerWithRegistry(t, reg)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -1593,7 +1593,7 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 	}
 
 	reg := oci.NewFakeRegistry()
-	h, err := newHandlerWithRegistry(reg)
+	h, err := newHandlerWithRegistry(t, reg)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1611,7 +1611,7 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 
 	// Exactly one sentinel under the index repo, regardless of how
 	// many versions were uploaded.
-	indexTags := reg.Tags["index"]
+	indexTags := reg.Tags["default/index"]
 	if got, want := len(indexTags), 1; got != want {
 		t.Errorf("index tags = %v, want exactly one entry for the package", indexTags)
 	}

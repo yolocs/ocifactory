@@ -46,15 +46,15 @@ go build ./...
 go run ./cmd/ocifactory serve \
   --repo-type=python \
   --backend-registry=zot.local:5000/ocifactory \
+  --disable-authn \
   --port=8080
-
-# In another shell
-pip install --index-url http://localhost:8080/default/simple/ requests
 ```
 
 Artifact routes are namespace-prefixed (for example, `/default/simple/` for
-Python); create the namespace metadata before serving real clients. See
-[`docs/namespaces.md`](docs/namespaces.md).
+Python), and the namespace must exist before clients can use it. Until an admin
+CLI lands, seed namespace metadata with `pkg/namespace.Store` from a small
+control-plane tool; the real-client integration harness shows the exact pattern.
+See [`docs/namespaces.md`](docs/namespaces.md).
 
 Every runtime knob is a CLI flag with a matching env var — no config files.
 Common ones: `PORT`, `OCIFACTORY_REPO_TYPE`, `OCIFACTORY_BACKEND_REGISTRY`,
