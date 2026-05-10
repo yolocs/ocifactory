@@ -22,6 +22,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/metrics"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -348,7 +349,8 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		mh, err := maven.NewHandler(r, maven.WithAuthMiddleware(authMW))
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		mh, err := maven.NewHandler(nsReg, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
@@ -361,7 +363,8 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		ph, err := python.NewHandler(r,
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		ph, err := python.NewHandler(nsReg,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),

@@ -24,10 +24,13 @@ import (
 const (
 	// defaultPackageIndexSuffix names the per-namespace OCI repo whose
 	// tags enumerate every owning-repo the wrapper has ever recorded a
-	// write for. The repo lives at "<namespace>/_packages" by default
-	// — operators who already park a real artifact under that name can
-	// relocate it via [WithPackageIndexSuffix].
-	defaultPackageIndexSuffix = "_packages"
+	// write for. The repo lives at "<namespace>/ocifactory-packages"
+	// by default — operators who already park a real artifact under
+	// that name can relocate it via [WithPackageIndexSuffix]. The
+	// literal must satisfy the OCI distribution name regex (path
+	// segments start with [a-z0-9]); a leading "_" is rejected
+	// client-side by oras-go.
+	defaultPackageIndexSuffix = "ocifactory-packages"
 
 	// packageIndexSentinelFile is the file name written under the
 	// package index repo. The body is constant — the tag's existence
@@ -132,10 +135,10 @@ type Registry struct {
 // RegistryOption customises a [Registry].
 type RegistryOption func(*Registry)
 
-// WithPackageIndexSuffix overrides the default ("_packages").
-// Operators set this when their backend already has a top-level
-// "_packages" repo they want to keep — extremely unlikely, but cheap
-// to make configurable.
+// WithPackageIndexSuffix overrides the default
+// ("ocifactory-packages"). Operators set this when their backend
+// already has a per-namespace "ocifactory-packages" repo they want to
+// keep — extremely unlikely, but cheap to make configurable.
 func WithPackageIndexSuffix(s string) RegistryOption {
 	return func(r *Registry) { r.indexSuffix = s }
 }
@@ -300,6 +303,14 @@ func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
 	}
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
 		return "", fmt.Errorf("%w: owning repo %q escapes namespace", ErrInvalidOwningRepo, owningRepo)
+	}
+	// The first path segment of the namespace package index repo is
+	// reserved: a write that landed there would mix user artifacts in
+	// with the wrapper's own sentinel tags. Maven's regex-y URL routes
+	// can otherwise reach it, so the check lives at the resolver — the
+	// chokepoint every per-format handler funnels through.
+	if cleaned == r.indexSuffix || strings.HasPrefix(cleaned, r.indexSuffix+"/") {
+		return "", fmt.Errorf("%w: owning repo %q uses reserved prefix %q", ErrInvalidOwningRepo, owningRepo, r.indexSuffix)
 	}
 	return path.Join(namespace, cleaned), nil
 }

@@ -239,7 +239,7 @@ func TestStore_WithPrefix_RoutesToConfiguredRepos(t *testing.T) {
 		t.Errorf("expected metadata file under custom/_namespaces/myteam/_metadata, got files: %v",
 			slices.Sorted(maps.Keys(fake.Files)))
 	}
-	indexTags, err := fake.ListTags(ctx, "custom/_namespaces/_index")
+	indexTags, err := fake.ListTags(ctx, "custom/_namespaces/ocifactory-namespaces")
 	if err != nil {
 		t.Fatalf("ListTags index: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestStore_OnDiskLayout(t *testing.T) {
 		t.Errorf("on-disk spec mismatch (-want +got):\n%s", diff)
 	}
 
-	if _, ok := fake.Files["_index/myteam/"+indexSentinelName]; !ok {
+	if _, ok := fake.Files["ocifactory-namespaces/myteam/"+indexSentinelName]; !ok {
 		t.Errorf("expected index sentinel file, got files: %v", slices.Sorted(maps.Keys(fake.Files)))
 	}
 }

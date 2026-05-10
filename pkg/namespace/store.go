@@ -17,11 +17,18 @@ import (
 const (
 	// DefaultPrefix is empty: namespace "foo" maps to the top-level
 	// OCI repo "foo", and the catalogue index lives at top-level
-	// "_index". Operators with a shared OCI registry can group
-	// everything under their own prefix via [WithPrefix].
+	// "ocifactory-namespaces". Operators with a shared OCI registry
+	// can group everything under their own prefix via [WithPrefix].
 	DefaultPrefix = ""
 
-	indexRepoSegment  = "_index"
+	// indexRepoSegment names the repo whose tags enumerate every
+	// registered namespace. The literal must satisfy the OCI
+	// distribution name regex — each path segment starts with
+	// [a-z0-9], so a leading "_" is rejected client-side by oras-go.
+	// "ocifactory-namespaces" is the conventional name; operators
+	// who already park an artifact under it would need to relocate
+	// (extremely unlikely — the segment is namespaced to ocifactory).
+	indexRepoSegment  = "ocifactory-namespaces"
 	metadataTag       = "_metadata"
 	specFileName      = "spec.json"
 	indexSentinelName = "present"
@@ -46,9 +53,9 @@ type Backend interface {
 // Store persists namespace metadata in an OCI registry. With the
 // default empty prefix, namespace "foo" maps to OCI repo "foo" with
 // a single tag _metadata holding the spec; the catalogue index lives
-// at top-level "_index" with one tag per namespace. Distribution's
-// _catalog endpoint is optional and inconsistently implemented across
-// registries, so we maintain the index ourselves.
+// at top-level "ocifactory-namespaces" with one tag per namespace.
+// Distribution's _catalog endpoint is optional and inconsistently
+// implemented across registries, so we maintain the index ourselves.
 type Store struct {
 	backend   Backend
 	prefix    string

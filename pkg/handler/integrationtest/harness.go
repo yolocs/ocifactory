@@ -27,6 +27,11 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/yolocs/ocifactory/pkg/auth/backend"
+	"github.com/yolocs/ocifactory/pkg/handler/maven"
+	"github.com/yolocs/ocifactory/pkg/handler/python"
+	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // zotImage matches the version pinned by pkg/oci's streaming
@@ -79,6 +84,23 @@ func Start(t *testing.T, repoType string, extraArgs ...string) *Harness {
 	binary := buildBinary(t)
 
 	backendRepo := "ocifactory-int"
+	// Seed the "default" namespace directly through the Store before
+	// the subprocess starts. The data-plane wrapper Store.Get's
+	// lazily on first request and caches behind a TTL, so the
+	// namespace just needs to exist by the time the first client
+	// request arrives — doing it here keeps the harness
+	// deterministic and avoids racing with the first GET.
+	//
+	// The seeded policy admits the AlwaysAnonymous AuthContext the
+	// subprocess installs via --disable-authn. The seed registry
+	// MUST use the same artifact type as the subprocess: pkg/oci's
+	// ReadFile filters file referrers by artifactType, so a seed
+	// written under the default artifact type would be invisible to
+	// a subprocess running with --repo-type=python|maven. Production
+	// deployments register namespaces with real subject matchers and
+	// never use AlwaysAnonymous.
+	seedDefaultNamespace(t, ctx, zotURL, backendRepo, artifactTypeFor(t, repoType))
+
 	logPath := filepath.Join(t.TempDir(), "ocifactory.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -273,5 +295,61 @@ func SkipIfMissing(t *testing.T, bins ...string) {
 		if _, err := exec.LookPath(b); err != nil {
 			t.Skipf("required binary %q not found on PATH: %v", b, err)
 		}
+	}
+}
+
+// seedDefaultNamespace writes a "default" namespace into the same OCI
+// backend the ocifactory subprocess will read from. The seeded policy
+// admits the AlwaysAnonymous AuthContext that --disable-authn installs.
+//
+// artifactType MUST match the value the subprocess will use (i.e.
+// python.ArtifactType / maven.ArtifactType): pkg/oci tags the file
+// manifest with artifactType+".file" and ReadFile filters referrers
+// by that exact string, so a seed under the wrong artifact type is
+// invisible to the subprocess.
+//
+// Tests share zot but not the namespace metadata: each test harness
+// owns its own backendRepo prefix, so concurrent integration tests do
+// not race on the same metadata tag.
+func seedDefaultNamespace(t *testing.T, ctx context.Context, zotURL *url.URL, backendRepo, artifactType string) {
+	t.Helper()
+	regURL := &url.URL{Scheme: zotURL.Scheme, Host: zotURL.Host, Path: "/" + backendRepo}
+	// Anonymous matches what the subprocess uses
+	// (--backend-auth-kind=anonymous); pin it so a default change
+	// doesn't flip behaviour silently.
+	inner, err := oci.NewRegistry(regURL,
+		oci.WithBackendAuth(backend.Anonymous()),
+		oci.WithArtifactType(artifactType),
+	)
+	if err != nil {
+		t.Fatalf("seed: oci.NewRegistry: %v", err)
+	}
+	store := namespace.NewStore(inner)
+	policy := namespace.Policy{
+		Readers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+		Writers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+	}
+	if err := store.Put(ctx, &namespace.Namespace{
+		Name: "default",
+		Spec: namespace.Spec{Policy: policy},
+	}); err != nil {
+		t.Fatalf("seed default namespace: %v", err)
+	}
+}
+
+// artifactTypeFor maps a --repo-type value to the artifact type the
+// matching format handler advertises. The seed registry must use the
+// same artifact type as the subprocess so the spec.json file
+// manifest's referrer filter matches on the read side.
+func artifactTypeFor(t *testing.T, repoType string) string {
+	t.Helper()
+	switch repoType {
+	case python.RepoType:
+		return python.ArtifactType
+	case maven.RepoType:
+		return maven.ArtifactType
+	default:
+		t.Fatalf("integrationtest harness has no artifact type registered for repoType=%q", repoType)
+		return ""
 	}
 }

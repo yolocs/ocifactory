@@ -2,11 +2,14 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/logging"
+	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/serving"
 )
@@ -23,6 +26,29 @@ type Registry interface {
 	// redirects are disabled). Hard failures return ("", err); callers
 	// should fall back to ReadFile in that case.
 	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
+}
+
+// WriteNamespaceError translates namespace sentinel errors to HTTP
+// 4xx responses and returns whether it wrote a response. When err is
+// nil or unrelated, returns false and writes nothing — the caller
+// handles remaining branches (errdef.ErrNotFound, oci.HasCode, ...).
+func WriteNamespaceError(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, namespace.ErrInvalidName),
+		errors.Is(err, namespace.ErrInvalidOwningRepo):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return true
+	case errors.Is(err, namespace.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return true
+	case errors.Is(err, auth.ErrUnauthorized):
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return true
+	}
+	return false
 }
 
 // WriteError logs internal at ERROR (so operators see the backend

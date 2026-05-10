@@ -97,7 +97,7 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 			"install",
 			"--no-cache-dir",
 			"--no-deps",
-			"--index-url", h.OcifactoryURL.String()+"/simple/",
+			"--index-url", h.OcifactoryURL.String()+"/default/simple/",
 			"--trusted-host", trustedHostFromBase(t, h.OcifactoryURL.String()),
 			fmt.Sprintf("%s==%s", pkgName, version),
 		)
@@ -107,13 +107,17 @@ func TestPythonIntegration_RealClients(t *testing.T) {
 // uploadWithTwine drives `twine upload` against the running
 // ocifactory. With --disable-authn the server takes any credential,
 // but twine requires non-empty username/password in the env to send
-// a Basic header at all.
+// a Basic header at all. The repo URL is prefixed with /default/
+// because every URL now lives under a namespace; the harness seeds
+// a "default" namespace via Store.Put before starting the subprocess
+// (see seedDefaultNamespace) so a real client doesn't need an admin
+// namespace-Put step.
 func uploadWithTwine(t *testing.T, base string, whl *testWheel) {
 	t.Helper()
 
 	cmd := exec.Command(
 		"twine", "upload",
-		"--repository-url", base+"/",
+		"--repository-url", base+"/default/",
 		"--non-interactive",
 		"--disable-progress-bar",
 		"--verbose",
@@ -140,7 +144,7 @@ func downloadAndCheck(t *testing.T, base, pkgName, version string, whl *testWhee
 		"--no-cache-dir",
 		"--no-deps",
 		"--dest", dst,
-		"--index-url", base+"/simple/",
+		"--index-url", base+"/default/simple/",
 		"--trusted-host", trustedHostFromBase(t, base),
 		fmt.Sprintf("%s==%s", pkgName, version),
 	)
