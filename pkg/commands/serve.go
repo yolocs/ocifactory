@@ -349,7 +349,14 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		storeReg, err := oci.NewRegistry(
+			cfg.RegistryURL,
+			append(registryOpts, oci.WithArtifactType(namespace.ArtifactType))...,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace registry: %w", err)
+		}
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
 		mh, err := maven.NewHandler(nsReg, maven.WithAuthMiddleware(authMW))
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
@@ -363,7 +370,14 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(r))
+		storeReg, err := oci.NewRegistry(
+			cfg.RegistryURL,
+			append(registryOpts, oci.WithArtifactType(namespace.ArtifactType))...,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace registry: %w", err)
+		}
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
 		ph, err := python.NewHandler(nsReg,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
