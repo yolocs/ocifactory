@@ -8,6 +8,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -28,6 +29,13 @@ import (
 // need those should use the inMemoryRepo wrapper around oras-go's
 // content/memory.Store instead (see registry_test.go).
 type FakeRegistry struct {
+	// mu guards Files, Tags, and Aliases against concurrent
+	// mutation. Single-threaded handler tests don't need it; the
+	// lock exists for tests that exercise wrappers concurrently
+	// (e.g. pkg/namespace's package-index race test). Public field
+	// access from tests still works — callers reading the maps
+	// outside of test goroutines see a consistent snapshot.
+	mu      sync.Mutex
 	Files   map[string][]byte
 	Tags    map[string][]string
 	Aliases map[string]string
@@ -53,6 +61,12 @@ func NewFakeRegistry() *FakeRegistry {
 // helper because handler tests (notably python) seed canonical tags
 // directly to set up package-list expectations.
 func (r *FakeRegistry) AddTag(repo, tag string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addTagLocked(repo, tag)
+}
+
+func (r *FakeRegistry) addTagLocked(repo, tag string) {
 	if slices.Contains(r.Tags[repo], tag) {
 		return
 	}
@@ -63,27 +77,39 @@ func (r *FakeRegistry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (
 	if f.OwningTag == "" {
 		return nil, fmt.Errorf("OwningTag must be set")
 	}
-	// Refuse to clobber an alias tag with a canonical version push — the
-	// real registry does the same via the artifactType HEAD probe.
+
+	// Pre-flight checks under the lock so we can refuse the upload
+	// without consuming the body — matches the real Registry's
+	// pre-upload rejection contract that handler tests rely on for
+	// twine-retry simulation.
+	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
+	r.mu.Lock()
 	if _, ok := r.Aliases[aliasKey(f.OwningRepo, f.OwningTag)]; ok {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: tag %q in repo %q is an alias", ErrAliasCollision, f.OwningTag, f.OwningRepo)
 	}
-
-	key := f.OwningRepo + "/" + f.OwningTag + "/" + f.Name
 	if _, exists := r.Files[key]; exists && !r.AllowOverwrite {
-		// Match the real Registry's pre-upload rejection: the body
-		// is not consumed, so handler tests that simulate a twine
-		// retry can re-use the same reader.
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAlreadyExists, key)
 	}
+	r.mu.Unlock()
 
+	// Read the body without holding the lock — a slow reader (e.g.
+	// one blocked on a channel) would otherwise stall every
+	// concurrent fake op. The race window is benign: a colliding
+	// concurrent upload that wins between the pre-check and the
+	// store below either gets ErrAlreadyExists itself or, with
+	// AllowOverwrite, is overwritten in turn — same outcome as a
+	// real backend racing two PUTs.
 	content, err := io.ReadAll(ro)
 	if err != nil {
 		return nil, err
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.Files[key] = content
-	r.AddTag(f.OwningRepo, f.OwningTag)
+	r.addTagLocked(f.OwningRepo, f.OwningTag)
 
 	desc := generateDescriptor(content, f)
 	return &FileDescriptor{File: desc}, nil
@@ -109,6 +135,9 @@ func (r *FakeRegistry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescript
 		return nil, nil, fmt.Errorf("either OwningTag or RefTag must be set")
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	tag := f.OwningTag
 	if tag == "" {
 		canonical, ok := r.Aliases[aliasKey(f.OwningRepo, f.RefTag)]
@@ -133,6 +162,8 @@ func (r *FakeRegistry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescript
 // re-point of an existing alias is allowed and replaces the previous
 // target.
 func (r *FakeRegistry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !slices.Contains(r.Tags[repo], canonicalTag) {
 		return fmt.Errorf("canonical tag %q not found in repo %q: %w", canonicalTag, repo, errdef.ErrNotFound)
 	}
@@ -153,6 +184,8 @@ func (r *FakeRegistry) AppendRefs(ctx context.Context, repo string, canonicalTag
 // check (not modelled here — tests that need it use the inMemoryRepo
 // wrapper).
 func (r *FakeRegistry) ListTags(ctx context.Context, repo string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	tags := append([]string{}, r.Tags[repo]...)
 	prefix := repo + "/"
 	for k := range r.Aliases {
@@ -169,6 +202,8 @@ func (r *FakeRegistry) ListTags(ctx context.Context, repo string) ([]string, err
 // to mirror the real Registry's behaviour, where the digest comes from
 // the file manifest's FileDigestAnnotation.
 func (r *FakeRegistry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var filesList []*RepoFile
 	for key, content := range r.Files {
 		parts := strings.Split(key, "/")
@@ -205,6 +240,8 @@ func (r *FakeRegistry) BlobRedirectURL(ctx context.Context, f *RepoFile) (string
 // callers can use errors.Is to distinguish "already gone" from a
 // genuine error.
 func (r *FakeRegistry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	aliasK := aliasKey(repo, tag)
 	if _, ok := r.Aliases[aliasK]; ok {
 		delete(r.Aliases, aliasK)
@@ -222,6 +259,29 @@ func (r *FakeRegistry) DeleteTagFiles(ctx context.Context, repo string, tag stri
 	r.Tags[repo] = slices.DeleteFunc(r.Tags[repo], func(t string) bool { return t == tag })
 	if len(r.Tags[repo]) == 0 {
 		delete(r.Tags, repo)
+	}
+	return nil
+}
+
+// DeleteRepoFiles mirrors *Registry.DeleteRepoFiles for the in-memory
+// fake. Every canonical version (and its files) under repo is removed,
+// then aliases anchored to repo are unbound. A repo with no canonical
+// versions and no aliases is a no-op — matches the real Registry's
+// best-effort cleanup contract.
+func (r *FakeRegistry) DeleteRepoFiles(ctx context.Context, repo string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prefix := repo + "/"
+	for k := range r.Files {
+		if strings.HasPrefix(k, prefix) {
+			delete(r.Files, k)
+		}
+	}
+	delete(r.Tags, repo)
+	for k := range r.Aliases {
+		if strings.HasPrefix(k, prefix) {
+			delete(r.Aliases, k)
+		}
 	}
 	return nil
 }

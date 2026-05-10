@@ -50,8 +50,9 @@ type Backend interface {
 // _catalog endpoint is optional and inconsistently implemented across
 // registries, so we maintain the index ourselves.
 type Store struct {
-	backend Backend
-	prefix  string
+	backend   Backend
+	prefix    string
+	onMutated func(name string)
 }
 
 type Option func(*Store)
@@ -59,6 +60,15 @@ type Option func(*Store)
 // WithPrefix overrides [DefaultPrefix].
 func WithPrefix(prefix string) Option {
 	return func(s *Store) { s.prefix = prefix }
+}
+
+// WithMutationHook registers a callback the Store invokes after a
+// successful Put or Delete with the affected namespace name. The
+// data-plane wrapper uses this to invalidate its cached authorizer
+// so an admin Put takes effect on the very next request without
+// waiting for the cache TTL to expire. nil clears any previous hook.
+func WithMutationHook(hook func(name string)) Option {
+	return func(s *Store) { s.onMutated = hook }
 }
 
 // NewStore wraps backend in a namespace [Store]. In production
@@ -70,6 +80,20 @@ func NewStore(backend Backend, opts ...Option) *Store {
 		opt(s)
 	}
 	return s
+}
+
+// SetMutationHook installs a mutation callback after construction.
+// Used by [Registry] to plug itself in for cache invalidation
+// without forcing the caller to construct the wrapper before the
+// store. Passing nil clears the hook.
+func (s *Store) SetMutationHook(hook func(name string)) {
+	s.onMutated = hook
+}
+
+func (s *Store) notifyMutated(name string) {
+	if s.onMutated != nil {
+		s.onMutated(name)
+	}
 }
 
 func (s *Store) repoFor(name string) string {
@@ -169,6 +193,7 @@ func (s *Store) Put(ctx context.Context, ns *Namespace) error {
 	if _, err := s.backend.AddFile(ctx, indexRF, bytes.NewReader(indexSentinelBody)); err != nil && !errors.Is(err, oci.ErrAlreadyExists) {
 		return fmt.Errorf("write namespace %q index entry: %w", ns.Name, err)
 	}
+	s.notifyMutated(ns.Name)
 	return nil
 }
 
@@ -191,6 +216,7 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 	if err := swallowNotFound(s.backend.DeleteTagFiles(ctx, s.indexRepo(), name)); err != nil {
 		return fmt.Errorf("delete namespace %q index entry: %w", name, err)
 	}
+	s.notifyMutated(name)
 	return nil
 }
 
