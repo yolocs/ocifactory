@@ -28,25 +28,28 @@ type Store interface {
 	Delete(ctx context.Context, name string) error
 }
 
-// PackageLister reports package-index entries for a namespace so DELETE can
-// refuse soft deletion of non-empty namespaces.
-type PackageLister interface {
+// PackageRegistry enumerates and bulk-deletes the OCI sub-repos a
+// namespace holds. The admin DELETE flow uses ListPackages to gate
+// the 409 / cascade decision and CascadeDelete to drop every sub-repo
+// before the namespace metadata is removed.
+type PackageRegistry interface {
 	ListPackages(ctx context.Context, name string) ([]string, error)
+	CascadeDelete(ctx context.Context, name string) error
 }
 
 // Handler serves the admin HTTP API.
 type Handler struct {
 	store    Store
-	packages PackageLister
+	packages PackageRegistry
 }
 
 // NewHandler returns an admin API handler backed by store and packages.
-func NewHandler(store Store, packages PackageLister) (*Handler, error) {
+func NewHandler(store Store, packages PackageRegistry) (*Handler, error) {
 	if store == nil {
 		return nil, fmt.Errorf("store is required")
 	}
 	if packages == nil {
-		return nil, fmt.Errorf("package lister is required")
+		return nil, fmt.Errorf("package registry is required")
 	}
 	return &Handler{store: store, packages: packages}, nil
 }
@@ -149,24 +152,44 @@ func (h *Handler) deleteNamespace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Soft delete is a best-effort guard until cascade delete lands: an
-	// upload racing between ListPackages and Store.Delete can still leave
-	// package sentinels behind. The follow-up cascade flow owns closing
-	// that window.
+	// ?cascade=true opts in to wiping every sub-repo under the
+	// namespace before dropping its metadata. The explicit query
+	// param is a guardrail against typo-DELETEs nuking a namespace
+	// full of artifacts; an empty namespace deletes either way so
+	// the common "I'm done with this" path stays a single curl.
+	cascade := parseCascade(r.URL.Query().Get("cascade"))
+
 	packages, err := h.packages.ListPackages(r.Context(), name)
 	if err != nil {
 		writeAdminError(r.Context(), w, err)
 		return
 	}
-	if len(packages) > 0 {
-		writeJSON(w, http.StatusConflict, errorResponse{Error: "namespace is not empty"})
+	if len(packages) > 0 && !cascade {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "namespace is not empty; pass ?cascade=true to delete all packages"})
 		return
+	}
+	if cascade {
+		if err := h.packages.CascadeDelete(r.Context(), name); err != nil {
+			writeAdminError(r.Context(), w, err)
+			return
+		}
 	}
 	if err := h.store.Delete(r.Context(), name); err != nil {
 		writeAdminError(r.Context(), w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// parseCascade accepts the standard truthy spellings ("true", "1",
+// "yes"). Anything else — including the absence of the query param —
+// is false so a stray "?cascade=maybe" doesn't surprise the operator.
+func parseCascade(v string) bool {
+	switch v {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
 }
 
 func writeAdminError(ctx context.Context, w http.ResponseWriter, err error) {

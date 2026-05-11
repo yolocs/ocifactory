@@ -459,6 +459,70 @@ func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string
 	return r.listPackages(ctx, namespace)
 }
 
+// CascadeDelete removes every sub-repo recorded in namespace's
+// package index, dropping each index tag right after its sub-repo is
+// deleted so a retried call after a partial failure picks up where
+// the previous attempt stopped. The package index repo itself is
+// dropped last (defensive: catches stray tags that never decoded), as
+// is the in-process LRU of indexed (namespace, owning-repo) keys —
+// without that sweep a re-created same-name namespace would not
+// re-record its packages.
+//
+// INTENDED FOR CONTROL-PLANE USE ONLY: bypasses data-plane
+// authorization. Callers (typically the admin DELETE endpoint) must
+// already sit on the admin trust boundary.
+//
+// Concurrent writes during cascade can leave a single sub-repo's tag
+// behind (the wrapper recorded it after ListPackages snapshotted the
+// index). Operators are expected to block external writes before
+// issuing DELETE; see issue #74 for the documented limitation.
+func (r *Registry) CascadeDelete(ctx context.Context, namespace string) error {
+	if err := ValidateName(namespace); err != nil {
+		return err
+	}
+	packages, err := r.listPackages(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	indexRepo := r.packageIndexRepo(namespace)
+	for _, owningRepo := range packages {
+		subRepo := path.Join(namespace, owningRepo)
+		if err := r.inner.DeleteRepoFiles(ctx, subRepo); err != nil {
+			return fmt.Errorf("delete sub-repo %q: %w", subRepo, err)
+		}
+		encoded, encErr := encodeTag(owningRepo)
+		if encErr != nil {
+			// listPackages only returns tags that round-tripped through
+			// decodeTag, so re-encoding must succeed. Treat as a bug
+			// and skip the index drop rather than failing the whole
+			// cascade — the trailing DeleteRepoFiles(indexRepo) will
+			// reap any residue.
+			logging.FromContext(ctx).WarnContext(ctx, "cascade delete: encode failed on cleanup",
+				"namespace", namespace, "owning_repo", owningRepo, "error", encErr,
+			)
+		} else if err := r.inner.DeleteTagFiles(ctx, indexRepo, encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+			return fmt.Errorf("drop package index tag for %q: %w", owningRepo, err)
+		}
+		r.indexed.Remove(indexedKey(namespace, owningRepo))
+	}
+	// Final defensive sweep of the index repo itself catches
+	// undecodable tags listPackages skipped and lets a future
+	// same-name namespace start from an empty index.
+	if err := r.inner.DeleteRepoFiles(ctx, indexRepo); err != nil {
+		return fmt.Errorf("delete package index repo: %w", err)
+	}
+	// Drop any remaining in-process indexed-LRU entries for this
+	// namespace. The keys carry the namespace as a "<ns>\x00..."
+	// prefix; iterate the snapshot returned by Keys() and remove.
+	prefix := namespace + "\x00"
+	for _, k := range r.indexed.Keys() {
+		if strings.HasPrefix(k, prefix) {
+			r.indexed.Remove(k)
+		}
+	}
+	return nil
+}
+
 // ListPackages authorizes the bound namespace for read and returns
 // package-index entries for that namespace.
 func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {

@@ -39,19 +39,52 @@ All endpoints are JSON-only and versioned under `/admin/v1`.
 |---|---|---|---|
 | `PUT` | `/admin/v1/namespaces/{name}` | `namespace.Spec` JSON | `201` with a `namespace.Namespace` on create; `200` on update. |
 | `GET` | `/admin/v1/namespaces/{name}` | none | `200` with a `namespace.Namespace`. |
-| `DELETE` | `/admin/v1/namespaces/{name}` | none | `204` when the namespace exists and is empty. |
+| `DELETE` | `/admin/v1/namespaces/{name}[?cascade=true]` | none | `204` on success. |
 | `GET` | `/admin/v1/namespaces` | none | `200 {"namespaces":[...]}`. |
 
 Errors use `{"error":"message"}`. Invalid namespace names and invalid specs
-return `400`; missing namespaces return `404`; soft-delete of a non-empty
-namespace returns `409`.
+return `400`; missing namespaces return `404`; deleting a non-empty namespace
+without `?cascade=true` returns `409`.
 
-## Soft delete
+## Cascade delete
 
-`DELETE` is intentionally conservative in this phase. ocifactory checks the
-namespace package index and refuses to delete a namespace that still contains
-packages. Remove package data through a future cascade-delete flow before
-deleting those namespaces.
+`DELETE /admin/v1/namespaces/{name}` removes a namespace's metadata and its
+entry in the global index. A namespace that still holds packages must opt in to
+a cascade with `?cascade=true`; without it the call returns `409` and a body of
+`{"error":"namespace is not empty; pass ?cascade=true to delete all packages"}`.
+The explicit query parameter is a guardrail against typo-DELETEs nuking a
+namespace full of artifacts; an empty namespace deletes either way.
+
+```bash
+# Empty namespace: either form succeeds.
+curl -X DELETE https://admin.example.com/admin/v1/namespaces/empty
+
+# Non-empty namespace: opt in.
+curl -X DELETE 'https://admin.example.com/admin/v1/namespaces/team-a?cascade=true'
+```
+
+When `?cascade=true` is set, the admin service enumerates every sub-repo the
+data plane has recorded for the namespace, deletes each one, drops the package
+index repo, and finally removes the namespace metadata. The package index entry
+for each sub-repo is dropped right after that sub-repo is deleted, so a partial
+backend failure is resumable: a retried `DELETE` picks up where the previous
+attempt stopped instead of restarting from scratch.
+
+The OCI registry does not give us an atomic multi-repo transaction, so cascade
+is best-effort across two boundaries:
+
+- **Partial failure mid-cascade** returns `500` with the underlying error. The
+  namespace metadata is left intact so a retry is meaningful.
+- **Concurrent writes during cascade** can leave a single sub-repo's index tag
+  behind (the write landed after the snapshot listing). Operators are expected
+  to block external writes before issuing `DELETE`. The current implementation
+  intentionally does not introduce a "deleting" state on the namespace; that
+  state machine is deferred until a real user reports the race.
+
+Deleting an unknown namespace returns `404`. Synthetic namespaces that some
+future data-plane configuration may serve without storing in OCI (for example,
+a `default` namespace under a forthcoming `--default-namespace-allow-all`
+mode) are not visible to the admin store and likewise return `404` on `DELETE`.
 
 ## Health, readiness, and metrics
 

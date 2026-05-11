@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -812,6 +813,174 @@ func TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 	if !slices.Contains(pkgs, repoFoo) {
 		t.Errorf("ListPackages re-add = %v, want to contain %q", pkgs, repoFoo)
 	}
+}
+
+// TestRegistry_CascadeDelete_HappyPath writes packages through the
+// scoped registry, then runs cascade and verifies every sub-repo and
+// the package index repo are gone.
+func TestRegistry_CascadeDelete_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	fake, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	repos := []string{repoFoo, repoBar, "tools/cli"}
+	for _, r := range repos {
+		if _, err := scoped.AddFile(ctx, newRepoFile(r, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+			t.Fatalf("AddFile %s: %v", r, err)
+		}
+	}
+
+	if err := reg.CascadeDelete(t.Context(), "alpha"); err != nil {
+		t.Fatalf("CascadeDelete: %v", err)
+	}
+
+	for _, r := range repos {
+		prefix := "alpha/" + r + "/"
+		for k := range fake.Files {
+			if strings.HasPrefix(k, prefix) {
+				t.Errorf("file %q remained after cascade", k)
+			}
+		}
+		if _, ok := fake.Tags["alpha/"+r]; ok {
+			t.Errorf("tags for alpha/%s remained after cascade", r)
+		}
+	}
+	if _, ok := fake.Tags["alpha/ocifactory-packages"]; ok {
+		t.Error("package index repo remained after cascade")
+	}
+}
+
+// TestRegistry_CascadeDelete_Empty: cascading an empty namespace is
+// a no-op that still succeeds.
+func TestRegistry_CascadeDelete_Empty(t *testing.T) {
+	t.Parallel()
+
+	_, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+
+	if err := reg.CascadeDelete(t.Context(), "alpha"); err != nil {
+		t.Errorf("CascadeDelete empty: %v", err)
+	}
+}
+
+// TestRegistry_CascadeDelete_InvalidName rejects malformed input
+// before touching the backend.
+func TestRegistry_CascadeDelete_InvalidName(t *testing.T) {
+	t.Parallel()
+
+	_, reg, _ := setup(t)
+	if err := reg.CascadeDelete(t.Context(), "Bad_Name"); !errors.Is(err, namespace.ErrInvalidName) {
+		t.Errorf("CascadeDelete bad name = %v, want errors.Is(ErrInvalidName)", err)
+	}
+}
+
+// TestRegistry_CascadeDelete_Resumable: a backend that fails the
+// third DeleteRepoFiles call leaves a partial state. A retried
+// cascade converges; everything is gone.
+func TestRegistry_CascadeDelete_Resumable(t *testing.T) {
+	t.Parallel()
+
+	fake := oci.NewFakeRegistry()
+	flaky := &flakyDeleteBackend{FakeRegistry: fake}
+	store := namespace.NewStore(flaky)
+	reg := namespace.NewRegistry(flaky, store, namespace.WithPolicyCacheTTL(0))
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	repos := []string{"packages/aaa", "packages/bbb", "packages/ccc", "packages/ddd"}
+	for _, r := range repos {
+		if _, err := scoped.AddFile(ctx, newRepoFile(r, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+			t.Fatalf("AddFile %s: %v", r, err)
+		}
+	}
+
+	flaky.failOn.Store(3) // fail the 3rd DeleteRepoFiles call
+	if err := reg.CascadeDelete(t.Context(), "alpha"); err == nil {
+		t.Fatal("CascadeDelete returned nil, want error from injected failure")
+	}
+	survivors := 0
+	for _, r := range repos {
+		if _, ok := fake.Tags["alpha/"+r]; ok {
+			survivors++
+		}
+	}
+	if survivors == 0 {
+		t.Fatal("expected partial cascade to leave at least one sub-repo behind")
+	}
+
+	flaky.failOn.Store(-1)
+	if err := reg.CascadeDelete(t.Context(), "alpha"); err != nil {
+		t.Fatalf("CascadeDelete retry: %v", err)
+	}
+	for _, r := range repos {
+		if _, ok := fake.Tags["alpha/"+r]; ok {
+			t.Errorf("sub-repo alpha/%s remained after retry", r)
+		}
+	}
+	if _, ok := fake.Tags["alpha/ocifactory-packages"]; ok {
+		t.Error("package index repo remained after retry")
+	}
+}
+
+// TestRegistry_CascadeDelete_ClearsIndexedLRU: after cascade,
+// re-creating the same-name namespace and writing a package must land
+// a fresh entry in the new index repo (proving the in-process LRU
+// sweep happened).
+func TestRegistry_CascadeDelete_ClearsIndexedLRU(t *testing.T) {
+	t.Parallel()
+
+	fake, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+
+	if err := reg.CascadeDelete(t.Context(), "alpha"); err != nil {
+		t.Fatalf("CascadeDelete: %v", err)
+	}
+	if err := store.Delete(t.Context(), "alpha"); err != nil {
+		t.Fatalf("store.Delete: %v", err)
+	}
+
+	putNamespace(t, store, "alpha", allowAllSpec())
+	if _, err := reg.For("alpha").AddFile(ctx, newRepoFile(repoFoo, "2.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		t.Fatalf("AddFile after re-create: %v", err)
+	}
+
+	pkgs, err := reg.ListPackages(t.Context(), "alpha")
+	if err != nil {
+		t.Fatalf("ListPackages: %v", err)
+	}
+	if diff := cmp.Diff([]string{repoFoo}, pkgs); diff != "" {
+		t.Errorf("ListPackages after re-create mismatch (-want +got):\n%s", diff)
+	}
+	// Sanity: the recorded package landed back in the index repo.
+	if got, ok := fake.Tags["alpha/ocifactory-packages"]; !ok || len(got) == 0 {
+		t.Errorf("package index repo = %v (ok=%v), want a tag for re-recorded package", got, ok)
+	}
+}
+
+// flakyDeleteBackend fails DeleteRepoFiles when failOn matches the
+// call count. failOn < 1 disables the injection.
+type flakyDeleteBackend struct {
+	*oci.FakeRegistry
+	failOn atomic.Int32
+	calls  atomic.Int32
+}
+
+func (f *flakyDeleteBackend) DeleteRepoFiles(ctx context.Context, repo string) error {
+	count := f.calls.Add(1)
+	if want := f.failOn.Load(); want > 0 && count == want {
+		return errors.New("simulated delete failure")
+	}
+	return f.FakeRegistry.DeleteRepoFiles(ctx, repo)
 }
 
 // TestRegistry_PolicyCache_HotPathSkipsStore counts spec.json reads
