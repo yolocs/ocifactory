@@ -2,15 +2,44 @@ package handler
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/internal/version"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/metrics"
 )
+
+// buildInfo is the build-identity block surfaced by /readyz so
+// operators triaging a multi-instance deployment can tell which
+// release each pod is running. Values come from internal/version,
+// which in turn reads runtime/debug.ReadBuildInfo or LDFLAGS overrides.
+type buildInfo struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	OSArch  string `json:"os_arch"`
+}
+
+func currentBuildInfo() buildInfo {
+	return buildInfo{
+		Version: version.Version,
+		Commit:  version.Commit,
+		OSArch:  version.OSArch,
+	}
+}
+
+// readyzResponse is the JSON body shape /readyz returns. Status is
+// "ready"/"not_ready"; backend describes the most recent backend probe
+// ("ok", "not_configured", or the error string on failure). Operators
+// scrape this in addition to the HTTP status code.
+type readyzResponse struct {
+	Status  string    `json:"status"`
+	Backend string    `json:"backend"`
+	Build   buildInfo `json:"build"`
+}
 
 // Pinger probes the OCI backend for /readyz. *oci.Registry satisfies it
 // out of the box; defining it here keeps pkg/handler free of an import
@@ -311,34 +340,34 @@ func (p *readyzProbe) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if p.pinger == nil {
-		// No backend wired in — readiness collapses to liveness. We
-		// don't ship a 200 with a misleading "ok" body in this mode;
-		// just say so explicitly.
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodGet {
-			_, _ = w.Write([]byte("ready (no backend pinger configured)"))
+
+	resp := readyzResponse{Build: currentBuildInfo()}
+	status := http.StatusOK
+	switch {
+	case p.pinger == nil:
+		// No backend wired in — readiness collapses to liveness. Stay
+		// explicit about it so a misconfigured deploy is obvious from
+		// the response body rather than a misleading "ok".
+		resp.Status = "ready"
+		resp.Backend = "not_configured"
+	default:
+		probeCtx, cancel := context.WithTimeout(r.Context(), readyzProbeTimeout)
+		defer cancel()
+		if err := p.probe(probeCtx); err != nil {
+			logger.DebugContext(r.Context(), "readyz probe failed", "error", err)
+			resp.Status = "not_ready"
+			resp.Backend = err.Error()
+			status = http.StatusServiceUnavailable
+		} else {
+			resp.Status = "ready"
+			resp.Backend = "ok"
 		}
-		return
 	}
 
-	probeCtx, cancel := context.WithTimeout(r.Context(), readyzProbeTimeout)
-	defer cancel()
-	err := p.probe(probeCtx)
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if err != nil {
-		logger.DebugContext(r.Context(), "readyz probe failed", "error", err)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if r.Method == http.MethodGet {
-			fmt.Fprintf(w, "not ready: %s", err)
-		}
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
 	if r.Method == http.MethodGet {
-		_, _ = w.Write([]byte("ready"))
+		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
 
