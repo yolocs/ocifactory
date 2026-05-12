@@ -20,6 +20,12 @@ import (
 const (
 	RepoType     = "maven"
 	ArtifactType = "application/vnd.ocifactory.maven"
+
+	// DefaultMaxUploadBytes caps the total request-body size accepted
+	// by every PUT route. 1 GiB matches python's default; mvn deploy
+	// of artifacts above 1 GiB is rare and the operator can opt in
+	// via WithMaxUploadBytes / --maven-max-upload-bytes.
+	DefaultMaxUploadBytes int64 = 1 << 30
 )
 
 var (
@@ -48,15 +54,17 @@ var (
 )
 
 type Handler struct {
-	registry *namespace.Registry
-	authMW   func(http.Handler) http.Handler
+	registry       *namespace.Registry
+	authMW         func(http.Handler) http.Handler
+	maxUploadBytes int64
 }
 
 // Option configures optional Handler behaviour.
 type Option func(*handlerConfig)
 
 type handlerConfig struct {
-	authMW func(http.Handler) http.Handler
+	authMW         func(http.Handler) http.Handler
+	maxUploadBytes int64
 }
 
 // WithAuthMiddleware installs an authentication middleware on
@@ -68,6 +76,15 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 	}
 }
 
+// WithMaxUploadBytes caps the total request-body size accepted by
+// every Maven PUT route. The default is DefaultMaxUploadBytes
+// (1 GiB). A non-positive value disables the cap (not recommended).
+func WithMaxUploadBytes(n int64) Option {
+	return func(c *handlerConfig) {
+		c.maxUploadBytes = n
+	}
+}
+
 // NewHandler creates a new Handler.
 //
 // registry is the data-plane wrapper that hands out per-request
@@ -75,11 +92,17 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 // handler func resolves the namespace from the request URL
 // (`/{namespace}/maven2/...`) and obtains a scoped view at the top.
 func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
-	cfg := handlerConfig{}
+	cfg := handlerConfig{
+		maxUploadBytes: DefaultMaxUploadBytes,
+	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Handler{registry: registry, authMW: cfg.authMW}, nil
+	return &Handler{
+		registry:       registry,
+		authMW:         cfg.authMW,
+		maxUploadBytes: cfg.maxUploadBytes,
+	}, nil
 }
 
 // Mux returns the maven handler's router. Every route lives under
@@ -220,12 +243,21 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
+	if h.maxUploadBytes > 0 {
+		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
+	}
+
 	defer req.Body.Close()
 
 	body, err := h.maybeVerifyChecksum(req, scoped, f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
 		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
 			return
 		}
 		code := httpStatus(err)
@@ -245,19 +277,19 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 		if handler.WriteNamespaceError(w, err) {
 			return
 		}
-		if errors.Is(err, oci.ErrAlreadyExists) {
+		var maxBytesErr *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBytesErr):
+			http.Error(w, fmt.Sprintf("upload exceeds %d-byte limit", maxBytesErr.Limit), http.StatusRequestEntityTooLarge)
+		case errors.Is(err, oci.ErrAlreadyExists):
 			http.Error(w, "file already exists in version", http.StatusConflict)
-			return
-		}
-		if oci.HasCode(err, http.StatusUnauthorized) {
+		case oci.HasCode(err, http.StatusUnauthorized):
 			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		if oci.HasCode(err, http.StatusForbidden) {
+		case oci.HasCode(err, http.StatusForbidden):
 			http.Error(w, err.Error(), http.StatusForbidden)
-			return
+		default:
+			handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		}
-		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
 		return
 	}
 	logger.DebugContext(req.Context(), "added file", "descriptor", desc)

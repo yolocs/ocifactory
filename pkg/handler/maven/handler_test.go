@@ -1,6 +1,7 @@
 package maven
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -432,6 +433,106 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 		OwningTag:  parts[len(parts)-2],                     // versionId
 		Name:       fn,
 		MediaType:  detectMediaType(fn),
+	}
+}
+
+// TestHandlePut_MaxUploadBytes confirms WithMaxUploadBytes returns 413
+// for an oversize body, 201 at-or-under the cap, and that the cap can
+// be disabled by passing a non-positive value.
+func TestHandlePut_MaxUploadBytes(t *testing.T) {
+	t.Parallel()
+
+	const cap = 1 << 14 // 16 KiB
+
+	cases := []struct {
+		name           string
+		maxUploadBytes int64
+		bodySize       int
+		wantStatus     int
+		wantBackendHit bool
+	}{
+		{
+			name:           "under cap",
+			maxUploadBytes: cap,
+			bodySize:       cap - 1,
+			wantStatus:     http.StatusCreated,
+			wantBackendHit: true,
+		},
+		{
+			name:           "exactly at cap",
+			maxUploadBytes: cap,
+			bodySize:       cap,
+			wantStatus:     http.StatusCreated,
+			wantBackendHit: true,
+		},
+		{
+			name:           "just over cap",
+			maxUploadBytes: cap,
+			bodySize:       cap + 1,
+			wantStatus:     http.StatusRequestEntityTooLarge,
+			wantBackendHit: false,
+		},
+		{
+			name:           "way over cap",
+			maxUploadBytes: cap,
+			bodySize:       1 << 20, // 1 MiB
+			wantStatus:     http.StatusRequestEntityTooLarge,
+			wantBackendHit: false,
+		},
+		{
+			name:           "cap disabled accepts 10 MiB",
+			maxUploadBytes: 0,
+			bodySize:       10 << 20,
+			wantStatus:     http.StatusCreated,
+			wantBackendHit: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			h, _ := newTestHandler(t, reg, WithMaxUploadBytes(tc.maxUploadBytes))
+
+			body := bytes.Repeat([]byte("a"), tc.bodySize)
+			req := httptest.NewRequest(
+				http.MethodPut,
+				nsPath("/com/example/project/1.0.0/project-1.0.0.jar"),
+				bytes.NewReader(body),
+			)
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body=%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if rec.Code == http.StatusRequestEntityTooLarge && rec.Body.Len() == 0 {
+				t.Errorf("413 response had empty body, want non-empty error message")
+			}
+			// Backend was contacted iff the artifact key was written.
+			// The test handler setup writes namespace-metadata blobs
+			// unconditionally, so check for the artifact key directly.
+			artifactKey := testNS + "/com/example/project/1.0.0/project-1.0.0.jar"
+			_, hit := reg.Files[artifactKey]
+			if hit != tc.wantBackendHit {
+				t.Errorf("backend hit = %v, want %v", hit, tc.wantBackendHit)
+			}
+		})
+	}
+}
+
+// TestHandlePut_DefaultMaxUploadBytes confirms NewHandler defaults the
+// cap to DefaultMaxUploadBytes when no WithMaxUploadBytes option is
+// supplied.
+func TestHandlePut_DefaultMaxUploadBytes(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+
+	if got, want := h.maxUploadBytes, DefaultMaxUploadBytes; got != want {
+		t.Errorf("default maxUploadBytes = %d, want %d", got, want)
 	}
 }
 
