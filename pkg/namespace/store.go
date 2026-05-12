@@ -143,6 +143,9 @@ func (s *Store) Get(ctx context.Context, name string) (*Namespace, error) {
 	if err := json.Unmarshal(body, &spec); err != nil {
 		return nil, fmt.Errorf("decode namespace %q spec: %w", name, err)
 	}
+	if err := spec.Validate(); err != nil {
+		return nil, fmt.Errorf("validate namespace %q spec: %w", name, err)
+	}
 	return &Namespace{Name: name, Spec: spec}, nil
 }
 

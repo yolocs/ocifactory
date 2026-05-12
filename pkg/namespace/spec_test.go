@@ -2,6 +2,8 @@ package namespace
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -89,6 +91,16 @@ func TestSpec_JSONRoundtrip(t *testing.T) {
 			},
 			want: `{"policy":{"writers":[{"sub_match":"ci-bot","kind":"basictoken"}]}}`,
 		},
+		{
+			name: "schema-version-current",
+			spec: Spec{
+				SchemaVersion: CurrentSchemaVersion,
+				Policy: Policy{
+					Readers: []SubjectMatcher{{Email: "alice@example.com"}},
+				},
+			},
+			want: `{"schema_version":1,"policy":{"readers":[{"email":"alice@example.com"}]}}`,
+		},
 	}
 
 	for _, tc := range tests {
@@ -112,4 +124,123 @@ func TestSpec_JSONRoundtrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSpec_Validate_SchemaVersion covers the three states the field
+// can be in on disk: legacy (zero), current, and future-unknown.
+func TestSpec_Validate_SchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		spec    Spec
+		wantErr error
+	}{
+		{
+			name: "zero-treated-as-current",
+			spec: Spec{},
+		},
+		{
+			name: "explicit-current",
+			spec: Spec{SchemaVersion: CurrentSchemaVersion},
+		},
+		{
+			name:    "future-unknown",
+			spec:    Spec{SchemaVersion: CurrentSchemaVersion + 1},
+			wantErr: ErrUnsupportedSchemaVersion,
+		},
+		{
+			name:    "future-way-out",
+			spec:    Spec{SchemaVersion: 999},
+			wantErr: ErrUnsupportedSchemaVersion,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.spec.Validate()
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Validate() error %v, want errors.Is %v", err, tc.wantErr)
+			}
+			// The operator-facing message must name the highest version
+			// this binary understands so the upgrade path is obvious.
+			if msg := err.Error(); !strings.Contains(msg, "understands up to") {
+				t.Errorf("Validate() error %q missing supported-max hint", msg)
+			}
+		})
+	}
+}
+
+// TestSpec_Validate_NilReceiver guards the documented nil-safe path
+// used by callers that don't always allocate a spec.
+func TestSpec_Validate_NilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var s *Spec
+	if err := s.Validate(); err != nil {
+		t.Errorf("(*Spec)(nil).Validate() = %v, want nil", err)
+	}
+}
+
+// TestSpec_Normalize asserts Normalize stamps CurrentSchemaVersion
+// idempotently and leaves other fields untouched. The legacy-promotion
+// case is the load-bearing one: bodies written before the field
+// existed must come out of the write path stamped with v1.
+func TestSpec_Normalize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   Spec
+		want Spec
+	}{
+		{
+			name: "legacy-promoted",
+			in:   Spec{Policy: Policy{Readers: []SubjectMatcher{{Email: "alice@example.com"}}}},
+			want: Spec{SchemaVersion: CurrentSchemaVersion, Policy: Policy{Readers: []SubjectMatcher{{Email: "alice@example.com"}}}},
+		},
+		{
+			name: "already-current",
+			in:   Spec{SchemaVersion: CurrentSchemaVersion},
+			want: Spec{SchemaVersion: CurrentSchemaVersion},
+		},
+		{
+			name: "older-value-overwritten",
+			in:   Spec{SchemaVersion: 0},
+			want: Spec{SchemaVersion: CurrentSchemaVersion},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tc.in
+			got.Normalize()
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("Normalize() mismatch (-want +got):\n%s", diff)
+			}
+			// Idempotent.
+			got.Normalize()
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("Normalize() second pass mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestSpec_Normalize_NilReceiver guards the documented nil-safe path.
+func TestSpec_Normalize_NilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var s *Spec
+	s.Normalize()
 }

@@ -4,7 +4,23 @@
 // (e.g. /myteam/simple/..., /myteam/maven2/...).
 package namespace
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// CurrentSchemaVersion is the [Spec] shape ocifactory writes today.
+// Bump only as part of a deliberate, backwards-incompatible change to
+// the persisted shape; pair the bump with a read-side migration so
+// older bodies remain loadable.
+const CurrentSchemaVersion = 1
+
+// ErrUnsupportedSchemaVersion is the sentinel returned by
+// [Spec.Validate] when a body claims a schema version higher than
+// [CurrentSchemaVersion]. Callers can surface it as a 400 to keep the
+// operator-facing message clear.
+var ErrUnsupportedSchemaVersion = errors.New("unsupported namespace schema_version")
 
 // Namespace is a namespace and its spec. Name is the identifier as
 // it appears in URLs; validation rules live on [ValidateName].
@@ -15,6 +31,14 @@ type Namespace struct {
 
 // Spec is the persisted body of a [Namespace].
 type Spec struct {
+	// SchemaVersion identifies the persisted-shape this body was
+	// written against. Unset/zero is treated as 1 so legacy bodies
+	// (written before this field was introduced) load without a
+	// coordinated migration. ocifactory rejects bodies whose
+	// SchemaVersion is greater than [CurrentSchemaVersion] rather
+	// than silently dropping fields an older binary can't see.
+	SchemaVersion int `json:"schema_version,omitempty"`
+
 	// Policy is the authz block. An empty Policy is deny-all.
 	//
 	// omitzero (Go 1.24+) is required here: omitempty does not omit
@@ -33,5 +57,22 @@ func (s *Spec) Validate() error {
 	if s == nil {
 		return nil
 	}
+	v := s.SchemaVersion
+	if v == 0 {
+		v = 1
+	}
+	if v > CurrentSchemaVersion {
+		return fmt.Errorf("%w %d (this ocifactory understands up to %d)", ErrUnsupportedSchemaVersion, v, CurrentSchemaVersion)
+	}
 	return s.Policy.Validate()
+}
+
+// Normalize stamps [CurrentSchemaVersion] onto s. The admin write path
+// calls it before persisting so every body on disk carries an explicit
+// version. Idempotent.
+func (s *Spec) Normalize() {
+	if s == nil {
+		return
+	}
+	s.SchemaVersion = CurrentSchemaVersion
 }

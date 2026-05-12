@@ -120,6 +120,7 @@ func (h *Handler) putNamespace(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(r.Context(), w, err)
 		return
 	}
+	spec.Normalize()
 
 	status := http.StatusOK
 	// The 200-vs-201 distinction is best-effort: concurrent creates can
@@ -171,7 +172,9 @@ func (h *Handler) deleteNamespace(w http.ResponseWriter, r *http.Request) {
 
 func writeAdminError(ctx context.Context, w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, namespace.ErrInvalidName), errors.Is(err, namespace.ErrInvalidPolicy):
+	case errors.Is(err, namespace.ErrInvalidName),
+		errors.Is(err, namespace.ErrInvalidPolicy),
+		errors.Is(err, namespace.ErrUnsupportedSchemaVersion):
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 	case errors.Is(err, namespace.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: err.Error()})

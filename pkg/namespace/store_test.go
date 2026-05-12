@@ -248,6 +248,50 @@ func TestStore_WithPrefix_RoutesToConfiguredRepos(t *testing.T) {
 	}
 }
 
+// TestStore_Get_UnsupportedSchemaVersion proves an older binary
+// reading a body written by a future binary surfaces the explicit
+// schema-version error rather than silently dropping fields.
+func TestStore_Get_UnsupportedSchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	_, s, ctx := newTestStore(t)
+
+	future := &Namespace{Name: "myteam", Spec: Spec{SchemaVersion: CurrentSchemaVersion + 1}}
+	if err := s.Put(ctx, future); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	_, err := s.Get(ctx, "myteam")
+	if !errors.Is(err, ErrUnsupportedSchemaVersion) {
+		t.Errorf("Get() error %v, want errors.Is ErrUnsupportedSchemaVersion", err)
+	}
+}
+
+// TestStore_Get_LegacySchemaVersionAccepted covers the migration
+// contract: bodies persisted before the field existed (zero) load
+// without an error and round-trip unchanged.
+func TestStore_Get_LegacySchemaVersionAccepted(t *testing.T) {
+	t.Parallel()
+
+	_, s, ctx := newTestStore(t)
+
+	// Build a legacy on-disk shape by going through Put with
+	// SchemaVersion=0 — the field is omitempty so the persisted body
+	// has no schema_version key, matching what pre-feature ocifactory
+	// would have written.
+	if err := s.Put(ctx, &Namespace{Name: "myteam", Spec: sampleSpec()}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got, err := s.Get(ctx, "myteam")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Spec.SchemaVersion != 0 {
+		t.Errorf("legacy body SchemaVersion = %d, want 0 (preserved on read)", got.Spec.SchemaVersion)
+	}
+}
+
 // TestStore_OnDiskLayout pins the metadata path so a refactor that
 // breaks the on-disk shape trips this test rather than silently
 // migrating every operator's existing storage.
