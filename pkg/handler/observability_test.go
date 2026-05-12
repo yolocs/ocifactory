@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/internal/version"
 	"github.com/yolocs/ocifactory/pkg/metrics"
 )
 
@@ -224,24 +226,32 @@ func TestObservabilityHandler_Readyz(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		pinger   Pinger
-		wantCode int
+		name        string
+		pinger      Pinger
+		wantCode    int
+		wantStatus  string
+		wantBackend string
 	}{
 		{
-			name:     "no pinger returns 200",
-			pinger:   nil,
-			wantCode: http.StatusOK,
+			name:        "no pinger returns 200 ready",
+			pinger:      nil,
+			wantCode:    http.StatusOK,
+			wantStatus:  "ready",
+			wantBackend: "not_configured",
 		},
 		{
-			name:     "pinger ok returns 200",
-			pinger:   PingerFunc(func(context.Context) error { return nil }),
-			wantCode: http.StatusOK,
+			name:        "pinger ok returns 200 ready",
+			pinger:      PingerFunc(func(context.Context) error { return nil }),
+			wantCode:    http.StatusOK,
+			wantStatus:  "ready",
+			wantBackend: "ok",
 		},
 		{
-			name:     "pinger fails returns 503",
-			pinger:   PingerFunc(func(context.Context) error { return errors.New("backend down") }),
-			wantCode: http.StatusServiceUnavailable,
+			name:        "pinger fails returns 503 not_ready",
+			pinger:      PingerFunc(func(context.Context) error { return errors.New("backend down") }),
+			wantCode:    http.StatusServiceUnavailable,
+			wantStatus:  "not_ready",
+			wantBackend: "backend down",
 		},
 	}
 	for _, tc := range tests {
@@ -256,7 +266,47 @@ func TestObservabilityHandler_Readyz(t *testing.T) {
 			if rr.Code != tc.wantCode {
 				t.Errorf("status = %d, want %d", rr.Code, tc.wantCode)
 			}
+			if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				t.Errorf("Content-Type = %q, want application/json prefix", ct)
+			}
+			var got readyzResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode body: %v\nbody: %s", err, rr.Body.String())
+			}
+			want := readyzResponse{
+				Status:  tc.wantStatus,
+				Backend: tc.wantBackend,
+				Build: buildInfo{
+					Version: version.Version,
+					Commit:  version.Commit,
+					OSArch:  version.OSArch,
+				},
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("/readyz body mismatch (-want +got):\n%s", diff)
+			}
 		})
+	}
+}
+
+func TestObservabilityHandler_Readyz_HEAD(t *testing.T) {
+	t.Parallel()
+
+	// HEAD must return the headers GET would (Content-Type: JSON)
+	// but no body — load balancers issue HEAD probes and shouldn't
+	// have to drain a body.
+	h := ObservabilityHandler(http.NotFoundHandler(), nil, nil, "")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodHead, "/readyz", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json prefix", ct)
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("HEAD response body = %q, want empty", rr.Body.String())
 	}
 }
 

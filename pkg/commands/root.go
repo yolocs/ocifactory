@@ -4,13 +4,14 @@ import (
 	"context"
 
 	"github.com/spf13/cobra"
+	"github.com/yolocs/ocifactory/internal/version"
 )
 
 func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "ocifactory",
 		Short:         "ocifactory is a multi-format artifact registry backed by OCI.",
-		Version:       "dev",
+		Version:       version.HumanVersion,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
