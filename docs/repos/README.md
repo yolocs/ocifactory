@@ -10,7 +10,7 @@ using only the page.
 |---|---|---|
 | Python (PyPI) | ✅ Functional | [`python.md`](python.md) |
 | Maven         | ✅ Functional | [`maven.md`](maven.md) |
-| npm           | 🚧 In progress (routes wired, handlers stub) | — |
+| npm           | ✅ Functional | [`npm.md`](npm.md) |
 | Go module proxy | ⏳ Planned | — |
 | Debian / apt    | ⏳ Planned | — |
 

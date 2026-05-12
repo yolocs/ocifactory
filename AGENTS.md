@@ -21,7 +21,7 @@ Design pillars (in priority order):
 | `pkg/oci` — OCI-backed registry primitives (Add/Read/List/Delete/AppendRefs) | Done, tested with in-memory fake |
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested. Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
-| `pkg/handler/npm` — Routes wired up, all handlers return 501 | **Stub — next up** |
+| `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`) | Done, tested. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
@@ -29,7 +29,7 @@ Design pillars (in priority order):
 | `pkg/auth/backend` — Pluggable backend credential `Provider` interface and in-tree adapters (`anonymous`, `gcpadc`, `staticenv`, `dockerconfig`) | Done, tested. Wired into `oci.Registry` via `WithBackendAuth`. Configured via `OCIFACTORY_BACKEND_AUTH_*` flags / env vars. |
 | `ocifactory admin serve` — control-plane namespace CRUD API | Done, tested. Operator docs: [`docs/admin.md`](docs/admin.md). |
 | `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
-| `cmd/ocifactory serve` | Works for `--repo-type=python|maven|echo` (echo runs without `--backend-registry`) |
+| `cmd/ocifactory serve` | Works for `--repo-type=python|maven|npm|echo` (echo runs without `--backend-registry`) |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
