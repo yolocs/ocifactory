@@ -21,7 +21,7 @@ Design pillars (in priority order):
 | `pkg/oci` — OCI-backed registry primitives (Add/Read/List/Delete/AppendRefs) | Done, tested with in-memory fake |
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested. Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
-| `pkg/handler/npm` — Routes wired up, all handlers return 501 | **Stub — next up** |
+| `pkg/handler/npm` — npm packuments, publish, tarball download, dist-tags | Done, tested. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
 | `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |

@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
+	"github.com/yolocs/ocifactory/pkg/handler/npm"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
@@ -180,6 +181,7 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: flagAuthnKind, flagName: flagAuthnKind},
 		{name: flagAuthnOIDCIssuers, flagName: flagAuthnOIDCIssuers},
 		{name: flagAuthnOIDCAudience, flagName: flagAuthnOIDCAudience},
+		{name: flagNPMMaxUploadBytes, flagName: flagNPMMaxUploadBytes},
 		{name: flagBackendAuthKind, flagName: flagBackendAuthKind},
 		{name: flagBackendAuthGCPADCScopes, flagName: flagBackendAuthGCPADCScopes},
 		{name: flagBackendAuthStaticEnvUserEnv, flagName: flagBackendAuthStaticEnvUserEnv},
@@ -253,6 +255,7 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		SimpleIndexCacheTTL:  13 * time.Second,
 		PythonMaxUploadBytes: python.DefaultMaxUploadBytes,
 		MavenMaxUploadBytes:  maven.DefaultMaxUploadBytes,
+		NPMMaxUploadBytes:    npm.DefaultMaxUploadBytes,
 		DisableAuthn:         true,
 		AuthnKind:            "oidc",
 		AuthnOIDCIssuers: []string{

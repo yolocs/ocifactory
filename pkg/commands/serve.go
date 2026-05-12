@@ -19,6 +19,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/handler/echo"
 	"github.com/yolocs/ocifactory/pkg/handler/maven"
+	"github.com/yolocs/ocifactory/pkg/handler/npm"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/metrics"
@@ -35,6 +36,7 @@ const envPrefix = "OCIFACTORY"
 
 var supportedRepoTypes = []string{
 	maven.RepoType,
+	npm.RepoType,
 	python.RepoType,
 	echo.RepoType,
 }
@@ -45,6 +47,7 @@ var supportedRepoTypes = []string{
 // target for CI.
 var repoTypesNeedingBackend = map[string]bool{
 	maven.RepoType:  true,
+	npm.RepoType:    true,
 	python.RepoType: true,
 }
 
@@ -70,6 +73,7 @@ const (
 	flagSimpleIndexCacheTTL             = "simple-index-cache-ttl"
 	flagPythonMaxUploadBytes            = "python-max-upload-bytes"
 	flagMavenMaxUploadBytes             = "maven-max-upload-bytes"
+	flagNPMMaxUploadBytes               = "npm-max-upload-bytes"
 	flagEnableMetrics                   = "enable-metrics"
 	flagMetricsPath                     = "metrics-path"
 	flagDisableAuthn                    = "disable-authn"
@@ -98,6 +102,7 @@ type serveConfig struct {
 	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
 	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
 	MavenMaxUploadBytes  int64         `mapstructure:"maven-max-upload-bytes"`
+	NPMMaxUploadBytes    int64         `mapstructure:"npm-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
 	MetricsPath          string        `mapstructure:"metrics-path"`
 
@@ -292,6 +297,11 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"endpoint. Defends against an authenticated client streaming "+
 			"arbitrary bytes to burn instance hours / egress before the OCI "+
 			"backend rejects the layer. Set to 0 to disable the cap.")
+	flags.Int64(flagNPMMaxUploadBytes, npm.DefaultMaxUploadBytes,
+		"Cap on the total request-body size accepted by the npm publish "+
+			"endpoint. Defends against an authenticated client streaming "+
+			"arbitrary bytes to burn instance hours / egress before the OCI "+
+			"backend rejects the layer. Set to 0 to disable the cap.")
 	flags.Bool(flagEnableMetrics, true,
 		"Expose Prometheus metrics at --metrics-path and instrument the "+
 			"HTTP and OCI backend layers. When false, the no-op recorder is "+
@@ -387,6 +397,27 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}
 		reg, format, h = r, maven.RepoType, mh.Mux()
+	case npm.RepoType:
+		r, err := oci.NewRegistry(
+			cfg.RegistryURL,
+			append(registryOpts, oci.WithArtifactType(npm.ArtifactType))...,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create registry: %w", err)
+		}
+		storeReg, err := newNamespaceMetadataRegistry(cfg.RegistryURL, registryOpts)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace registry: %w", err)
+		}
+		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		nh, err := npm.NewHandler(nsReg,
+			npm.WithAuthMiddleware(authMW),
+			npm.WithMaxUploadBytes(cfg.NPMMaxUploadBytes),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create npm handler: %w", err)
+		}
+		reg, format, h = r, npm.RepoType, nh.Mux()
 	case python.RepoType:
 		r, err := oci.NewRegistry(
 			cfg.RegistryURL,

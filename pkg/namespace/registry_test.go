@@ -764,6 +764,27 @@ func TestScopedRegistry_AppendRefs_Forwards(t *testing.T) {
 	}
 }
 
+func TestScopedRegistry_DeleteTagFiles_Forwards(t *testing.T) {
+	t.Parallel()
+
+	fake, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	if err := scoped.DeleteTagFiles(ctx, repoFoo, "1.0.0"); err != nil {
+		t.Fatalf("DeleteTagFiles: %v", err)
+	}
+	for k := range fake.Files {
+		if strings.HasPrefix(k, "alpha/"+repoFoo+"/1.0.0/") {
+			t.Errorf("file %q remained after DeleteTagFiles", k)
+		}
+	}
+}
+
 // TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex verifies
 // BOTH the in-process indexed marker AND the backend
 // ocifactory-packages tag are cleared.

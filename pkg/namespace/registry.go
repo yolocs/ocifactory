@@ -512,6 +512,19 @@ func (s *ScopedRegistry) AppendRefs(ctx context.Context, repo string, canonicalT
 	return s.parent.inner.AppendRefs(ctx, scoped, canonicalTag, refs...)
 }
 
+// DeleteTagFiles authorizes the bound namespace for write and forwards
+// to the inner registry with repo prefixed.
+func (s *ScopedRegistry) DeleteTagFiles(ctx context.Context, repo string, tag string) error {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
+		return err
+	}
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	if err != nil {
+		return err
+	}
+	return s.parent.inner.DeleteTagFiles(ctx, scoped, tag)
+}
+
 // DeleteRepoFiles authorizes the bound namespace for write and
 // forwards to the inner registry with repo prefixed. The package
 // index entry for repo is cleared after the inner delete succeeds —
