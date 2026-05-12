@@ -69,6 +69,7 @@ const (
 	flagAllowOverwrite                  = "allow-overwrite"
 	flagSimpleIndexCacheTTL             = "simple-index-cache-ttl"
 	flagPythonMaxUploadBytes            = "python-max-upload-bytes"
+	flagMavenMaxUploadBytes             = "maven-max-upload-bytes"
 	flagEnableMetrics                   = "enable-metrics"
 	flagMetricsPath                     = "metrics-path"
 	flagDisableAuthn                    = "disable-authn"
@@ -96,6 +97,7 @@ type serveConfig struct {
 	AllowOverwrite       bool          `mapstructure:"allow-overwrite"`
 	SimpleIndexCacheTTL  time.Duration `mapstructure:"simple-index-cache-ttl"`
 	PythonMaxUploadBytes int64         `mapstructure:"python-max-upload-bytes"`
+	MavenMaxUploadBytes  int64         `mapstructure:"maven-max-upload-bytes"`
 	EnableMetrics        bool          `mapstructure:"enable-metrics"`
 	MetricsPath          string        `mapstructure:"metrics-path"`
 
@@ -285,6 +287,11 @@ func registerServeFlags(flags *pflag.FlagSet) {
 			"endpoint. Defends against an authenticated client streaming "+
 			"arbitrary bytes to burn instance hours / egress before the OCI "+
 			"backend rejects the layer. Set to 0 to disable the cap.")
+	flags.Int64(flagMavenMaxUploadBytes, maven.DefaultMaxUploadBytes,
+		"Cap on the total request-body size accepted by the maven upload "+
+			"endpoint. Defends against an authenticated client streaming "+
+			"arbitrary bytes to burn instance hours / egress before the OCI "+
+			"backend rejects the layer. Set to 0 to disable the cap.")
 	flags.Bool(flagEnableMetrics, true,
 		"Expose Prometheus metrics at --metrics-path and instrument the "+
 			"HTTP and OCI backend layers. When false, the no-op recorder is "+
@@ -372,7 +379,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
 		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
-		mh, err := maven.NewHandler(nsReg, maven.WithAuthMiddleware(authMW))
+		mh, err := maven.NewHandler(nsReg,
+			maven.WithAuthMiddleware(authMW),
+			maven.WithMaxUploadBytes(cfg.MavenMaxUploadBytes),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
 		}

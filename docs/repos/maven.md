@@ -229,13 +229,9 @@ artifact. Tracked by [#49](https://github.com/yolocs/ocifactory/issues/49).
 | Flag | Default | Purpose |
 |---|---|---|
 | `--allow-overwrite` | `false` | **REQUIRED to set to `true` for any working Maven deployment** — see the warning at the top. |
+| `--maven-max-upload-bytes` | `1073741824` (1 GiB) | Caps the total request body the upload endpoint accepts. Defends against an authenticated client streaming arbitrary bytes to burn instance hours / egress before the OCI backend rejects the layer. Set to `0` to disable; tighten for cost-sensitive deployments. Oversize requests are rejected with `413 Payload Too Large` before they touch the OCI backend. |
 | `--disable-streaming-push` | `false` | Force buffered+monolithic uploads through the OCI backend instead of chunked PATCH. Set only if your backend has broken chunked-PATCH support. |
 | `--disable-blob-redirect` | `false` | Disable `307` redirects to backend-issued presigned URLs on blob downloads. Set when exposing backend URLs to clients is unacceptable (egress restrictions, DLP, audit). |
-
-Maven uploads carry a `Content-Length` header and stream straight to
-the OCI backend; there is no Maven-specific upload-size knob. The
-effective upload limit is whatever your OCI backend enforces on a
-single layer push.
 
 Common server-wide flags (`--port`, `--backend-registry`,
 `--enable-metrics`, the `--authn-*` and `--backend-auth-*` families)

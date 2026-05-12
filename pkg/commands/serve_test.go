@@ -10,6 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/handler/python"
 	"github.com/yolocs/ocifactory/pkg/testutil"
 )
@@ -251,6 +252,7 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		MetricsPath:          "/metrics",
 		SimpleIndexCacheTTL:  13 * time.Second,
 		PythonMaxUploadBytes: python.DefaultMaxUploadBytes,
+		MavenMaxUploadBytes:  maven.DefaultMaxUploadBytes,
 		DisableAuthn:         true,
 		AuthnKind:            "oidc",
 		AuthnOIDCIssuers: []string{
