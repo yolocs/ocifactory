@@ -3,7 +3,6 @@ module github.com/yolocs/ocifactory
 go 1.26.0
 
 require (
-	github.com/abcxyz/pkg v1.5.4
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/go-cmp v0.7.0
