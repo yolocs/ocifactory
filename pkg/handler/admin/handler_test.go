@@ -21,6 +21,15 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 	allowAlice := namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Email: "alice@example.com"}}}}
 	allowBob := namespace.Spec{Policy: namespace.Policy{Readers: []namespace.SubjectMatcher{{Email: "bob@example.com"}}}}
 
+	// Admin PUT stamps CurrentSchemaVersion via Spec.Normalize before
+	// persisting, so the response body — and any subsequent GET —
+	// carries it back. allowAlicePersisted / allowBobPersisted are the
+	// wantBody shape after that normalization.
+	allowAlicePersisted := allowAlice
+	allowAlicePersisted.SchemaVersion = namespace.CurrentSchemaVersion
+	allowBobPersisted := allowBob
+	allowBobPersisted.SchemaVersion = namespace.CurrentSchemaVersion
+
 	tests := []struct {
 		name       string
 		method     string
@@ -37,7 +46,7 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			path:       "/admin/v1/namespaces/alpha",
 			body:       allowAlice,
 			wantStatus: http.StatusCreated,
-			wantBody:   &namespace.Namespace{Name: "alpha", Spec: allowAlice},
+			wantBody:   &namespace.Namespace{Name: "alpha", Spec: allowAlicePersisted},
 		},
 		{
 			name:   "put existing namespace",
@@ -49,7 +58,15 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 				putNamespaceNow(t, store, "alpha", allowAlice)
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   &namespace.Namespace{Name: "alpha", Spec: allowBob},
+			wantBody:   &namespace.Namespace{Name: "alpha", Spec: allowBobPersisted},
+		},
+		{
+			name:       "put rejects future schema version",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/futureversion",
+			rawBody:    `{"schema_version":999}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": "unsupported namespace schema_version 999 (this ocifactory understands up to 1)"},
 		},
 		{
 			name:       "put invalid name",
@@ -106,7 +123,7 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			method:     http.MethodGet,
 			path:       "/admin/v1/namespaces",
 			wantStatus: http.StatusOK,
-			wantBody:   map[string][]string{"namespaces": []string{}},
+			wantBody:   map[string][]string{"namespaces": {}},
 		},
 		{
 			name:   "list namespaces",
@@ -118,7 +135,7 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 				putNamespaceNow(t, store, "beta", namespace.Spec{})
 			},
 			wantStatus: http.StatusOK,
-			wantBody:   map[string][]string{"namespaces": []string{"alpha", "beta"}},
+			wantBody:   map[string][]string{"namespaces": {"alpha", "beta"}},
 		},
 		{
 			name:   "delete non-empty namespace",
@@ -194,6 +211,47 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			}
 			assertJSONBody(t, resp, tc.wantBody)
 		})
+	}
+}
+
+// TestHandler_PutStampsSchemaVersionOnDisk proves the admin write
+// path calls Spec.Normalize even when the request body omits
+// schema_version: the persisted body must carry the current version
+// so future ocifactory binaries can distinguish shapes without
+// sniffing.
+func TestHandler_PutStampsSchemaVersionOnDisk(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	store := namespace.NewStore(reg)
+	nsReg := namespace.NewRegistry(reg, store)
+	h, err := admin.NewHandler(store, nsReg)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	srv := httptest.NewServer(h.Mux())
+	t.Cleanup(srv.Close)
+
+	body := bytes.NewReader([]byte(`{"policy":{"readers":[{"email":"alice@example.com"}]}}`))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, srv.URL+"/admin/v1/namespaces/alpha", body)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	stored, err := store.Get(t.Context(), "alpha")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stored.Spec.SchemaVersion != namespace.CurrentSchemaVersion {
+		t.Errorf("persisted SchemaVersion = %d, want %d", stored.Spec.SchemaVersion, namespace.CurrentSchemaVersion)
 	}
 }
 

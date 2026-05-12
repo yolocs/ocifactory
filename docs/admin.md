@@ -70,3 +70,19 @@ served by a process. If you experimented with namespace metadata from the short
 window before this admin service existed, recreate those namespaces through the
 admin API so Python, Maven, and future repo types all read the same control-plane
 documents.
+
+## `schema_version`
+
+Persisted specs carry an integer `schema_version` field. ocifactory stamps it
+on every write — operators do not set it manually and clients can omit it from
+PUT bodies. The contract is:
+
+- The current binary writes `schema_version: 1`.
+- Bodies without the field (written by older builds, before this field
+  existed) are treated as version 1 on read; no backfill is required.
+- A body claiming a `schema_version` higher than this binary understands is
+  rejected with `HTTP 400` rather than silently loaded with fields dropped.
+  Upgrade ocifactory before working with those namespaces.
+
+The field exists so future, backwards-incompatible changes to the on-disk
+shape have an in-band way to migrate without operator-coordinated downtime.
