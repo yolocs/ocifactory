@@ -3,20 +3,18 @@ package npm
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
-
-	"crypto/sha1"
-	"crypto/sha512"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -233,6 +231,21 @@ func TestPublish_BadBody(t *testing.T) {
 			wantStatus:  http.StatusBadRequest,
 			wantContain: "valid npm publish document",
 		},
+		{
+			name:        "missing both shasum and integrity",
+			urlPkg:      "example-pkg",
+			body:        publishBodyForTest("example-pkg", "1.0.0", validTarball, nil),
+			mangle:      mangleStripChecksums,
+			wantStatus:  http.StatusBadRequest,
+			wantContain: "shasum",
+		},
+		{
+			name:        "dist-tag points at version not in publish",
+			urlPkg:      "example-pkg",
+			body:        publishBodyForTest("example-pkg", "1.0.0", validTarball, map[string]string{"latest": "9.9.9"}),
+			wantStatus:  http.StatusBadRequest,
+			wantContain: "not included in this publish",
+		},
 	}
 
 	for _, tc := range cases {
@@ -306,6 +319,13 @@ func TestPublish_MaxUploadBytes(t *testing.T) {
 	}{
 		{name: "under cap", cap: 1 << 20, bodyExtra: 1 << 10, wantStatus: http.StatusCreated, wantBackendHit: true},
 		{name: "over cap", cap: 1 << 12, bodyExtra: 1 << 16, wantStatus: http.StatusRequestEntityTooLarge, wantBackendHit: false},
+		// Boundary at exactly the cap: the wire payload (publish
+		// JSON + base64 + sha checksums) is always larger than
+		// the raw tarball, so a payload of `cap - <fixed
+		// framing>` bytes is the largest that still fits. Sized
+		// generously so a small change to publishBodyForTest's
+		// framing doesn't flip the boundary case spuriously.
+		{name: "well under cap", cap: 1 << 20, bodyExtra: (1 << 19) - 4096, wantStatus: http.StatusCreated, wantBackendHit: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -372,8 +392,8 @@ func TestPackument_RoundTrip(t *testing.T) {
 	if pak.Name != pkg {
 		t.Errorf("name=%q, want %q", pak.Name, pkg)
 	}
-	if got, want := []string{"1.0.0", "2.0.0"}, versionKeys(pak); !cmp.Equal(got, want) {
-		t.Errorf("versions mismatch:\n got=%v\nwant=%v", want, got)
+	if diff := cmp.Diff([]string{"1.0.0", "2.0.0"}, versionKeys(pak)); diff != "" {
+		t.Errorf("versions mismatch (-want +got):\n%s", diff)
 	}
 	wantDistTags := map[string]string{"latest": "2.0.0", "beta": "2.0.0"}
 	if diff := cmp.Diff(wantDistTags, pak.DistTags); diff != "" {
@@ -389,6 +409,134 @@ func TestPackument_RoundTrip(t *testing.T) {
 	tarballURL, _ := dist["tarball"].(string)
 	if !strings.Contains(tarballURL, "/"+testNS+"/"+pkg+"/-/example-pkg-1.0.0.tgz") {
 		t.Errorf("tarball URL not rewritten: %q", tarballURL)
+	}
+}
+
+// TestPackument_TarballURLScheme covers tarballURL's scheme detection
+// honouring X-Forwarded-Proto so deployments behind a TLS-terminating
+// reverse proxy serve https URLs even though req.TLS is nil at the
+// Go layer.
+func TestPackument_TarballURLScheme(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+	if rec := doPublish(t, h, "example", "1.0.0", []byte("payload"), map[string]string{"latest": "1.0.0"}); rec.Code != http.StatusCreated {
+		t.Fatalf("publish status=%d", rec.Code)
+	}
+
+	cases := []struct {
+		name       string
+		header     string
+		wantPrefix string
+	}{
+		{name: "no header defaults to http on plaintext", header: "", wantPrefix: "http://"},
+		{name: "X-Forwarded-Proto https wins", header: "https", wantPrefix: "https://"},
+		{name: "comma-list takes first", header: "https, http", wantPrefix: "https://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/example", nil)
+			if tc.header != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			h.Mux().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d (body=%s)", rec.Code, rec.Body.String())
+			}
+			var pak packument
+			if err := json.Unmarshal(rec.Body.Bytes(), &pak); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			var v map[string]any
+			if err := json.Unmarshal(pak.Versions["1.0.0"], &v); err != nil {
+				t.Fatalf("unmarshal version: %v", err)
+			}
+			dist := v["dist"].(map[string]any)
+			tarballURL, _ := dist["tarball"].(string)
+			if !strings.HasPrefix(tarballURL, tc.wantPrefix) {
+				t.Errorf("tarball URL %q does not start with %q", tarballURL, tc.wantPrefix)
+			}
+		})
+	}
+}
+
+// TestPackument_OverwritesMalformedDist verifies the read path
+// replaces a non-map `dist` field (a malicious publisher submitting
+// dist as an array or string) so the served packument always carries
+// a tarball URL that points at this server, not at whatever the
+// publisher originally encoded.
+func TestPackument_OverwritesMalformedDist(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+
+	// Seed a synthetic version with `dist` as an array directly
+	// against the fake — going through doPublish would reject the
+	// shape upstream of OCI. We add the tarball, then overwrite the
+	// version-metadata layer with the malformed shape.
+	tarball := []byte("payload")
+	if rec := doPublish(t, h, "example", "1.0.0", tarball, map[string]string{"latest": "1.0.0"}); rec.Code != http.StatusCreated {
+		t.Fatalf("seed publish status=%d (body=%s)", rec.Code, rec.Body.String())
+	}
+	// Replace package.json with a body where dist is an array.
+	malformed := []byte(`{"name":"example","version":"1.0.0","dist":["a","b"]}`)
+	reg.Files[testNS+"/packages/u/example/1.0.0/package.json"] = malformed
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/example", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var pak packument
+	if err := json.Unmarshal(rec.Body.Bytes(), &pak); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(pak.Versions["1.0.0"], &v); err != nil {
+		t.Fatalf("unmarshal version: %v", err)
+	}
+	dist, ok := v["dist"].(map[string]any)
+	if !ok {
+		t.Fatalf("dist=%T, want map[string]any (got %v)", v["dist"], v["dist"])
+	}
+	tarballURL, _ := dist["tarball"].(string)
+	if !strings.Contains(tarballURL, "/"+testNS+"/example/-/example-1.0.0.tgz") {
+		t.Errorf("tarball URL %q does not point at this server", tarballURL)
+	}
+}
+
+// TestPackument_NoLatestFallback proves the packument GET path does
+// NOT fabricate `dist-tags.latest` when no publish ever set one. The
+// npm CLI always sets latest on publish; a missing latest is the
+// publisher's choice and `npm install foo` should fail with "no
+// matching version" the same way it would against npmjs.org.
+func TestPackument_NoLatestFallback(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+	// Publish with NO dist-tags.
+	if rec := doPublish(t, h, "example", "1.0.0", []byte("payload"), nil); rec.Code != http.StatusCreated {
+		t.Fatalf("publish status=%d (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/example", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	var pak packument
+	if err := json.Unmarshal(rec.Body.Bytes(), &pak); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, ok := pak.DistTags["latest"]; ok {
+		t.Errorf("dist-tags.latest=%q, want unset (no server-side fallback)", got)
 	}
 }
 
@@ -446,6 +594,9 @@ func TestTarballGet(t *testing.T) {
 		}
 		if rec.Body.Len() != 0 {
 			t.Errorf("HEAD body=%q, want empty", rec.Body.String())
+		}
+		if got, want := rec.Header().Get("Content-Length"), fmt.Sprintf("%d", len(tarball)); got != want {
+			t.Errorf("HEAD Content-Length=%q, want %q", got, want)
 		}
 	})
 
@@ -603,6 +754,85 @@ func TestDistTagPut(t *testing.T) {
 	}
 }
 
+// TestDistTagList_UnknownPackage returns 404 when no canonical
+// versions exist for the package, matching the python handler's
+// behaviour on /simple/<unknown>/.
+func TestDistTagList_UnknownPackage(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/-/package/missing-pkg/dist-tags", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPublish_AtomicValidation confirms that a bad sha512 on the
+// SECOND version of a multi-version publish leaves the registry
+// untouched — the validation runs in a phase before any AddFile so
+// partial commits are impossible.
+func TestPublish_AtomicValidation(t *testing.T) {
+	t.Parallel()
+
+	reg := oci.NewFakeRegistry()
+	h, _ := newTestHandler(t, reg)
+
+	// Hand-build a publish doc with two versions; version 2.0.0
+	// has a deliberately wrong dist.integrity. Phase-1 validation
+	// in handlePublish must reject the whole publish before
+	// version 1.0.0 lands in the backend.
+	tarball := []byte("payload")
+	sha1Sum := sha1.Sum(tarball)
+	sha512Sum := sha512.Sum512(tarball)
+	bogus := make([]byte, 64)
+	for i := range bogus {
+		bogus[i] = byte(i)
+	}
+
+	v1 := map[string]any{
+		"name":    "example",
+		"version": "1.0.0",
+		"dist": map[string]any{
+			"shasum":    hex.EncodeToString(sha1Sum[:]),
+			"integrity": "sha512-" + base64.StdEncoding.EncodeToString(sha512Sum[:]),
+		},
+	}
+	v2 := map[string]any{
+		"name":    "example",
+		"version": "2.0.0",
+		"dist": map[string]any{
+			"shasum":    hex.EncodeToString(sha1Sum[:]),
+			"integrity": "sha512-" + base64.StdEncoding.EncodeToString(bogus),
+		},
+	}
+	doc := map[string]any{
+		"name": "example",
+		"versions": map[string]any{
+			"1.0.0": v1,
+			"2.0.0": v2,
+		},
+		"_attachments": map[string]any{
+			"example-1.0.0.tgz": map[string]any{"content_type": "application/octet-stream", "data": base64.StdEncoding.EncodeToString(tarball), "length": len(tarball)},
+			"example-2.0.0.tgz": map[string]any{"content_type": "application/octet-stream", "data": base64.StdEncoding.EncodeToString(tarball), "length": len(tarball)},
+		},
+	}
+	body, _ := json.Marshal(doc)
+	req := httptest.NewRequest(http.MethodPut, "/"+testNS+"/example", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if _, ok := reg.Files[testNS+"/packages/u/example/1.0.0/example-1.0.0.tgz"]; ok {
+		t.Errorf("v1 tarball was written despite v2 validation failure — phase-1 validation broken")
+	}
+}
+
 // TestDistTagPut_UnknownVersion returns 404 when the target version
 // does not exist in the canonical tags.
 func TestDistTagPut_UnknownVersion(t *testing.T) {
@@ -741,6 +971,22 @@ func mangleSha1(body []byte) []byte {
 	return out
 }
 
+// mangleStripChecksums removes both dist.shasum and dist.integrity
+// so we can exercise the "publisher submitted neither" reject path
+// in verifyChecksums.
+func mangleStripChecksums(body []byte) []byte {
+	var m map[string]any
+	_ = json.Unmarshal(body, &m)
+	versions := m["versions"].(map[string]any)
+	for _, v := range versions {
+		dist := v.(map[string]any)["dist"].(map[string]any)
+		delete(dist, "shasum")
+		delete(dist, "integrity")
+	}
+	out, _ := json.Marshal(m)
+	return out
+}
+
 // mangleIntegrity flips the dist.integrity to a wrong-but-valid SRI
 // so the recomputed sha512 disagrees.
 func mangleIntegrity(body []byte) []byte {
@@ -786,9 +1032,3 @@ func versionKeys(p packument) []string {
 	}
 	return out
 }
-
-// Make sure unused imports are kept in check across builds.
-var (
-	_ = io.Discard
-	_ = errors.New
-)

@@ -6,6 +6,7 @@
 package npm
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"crypto/sha512"
@@ -45,6 +46,18 @@ const (
 	// the cap exists to keep a malicious client from piling
 	// unbounded characters into an OCI tag.
 	maxVersionLength = 128
+
+	// maxTarballBytes caps the size of any single base64-decoded
+	// _attachments entry. npm itself caps tarballs at 100 MiB; 500
+	// MiB leaves slack for the largest legitimate packages while
+	// stopping a publisher from declaring a tiny version and
+	// stuffing a 750+ MiB blob into the attachment to amplify
+	// memory pressure through the JSON decode + base64 decode
+	// pipeline. Lives separately from DefaultMaxUploadBytes (the
+	// outer wire cap) because per-attachment bounds let us reject
+	// pathological multi-version publishes the outer cap would
+	// otherwise admit.
+	maxTarballBytes int64 = 500 << 20
 
 	// indexSentinelName / indexSentinelContent mirror python: a
 	// constant placeholder layer whose presence is what we read off
@@ -273,7 +286,20 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 
 	repo := packageOwningRepo(pkgFromURL)
 
-	publishedVersions := make([]string, 0, len(doc.Versions))
+	// Phase 1: validate every version's metadata and attachment up
+	// front and stage the decoded tarballs. Nothing here touches the
+	// OCI backend, so a single bad sha512 / oversized attachment /
+	// dist-tag pointing at a non-existent version fails the whole
+	// publish before any side effect lands. The npm CLI publishes
+	// one version at a time in practice; the staging map is rarely
+	// larger than 1.
+	type stagedVersion struct {
+		raw         json.RawMessage
+		tarball     []byte
+		tarballName string
+	}
+	staged := make(map[string]stagedVersion, len(doc.Versions))
+
 	for version, raw := range doc.Versions {
 		if version == "" {
 			http.Error(w, "publish document contains an empty version key", http.StatusBadRequest)
@@ -313,39 +339,24 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, fmt.Sprintf("attachment %q data is not valid base64: %s", tarballName, err), http.StatusBadRequest)
 			return
 		}
+		if int64(len(tarballBytes)) > maxTarballBytes {
+			http.Error(w, fmt.Sprintf("tarball %q exceeds %d-byte per-tarball cap", tarballName, maxTarballBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
 		if err := verifyChecksums(tarballBytes, meta.Dist); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		tarballRF := &oci.RepoFile{
-			OwningRepo: repo,
-			OwningTag:  version,
-			Name:       tarballName,
-			MediaType:  "application/octet-stream",
-			Size:       int64(len(tarballBytes)),
-		}
-		if !h.addFile(ctx, scoped, w, tarballRF, strings.NewReader(string(tarballBytes))) {
-			return
-		}
+		// Drop the base64-encoded string from the parsed document so
+		// GC can reclaim it — we already have the decoded bytes
+		// staged and don't need the source representation again.
+		attachment.Data = ""
+		doc.Attachments[tarballName] = attachment
 
-		metaRF := &oci.RepoFile{
-			OwningRepo: repo,
-			OwningTag:  version,
-			Name:       versionMetaName,
-			MediaType:  "application/json",
-			Size:       int64(len(raw)),
-		}
-		if !h.addFile(ctx, scoped, w, metaRF, strings.NewReader(string(raw))) {
-			return
-		}
-
-		publishedVersions = append(publishedVersions, version)
+		staged[version] = stagedVersion{raw: raw, tarball: tarballBytes, tarballName: tarballName}
 	}
 
-	// Dist-tag updates run after every version write so a publish
-	// bumping `latest` to a brand-new version sees that version
-	// already canonical when AppendRefs probes it.
 	for tag, version := range doc.DistTags {
 		if !distTagSafe(tag) {
 			http.Error(w, fmt.Sprintf("dist-tag %q contains characters that cannot be encoded as an OCI tag", tag), http.StatusBadRequest)
@@ -355,6 +366,52 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, fmt.Sprintf("dist-tag %q points at empty version", tag), http.StatusBadRequest)
 			return
 		}
+		if _, ok := staged[version]; !ok {
+			// npm publish documents only carry dist-tags pointing
+			// at versions in the same body. Targets not in the
+			// staged set are rejected here so a typo'd publisher
+			// gets a clean 400 instead of leaving the publish
+			// half-applied. Operators reassign dist-tags to
+			// previously-published versions via the direct
+			// `npm dist-tag add` endpoint.
+			http.Error(w, fmt.Sprintf("dist-tag %q points at version %q which is not included in this publish", tag, version), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Phase 2: write every staged version's tarball + metadata
+	// layers. By construction nothing here can fail validation —
+	// only an OCI-backend error (or a 409 from a duplicate version)
+	// remains. A partial-publish across multiple versions in this
+	// loop is unrecoverable; npm publishes are single-version in
+	// practice, so the staged map almost always has size 1.
+	for version, s := range staged {
+		tarballRF := &oci.RepoFile{
+			OwningRepo: repo,
+			OwningTag:  version,
+			Name:       s.tarballName,
+			MediaType:  "application/octet-stream",
+			Size:       int64(len(s.tarball)),
+		}
+		if !h.addFile(ctx, scoped, w, tarballRF, bytes.NewReader(s.tarball)) {
+			return
+		}
+
+		metaRF := &oci.RepoFile{
+			OwningRepo: repo,
+			OwningTag:  version,
+			Name:       versionMetaName,
+			MediaType:  "application/json",
+			Size:       int64(len(s.raw)),
+		}
+		if !h.addFile(ctx, scoped, w, metaRF, bytes.NewReader(s.raw)) {
+			return
+		}
+	}
+
+	// Phase 3: dist-tag updates. Each target is already known to
+	// reference a staged (and now-written) canonical version.
+	for tag, version := range doc.DistTags {
 		if err := scoped.AppendRefs(ctx, repo, version, tag); err != nil {
 			h.writeRegistryError(ctx, w, err, "failed to update dist-tag")
 			return
@@ -519,22 +576,34 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		// every other field by round-tripping through a generic
 		// map. json.RawMessage is fine for storage but doesn't
 		// let us mutate.
+		//
+		// The dist field is replaced unconditionally — if a
+		// publisher submitted dist as an array, a string, or any
+		// other non-map shape, we still control the tarball URL
+		// our clients see. A malicious publisher cannot leave the
+		// original (e.g. registry.npmjs.org) tarball URL in the
+		// served packument by sending a weird dist shape.
 		var versionDoc map[string]any
 		if err := json.Unmarshal(raw, &versionDoc); err != nil {
 			handler.WriteError(ctx, w, http.StatusInternalServerError, err, "failed to parse stored version metadata")
 			return
 		}
-		if dist, ok := versionDoc["dist"].(map[string]any); ok {
-			if vf.tarballName != "" {
-				dist["tarball"] = tarballURL(req, pkg, vf.tarballName)
-			}
-			if _, ok := dist["shasum"]; !ok && vf.tarballDigest != "" {
-				// dist.shasum is sha1; the OCI layer digest is
-				// sha256. Only populate the shasum field if the
-				// stored metadata didn't already carry one.
-				dist["shasum"] = strings.TrimPrefix(vf.tarballDigest, "sha256:")
-			}
+		dist, ok := versionDoc["dist"].(map[string]any)
+		if !ok {
+			dist = map[string]any{}
+			versionDoc["dist"] = dist
 		}
+		if vf.tarballName != "" {
+			dist["tarball"] = tarballURL(req, pkg, vf.tarballName)
+		}
+		// We do NOT fabricate dist.shasum from the OCI layer
+		// digest — that digest is sha256 while npm clients
+		// expect sha1 in dist.shasum, and serving a 64-char
+		// "sha1" makes clients fail at verification. With the
+		// publish-time requirement that every publish carries
+		// dist.shasum and/or dist.integrity (see verifyChecksums),
+		// the stored metadata always has at least one valid
+		// checksum that round-trips here untouched.
 		merged, mErr := json.Marshal(versionDoc)
 		if mErr != nil {
 			handler.WriteError(ctx, w, http.StatusInternalServerError, mErr, "failed to re-marshal version metadata")
@@ -588,20 +657,13 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		out.DistTags[tag] = target
 	}
 
-	// If the publisher set a "latest" but it didn't make it into a
-	// dist-tag alias (older publishes that didn't include dist-tags),
-	// fall back to the highest-sorted version. This keeps `npm
-	// install` from emitting "no matching version" when the user
-	// asks for the package by bare name.
-	if _, ok := out.DistTags["latest"]; !ok && len(out.Versions) > 0 {
-		latest := ""
-		for v := range out.Versions {
-			if v > latest {
-				latest = v
-			}
-		}
-		out.DistTags["latest"] = latest
-	}
+	// No server-side fallback for an unset "latest" dist-tag. The
+	// npm CLI always sets `dist-tags.latest` on publish; if it's
+	// missing the publisher explicitly chose to omit it and `npm
+	// install foo` should fail with "no matching version" the same
+	// way it would against npmjs.org. Lexical sorting was wrong
+	// (10.0.0 < 2.0.0 lexically) and proper semver isn't worth
+	// pulling in for a behaviour npm doesn't require.
 
 	w.Header().Set("Content-Type", "application/json")
 	if req.Method == http.MethodHead {
@@ -708,6 +770,17 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		h.writeRegistryError(ctx, w, err, "failed to list files")
+		return
+	}
+
+	// A package with no canonical files is not a published package
+	// — back-end registries return an empty list (or normalize a
+	// real NAME_UNKNOWN to ErrNotFound, handled above), and so does
+	// the fake. Either way, surface 404 so dist-tag ls of an
+	// unknown package looks the same as packument GET of the same
+	// package.
+	if len(files) == 0 {
+		http.Error(w, "package not found", http.StatusNotFound)
 		return
 	}
 
@@ -849,8 +922,15 @@ func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped handler.Regist
 // verifyChecksums recomputes the sha1 (dist.shasum) and sha512
 // (dist.integrity, SRI-prefixed) checksums for the decoded tarball
 // and returns an error when either disagrees with what the
-// publisher claimed. Mirrors maven's checksum-on-upload contract.
+// publisher claimed. At least one of the two must be supplied —
+// the read path serves whichever fields the publisher submitted,
+// so a publish carrying neither would land a tarball that
+// downstream `npm install` clients then verify against fabricated
+// digests they trust because the registry served them.
 func verifyChecksums(tarball []byte, dist versionDist) error {
+	if dist.Shasum == "" && dist.Integrity == "" {
+		return fmt.Errorf("publish must include dist.shasum or dist.integrity for the tarball")
+	}
 	if dist.Shasum != "" {
 		sum := sha1.Sum(tarball)
 		got := hex.EncodeToString(sum[:])
@@ -868,40 +948,68 @@ func verifyChecksums(tarball []byte, dist versionDist) error {
 			return fmt.Errorf("dist.integrity %q is not valid base64: %w", dist.Integrity, err)
 		}
 		sum := sha512.Sum512(tarball)
-		if !bytesEqual(sum[:], want) {
+		if !bytes.Equal(sum[:], want) {
 			return fmt.Errorf("tarball sha512 does not match dist.integrity")
 		}
 	}
 	return nil
 }
 
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // tarballURL builds the absolute URL clients should follow to fetch
-// the tarball from this ocifactory instance. Scheme defaults to
-// https unless the request was made over plain HTTP; the host is
-// taken from the request.
+// the tarball from this ocifactory instance.
+//
+// Scheme resolution: X-Forwarded-Proto wins so deployments behind a
+// TLS-terminating reverse proxy (Cloud Run, an L7 LB, nginx) serve
+// https URLs even though req.TLS is nil at the Go layer. Falls back
+// to req.TLS, then req.URL.Scheme, then http. Operators who don't
+// strip an upstream-supplied X-Forwarded-Proto from untrusted
+// clients should front ocifactory with a proxy that overwrites it.
+//
+// Path segments are PathEscaped so any future relaxation of the
+// version / filename charset doesn't silently produce malformed
+// URLs. Scoped names (`@scope/name`) are split into two path
+// segments so the `@` and `/` are preserved without double-encoding.
 func tarballURL(req *http.Request, pkg, filename string) string {
-	scheme := "https"
-	if req.TLS == nil && req.URL.Scheme != "https" {
-		scheme = "http"
+	scheme := detectScheme(req)
+	ns := mux.Vars(req)["namespace"]
+	var pkgPath string
+	if strings.HasPrefix(pkg, "@") {
+		if slash := strings.IndexByte(pkg, '/'); slash >= 0 {
+			pkgPath = url.PathEscape(pkg[:slash]) + "/" + url.PathEscape(pkg[slash+1:])
+		} else {
+			pkgPath = url.PathEscape(pkg)
+		}
+	} else {
+		pkgPath = url.PathEscape(pkg)
 	}
 	u := url.URL{
 		Scheme: scheme,
 		Host:   req.Host,
-		Path:   fmt.Sprintf("/%s/%s/-/%s", mux.Vars(req)["namespace"], pkg, filename),
+		Path:   "/" + url.PathEscape(ns) + "/" + pkgPath + "/-/" + url.PathEscape(filename),
 	}
 	return u.String()
+}
+
+// detectScheme returns the URL scheme clients should see for a
+// reflected URL. Honours X-Forwarded-Proto first so reverse-proxied
+// deployments get https; falls back to req.TLS for direct-TLS
+// listeners and finally to req.URL.Scheme / "http".
+func detectScheme(req *http.Request) string {
+	if proto := req.Header.Get("X-Forwarded-Proto"); proto != "" {
+		// Take the first value if a chain of proxies produced a
+		// comma-separated list.
+		if i := strings.IndexByte(proto, ','); i >= 0 {
+			proto = proto[:i]
+		}
+		return strings.TrimSpace(proto)
+	}
+	if req.TLS != nil {
+		return "https"
+	}
+	if req.URL.Scheme != "" {
+		return req.URL.Scheme
+	}
+	return "http"
 }
 
 // tarballVersion extracts the version segment from an npm tarball

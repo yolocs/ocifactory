@@ -38,6 +38,12 @@ const packageOwningRepoPrefix = "packages"
 // "._-", no leading "." or "_", no whitespace, length cap, and the
 // scoped form "@<scope>/<name>". Anything else (including "~",
 // uppercase letters, or Unicode characters) is rejected.
+//
+// The encoded form (see [encodePackageNameTag]) is also checked
+// against the 128-char OCI tag length cap so a syntactically valid
+// but encoding-oversized name is rejected at publish time rather
+// than silently failing later when [ensureIndexSentinel] tries to
+// write the index repo entry.
 func validatePackageName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty", ErrInvalidPackageName)
@@ -65,10 +71,15 @@ func validatePackageName(name string) error {
 		if strings.ContainsRune(unscoped, '/') {
 			return fmt.Errorf("%w: name %q contains %q", ErrInvalidPackageName, unscoped, "/")
 		}
-		return nil
-	}
-	if !npmNameSegmentRegExp.MatchString(name) {
+	} else if !npmNameSegmentRegExp.MatchString(name) {
 		return fmt.Errorf("%w: name %q has invalid characters", ErrInvalidPackageName, name)
+	}
+	// Final guard: the index repo tag encoding has a hard 128-char
+	// OCI tag cap. Names with many underscores or scoped names with
+	// long components can exceed it after _HH expansion even though
+	// they fit npm's own 214-char rule.
+	if _, err := encodePackageNameTag(name); err != nil {
+		return err
 	}
 	return nil
 }

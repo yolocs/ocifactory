@@ -36,6 +36,13 @@ func TestValidatePackageName(t *testing.T) {
 		{name: "scope leading dot", input: "@.scope/foo", wantErr: true},
 		{name: "scope uppercase", input: "@Scope/foo", wantErr: true},
 		{name: "too long", input: strings.Repeat("a", maxPackageNameLength+1), wantErr: true},
+		// Each "_" expands to "_5F" (3 bytes) when encoded; 50
+		// underscores in a 51-char name produce a 152-char tag,
+		// past the 128-char OCI tag cap. The name fits npm's own
+		// 214-char rule, so validatePackageName is the only thing
+		// catching this and we want it to fail fast at publish
+		// rather than at the sentinel-write phase.
+		{name: "encoded length exceeds OCI tag cap", input: "a" + strings.Repeat("_", 50), wantErr: true},
 	}
 
 	for _, tc := range cases {
