@@ -207,6 +207,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - uses: 'actions/setup-node@v4' # ratchet:exclude
+        with:
+          node-version: '20'
+
       - name: 'Install twine'
         run: 'python -m pip install --upgrade pip twine'
 
@@ -224,4 +228,5 @@ jobs:
             -timeout=10m \
             -v \
             ./pkg/handler/python/... \
-            ./pkg/handler/maven/...
+            ./pkg/handler/maven/... \
+            ./pkg/handler/npm/...
