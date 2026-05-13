@@ -328,19 +328,24 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		tarballName := tarballFilename(pkgFromURL, version)
-		attachment, ok := doc.Attachments[tarballName]
+		// npm keys `_attachments` by the full package name + version
+		// ("@scope/foo-1.0.0.tgz" for scoped, "foo-1.0.0.tgz" for
+		// unscoped). The stored OCI layer name, however, drops the
+		// "@scope/" prefix to avoid a slash inside a filename segment
+		// of the rewritten download URL.
+		attachKey := attachmentKey(pkgFromURL, version)
+		attachment, ok := doc.Attachments[attachKey]
 		if !ok {
-			http.Error(w, fmt.Sprintf("missing attachment for tarball %q", tarballName), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("missing attachment for tarball %q", attachKey), http.StatusBadRequest)
 			return
 		}
 		tarballBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(attachment.Data))
 		if err != nil {
-			http.Error(w, fmt.Sprintf("attachment %q data is not valid base64: %s", tarballName, err), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf("attachment %q data is not valid base64: %s", attachKey, err), http.StatusBadRequest)
 			return
 		}
 		if int64(len(tarballBytes)) > maxTarballBytes {
-			http.Error(w, fmt.Sprintf("tarball %q exceeds %d-byte per-tarball cap", tarballName, maxTarballBytes), http.StatusRequestEntityTooLarge)
+			http.Error(w, fmt.Sprintf("tarball %q exceeds %d-byte per-tarball cap", attachKey, maxTarballBytes), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if err := verifyChecksums(tarballBytes, meta.Dist); err != nil {
@@ -352,9 +357,9 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 		// GC can reclaim it — we already have the decoded bytes
 		// staged and don't need the source representation again.
 		attachment.Data = ""
-		doc.Attachments[tarballName] = attachment
+		doc.Attachments[attachKey] = attachment
 
-		staged[version] = stagedVersion{raw: raw, tarball: tarballBytes, tarballName: tarballName}
+		staged[version] = stagedVersion{raw: raw, tarball: tarballBytes, tarballName: tarballFilename(pkgFromURL, version)}
 	}
 
 	for tag, version := range doc.DistTags {

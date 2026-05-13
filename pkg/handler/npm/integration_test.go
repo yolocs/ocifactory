@@ -160,9 +160,21 @@ func runNpm(t *testing.T, dir, registry string, args ...string) {
 	// npm chokes when HOME is empty; t.TempDir() gives us a
 	// guaranteed-writeable location that gets cleaned up on test
 	// exit.
+	//
+	// npm 10 refuses to start when userconfig and globalconfig
+	// resolve to the same path ("double-loading config ... as
+	// global, previously loaded as user"), so point globalconfig
+	// at an empty file in a sibling tempdir. Keeping it outside
+	// the package directory matters for `npm publish`: anything
+	// in cwd lands in the published tarball by default.
+	cfgDir := t.TempDir()
+	globalRC := filepath.Join(cfgDir, ".npmrc-global")
+	if err := os.WriteFile(globalRC, nil, 0o600); err != nil {
+		t.Fatalf("write empty global npmrc: %v", err)
+	}
 	cmd.Env = append(os.Environ(),
 		"npm_config_userconfig="+filepath.Join(dir, ".npmrc"),
-		"npm_config_globalconfig="+filepath.Join(dir, ".npmrc"),
+		"npm_config_globalconfig="+globalRC,
 		"npm_config_cache="+t.TempDir(),
 		"HOME="+t.TempDir(),
 	)

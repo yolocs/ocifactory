@@ -66,18 +66,13 @@ func putNamespace(t *testing.T, store *namespace.Store, name string, spec namesp
 // version of pkgName. tarballBytes is the raw .tgz payload; the
 // helper base64-encodes it and computes the dist.shasum / integrity
 // the way a real npm client does. distTags is optional.
+//
+// The `_attachments` map is keyed by the full package name plus
+// version (e.g. "@scope/foo-1.0.0.tgz" for scoped) to mirror what real
+// npm clients send on `npm publish`.
 func publishBody(t *testing.T, pkgName, version string, tarballBytes []byte, distTags map[string]string) []byte {
 	t.Helper()
-	short := pkgName
-	if len(pkgName) > 0 && pkgName[0] == '@' {
-		for i := 0; i < len(pkgName); i++ {
-			if pkgName[i] == '/' {
-				short = pkgName[i+1:]
-				break
-			}
-		}
-	}
-	tarballName := fmt.Sprintf("%s-%s.tgz", short, version)
+	tarballName := fmt.Sprintf("%s-%s.tgz", pkgName, version)
 
 	sha1Sum := sha1.Sum(tarballBytes)
 	sha512Sum := sha512.Sum512(tarballBytes)
