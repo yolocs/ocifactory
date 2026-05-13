@@ -164,8 +164,11 @@ func runNpm(t *testing.T, dir, registry string, args ...string) {
 	// npm 10 refuses to start when userconfig and globalconfig
 	// resolve to the same path ("double-loading config ... as
 	// global, previously loaded as user"), so point globalconfig
-	// at an empty sibling file rather than reusing .npmrc.
-	globalRC := filepath.Join(dir, ".npmrc-global")
+	// at an empty file in a sibling tempdir. Keeping it outside
+	// the package directory matters for `npm publish`: anything
+	// in cwd lands in the published tarball by default.
+	cfgDir := t.TempDir()
+	globalRC := filepath.Join(cfgDir, ".npmrc-global")
 	if err := os.WriteFile(globalRC, nil, 0o600); err != nil {
 		t.Fatalf("write empty global npmrc: %v", err)
 	}

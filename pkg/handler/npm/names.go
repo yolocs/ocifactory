@@ -204,9 +204,10 @@ func unhex(c byte) (byte, bool) {
 }
 
 // tarballFilename returns the canonical tarball layer name for an npm
-// (name, version) pair. Scoped names strip the "@scope/" prefix so
-// the filename mirrors what real npm clients send in the
-// _attachments map: "foo-1.0.0.tgz" for both "foo" and "@scope/foo".
+// (name, version) pair. Scoped names strip the "@scope/" prefix so the
+// stored filename and the rewritten download URL stay simple (no path
+// separators in the OCI layer name). For both "foo" and "@scope/foo"
+// at version 1.0.0 this returns "foo-1.0.0.tgz".
 //
 // Callers must already have validated name.
 func tarballFilename(name, version string) string {
@@ -217,4 +218,17 @@ func tarballFilename(name, version string) string {
 		}
 	}
 	return short + "-" + version + ".tgz"
+}
+
+// attachmentKey returns the key under which a real npm client stores
+// a publish's tarball in the `_attachments` map of the publish JSON.
+// npm always uses the full package name plus version, so for a scoped
+// package "@scope/foo" at 1.0.0 the key is "@scope/foo-1.0.0.tgz".
+// This differs from [tarballFilename], which we use for the stored
+// OCI layer name and the rewritten download URL (where keeping a
+// slash inside the filename segment is gratuitously awkward).
+//
+// Callers must already have validated name.
+func attachmentKey(name, version string) string {
+	return name + "-" + version + ".tgz"
 }
