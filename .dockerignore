@@ -1,0 +1,5 @@
+# Goreleaser builds the ocifactory binary itself and stages it next
+# to Dockerfile.goreleaser. Exclude everything else so a stray local
+# checkout (e.g. dist/, pkg/, .git/) never leaks into image layers.
+*
+!ocifactory
