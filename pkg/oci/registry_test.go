@@ -229,6 +229,22 @@ func (r *inMemoryRepo) Predecessors(ctx context.Context, node ocispec.Descriptor
 	return kept, nil
 }
 
+// DeleteTag mirrors a real OCI registry's
+// `DELETE /v2/<repo>/manifests/<tag>` semantics: just the tag mapping
+// is removed; the underlying manifest stays addressable by digest (and
+// reachable via Predecessors) until something deletes it. Used by the
+// deterministic file-tag cleanup path in pkg/oci so the dangling _f_*
+// tag is reaped before the file manifest itself.
+func (r *inMemoryRepo) DeleteTag(_ context.Context, tag string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.allTags[tag]; !ok {
+		return errdef.ErrNotFound
+	}
+	delete(r.allTags, tag)
+	return nil
+}
+
 // Intercept the Resolve call to return ErrNotFound if the target has been deleted.
 func (r *inMemoryRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
 	target, err := r.Store.Resolve(ctx, reference)
@@ -1315,4 +1331,244 @@ type readCounter struct {
 func (r *readCounter) Read(p []byte) (int, error) {
 	r.calls++
 	return r.src.Read(p)
+}
+
+// TestAddFile_TagsDeterministicFileTag verifies the contract added in
+// #97: every AddFile attaches a deterministic _f_<sha256(owningTag\0name)>
+// tag to its file manifest so ReadFile / BlobRedirectURL can resolve in
+// one round-trip. The tag must point at the file manifest (not the
+// blob, not the version), and the canonical version tag must still be
+// the version manifest — the two namespaces must not collide.
+func TestAddFile_TagsDeterministicFileTag(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, memRepo := newTestRegistry(t)
+
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}
+	desc, err := r.AddFile(ctx, f, strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("AddFile() error = %v", err)
+	}
+
+	memRepo.mu.Lock()
+	fileTagDigest := memRepo.allTags[fileTagFor("v1", "a.txt")]
+	versionTagDigest := memRepo.allTags["v1"]
+	memRepo.mu.Unlock()
+
+	if fileTagDigest == "" {
+		t.Fatalf("expected _f_* tag for (v1, a.txt) but none present in allTags")
+	}
+	if fileTagDigest == versionTagDigest {
+		t.Errorf("deterministic file tag and version tag point at the same manifest digest %q; they must address different manifests", fileTagDigest)
+	}
+	if fileTagDigest == desc.File.Digest.String() {
+		t.Errorf("deterministic file tag points at the blob digest %q instead of the file manifest", fileTagDigest)
+	}
+	if fileTagDigest != desc.Manifest.Digest.String() {
+		t.Errorf("deterministic file tag digest = %q, want file manifest digest %q", fileTagDigest, desc.Manifest.Digest.String())
+	}
+}
+
+// TestReadFile_UsesDeterministicTag locks in the actual perf win the
+// issue is after: ReadFile must NOT walk the version's referrers when
+// the deterministic file tag exists. We exercise this by replacing
+// Predecessors (which backs registry.Referrers fallback) with a stub
+// that fails — if ReadFile ever asks for referrers on the hot path
+// this test fails. Resolve and Fetch are the only backend calls
+// allowed.
+func TestReadFile_UsesDeterministicTag(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, memRepo := newTestRegistry(t)
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}
+	if _, err := r.AddFile(ctx, f, strings.NewReader("hello")); err != nil {
+		t.Fatalf("AddFile() error = %v", err)
+	}
+
+	// Wrap the backend so any Predecessors / Referrers call surfaces
+	// as an error. Resolve+Fetch are the only backend calls
+	// ReadFile-via-deterministic-tag is permitted to make.
+	r.newBackendFunc = func(ctx context.Context, _ *RepoFile) (destRepo, error) {
+		return &referrerForbiddenRepo{inMemoryRepo: memRepo, t: t}, nil
+	}
+
+	_, body, err := r.ReadFile(ctx, f)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	defer body.Close()
+	got, _ := io.ReadAll(body)
+	if string(got) != "hello" {
+		t.Errorf("ReadFile() content = %q, want %q", got, "hello")
+	}
+}
+
+// referrerForbiddenRepo fails any call that walks the referrers graph,
+// so a test can assert that the fast-path ReadFile never touches it.
+type referrerForbiddenRepo struct {
+	*inMemoryRepo
+	t *testing.T
+}
+
+func (r *referrerForbiddenRepo) Predecessors(_ context.Context, _ ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	r.t.Errorf("Predecessors called on the read fast path; deterministic file tag should have short-circuited the referrers walk")
+	return nil, errors.New("referrer walk forbidden")
+}
+
+// TestListTags_FiltersDeterministicFileTags verifies the user-visible
+// view of ListTags: it must hide _f_* tags so handlers that enumerate
+// "versions + aliases" don't see implementation-detail entries. The
+// raw backend tag list confirms a _f_* entry is actually present —
+// otherwise the test would pass trivially even if filtering were a
+// no-op against an empty input.
+func TestListTags_FiltersDeterministicFileTags(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, memRepo := newTestRegistry(t)
+
+	if _, err := r.AddFile(ctx, &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile(v1) error = %v", err)
+	}
+	if err := r.AppendRefs(ctx, "pkg", "v1", "latest"); err != nil {
+		t.Fatalf("AppendRefs() error = %v", err)
+	}
+
+	// Sanity-check the backend actually carries the deterministic
+	// tag — otherwise the ListTags filter assertion would pass even
+	// if filtering were broken against an empty input.
+	memRepo.mu.Lock()
+	hasFileTag := false
+	for k := range memRepo.allTags {
+		if isFileTag(k) {
+			hasFileTag = true
+			break
+		}
+	}
+	memRepo.mu.Unlock()
+	if !hasFileTag {
+		t.Fatalf("precondition: backend must hold at least one _f_* tag after AddFile")
+	}
+
+	gotTags, err := r.ListTags(ctx, "pkg")
+	if err != nil {
+		t.Fatalf("ListTags() error = %v", err)
+	}
+	slices.Sort(gotTags)
+	if diff := cmp.Diff([]string{"latest", "v1"}, gotTags); diff != "" {
+		t.Errorf("ListTags() leaked _f_* tags or missed versions/aliases (-want +got):\n%s", diff)
+	}
+}
+
+// TestDeleteTagFiles_UntagsDeterministicTag locks in the cleanup
+// contract: after DeleteTagFiles, the deterministic _f_* tag must be
+// gone so Resolve(_f_*) returns ErrNotFound and ListTags-after-filter
+// surfaces a clean view of remaining versions.
+func TestDeleteTagFiles_UntagsDeterministicTag(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, memRepo := newTestRegistry(t)
+
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}
+	if _, err := r.AddFile(ctx, f, strings.NewReader("a")); err != nil {
+		t.Fatalf("AddFile() error = %v", err)
+	}
+	tag := fileTagFor("v1", "a.txt")
+	memRepo.mu.Lock()
+	_, present := memRepo.allTags[tag]
+	memRepo.mu.Unlock()
+	if !present {
+		t.Fatalf("precondition: deterministic file tag %q must be set after AddFile", tag)
+	}
+
+	if err := r.DeleteTagFiles(ctx, "pkg", "v1"); err != nil {
+		t.Fatalf("DeleteTagFiles() error = %v", err)
+	}
+
+	memRepo.mu.Lock()
+	_, stillPresent := memRepo.allTags[tag]
+	memRepo.mu.Unlock()
+	if stillPresent {
+		t.Errorf("DeleteTagFiles() left deterministic tag %q behind", tag)
+	}
+
+	if _, _, err := r.ReadFile(ctx, f); !errors.Is(err, errdef.ErrNotFound) {
+		t.Errorf("ReadFile() after DeleteTagFiles = %v, want errors.Is ErrNotFound", err)
+	}
+}
+
+// TestAddFile_OverwriteMovesDeterministicTag verifies the
+// allow-overwrite path keeps the deterministic tag pointing at the new
+// file manifest (and not stranded on the deleted old one). Without
+// this, the second ReadFile would resolve the dangling tag and
+// either 404 or surface the previous content.
+func TestAddFile_OverwriteMovesDeterministicTag(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	r, err := NewRegistry(
+		&url.URL{Scheme: "https", Host: "example.com"},
+		WithAllowOverwrite(true),
+	)
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+	r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+		return memRepo, nil
+	}
+
+	f := &RepoFile{
+		OwningRepo: "pkg",
+		OwningTag:  "v1",
+		Name:       "a.txt",
+	}
+	first, err := r.AddFile(ctx, f, strings.NewReader("first"))
+	if err != nil {
+		t.Fatalf("AddFile() first error = %v", err)
+	}
+	second, err := r.AddFile(ctx, f, strings.NewReader("second"))
+	if err != nil {
+		t.Fatalf("AddFile() second error = %v", err)
+	}
+	if first.Manifest.Digest == second.Manifest.Digest {
+		t.Fatalf("overwrite produced identical manifest digest; expected different content to yield different manifest")
+	}
+
+	tag := fileTagFor("v1", "a.txt")
+	memRepo.mu.Lock()
+	pointsAt := memRepo.allTags[tag]
+	memRepo.mu.Unlock()
+	if pointsAt != second.Manifest.Digest.String() {
+		t.Errorf("deterministic tag %q points at %q, want new manifest digest %q", tag, pointsAt, second.Manifest.Digest)
+	}
+
+	_, body, err := r.ReadFile(ctx, f)
+	if err != nil {
+		t.Fatalf("ReadFile() after overwrite error = %v", err)
+	}
+	gotBody, _ := io.ReadAll(body)
+	body.Close()
+	if string(gotBody) != "second" {
+		t.Errorf("ReadFile() after overwrite = %q, want %q", gotBody, "second")
+	}
 }
