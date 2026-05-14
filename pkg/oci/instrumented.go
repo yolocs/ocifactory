@@ -24,6 +24,7 @@ const (
 	opResolve        = "resolve"
 	opTag            = "tag"
 	opDelete         = "delete"
+	opDeleteTag      = "delete_tag"
 	opListTags       = "list_tags"
 	opListReferrers  = "list_referrers"
 	opPredecessors   = "predecessors"
@@ -98,6 +99,13 @@ func (r *instrumentedRepo) Delete(ctx context.Context, target ocispec.Descriptor
 	start := time.Now()
 	err := r.destRepo.Delete(ctx, target)
 	r.rec.OCIBackendCall(opDelete, statusFromErr(err), time.Since(start))
+	return err
+}
+
+func (r *instrumentedRepo) DeleteTag(ctx context.Context, tag string) error {
+	start := time.Now()
+	err := r.destRepo.DeleteTag(ctx, tag)
+	r.rec.OCIBackendCall(opDeleteTag, statusFromErr(err), time.Since(start))
 	return err
 }
 

@@ -2,6 +2,7 @@ package oci
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,28 +57,23 @@ func (r *Registry) blobRedirectURL(ctx context.Context, f *RepoFile) (string, er
 		return "", err
 	}
 
-	versionDesc, err := r.resolveVersionDescriptor(ctx, backend, f)
+	canonicalTag, err := r.resolveCanonicalTag(ctx, backend, f)
 	if err != nil {
 		return "", err
 	}
 
-	refs, err := registry.Referrers(ctx, backend, versionDesc, r.fileArtifactType)
+	fileManifestDesc, err := backend.Resolve(ctx, fileTagFor(canonicalTag, f.Name))
 	if err != nil {
-		return "", fmt.Errorf("failed to list file referrers: %w", err)
-	}
-
-	for i := range refs {
-		if refs[i].Annotations[FileNameAnnotation] != f.Name {
-			continue
+		if errors.Is(err, errdef.ErrNotFound) {
+			return "", fmt.Errorf("file %q not found in version %q: %w", f.Name, canonicalTag, errdef.ErrNotFound)
 		}
-		blobDesc, err := fetchBlobDescriptor(ctx, backend, refs[i])
-		if err != nil {
-			return "", err
-		}
-		return r.probeBlobRedirect(ctx, f, blobDesc)
+		return "", fmt.Errorf("failed to resolve file manifest tag: %w", err)
 	}
-
-	return "", fmt.Errorf("file %q not found in version: %w", f.Name, errdef.ErrNotFound)
+	blobDesc, err := fetchBlobDescriptor(ctx, backend, fileManifestDesc)
+	if err != nil {
+		return "", err
+	}
+	return r.probeBlobRedirect(ctx, f, blobDesc)
 }
 
 // probeBlobRedirect issues a HEAD against the backend's

@@ -92,6 +92,16 @@ type destRepo interface {
 	content.Tagger
 	content.Deleter
 	content.PredecessorFinder
+
+	// DeleteTag removes a single tag reference without otherwise
+	// touching the manifest it points to. Used by the deterministic
+	// file-tag cleanup paths so a deleted file manifest doesn't leave
+	// behind a dangling _f_* tag entry that ListTags would have to
+	// filter on every call. oras-go's public surface exposes manifest
+	// deletion by digest only, so the destRepo abstraction grows this
+	// one method and remoteRepo implements it via a direct HTTP
+	// DELETE against /v2/<repo>/manifests/<tag>.
+	DeleteTag(ctx context.Context, tag string) error
 }
 
 type Registry struct {
@@ -442,7 +452,7 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 		return nil, err
 	}
 
-	fileManifestDesc, err := r.pushFileManifest(ctx, backend, blobDesc, f.Name, versionDesc)
+	fileManifestDesc, err := r.pushFileManifest(ctx, backend, blobDesc, f.OwningTag, f.Name, versionDesc)
 	if err != nil {
 		return nil, err
 	}
@@ -455,6 +465,12 @@ func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*Fil
 	// referrers list until backend GC reaps it, but the live referrer
 	// scan in ReadFile may then return either manifest. That
 	// uncertainty is exactly what overwrite-mode opts into.
+	//
+	// The deterministic file tag was already retagged onto the new
+	// manifest by pushFileManifest (Tag is an overwrite, not a
+	// create), so there's no separate tag to untag here — the old
+	// manifest is reachable only via Referrers until the Delete below
+	// detaches it.
 	if oldFileManifest != nil && oldFileManifest.Digest != fileManifestDesc.Digest {
 		_ = backend.Delete(ctx, *oldFileManifest)
 	}
@@ -666,7 +682,15 @@ func (r *Registry) ensureVersionManifest(ctx context.Context, backend destRepo, 
 // pushFileManifest packs a file manifest with subject = versionDesc, single
 // layer = blobDesc, and the file's name + blob digest mirrored into manifest
 // annotations so the referrers index reflects them without an extra fetch.
-func (r *Registry) pushFileManifest(ctx context.Context, backend destRepo, blobDesc ocispec.Descriptor, fileName string, versionDesc ocispec.Descriptor) (ocispec.Descriptor, error) {
+//
+// After the manifest is pushed, the deterministic file tag derived from
+// (owningTag, fileName) is set on it so ReadFile and BlobRedirectURL can
+// resolve the file manifest in one round-trip instead of paying for the
+// version-manifest → Referrers → file-manifest descriptor walk on every
+// download. Tag is an overwrite (PUT /v2/<repo>/manifests/<tag>), so an
+// AddFile that replaces an existing file simply moves the tag onto the
+// new manifest atomically.
+func (r *Registry) pushFileManifest(ctx context.Context, backend destRepo, blobDesc ocispec.Descriptor, owningTag, fileName string, versionDesc ocispec.Descriptor) (ocispec.Descriptor, error) {
 	annotations := map[string]string{
 		FileNameAnnotation:      fileName,
 		ocispec.AnnotationTitle: fileName,
@@ -676,14 +700,28 @@ func (r *Registry) pushFileManifest(ctx context.Context, backend destRepo, blobD
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("failed to push file manifest for %q: %w", fileName, err)
 	}
+	if err := backend.Tag(ctx, desc, fileTagFor(owningTag, fileName)); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("failed to tag file manifest for %q: %w", fileName, err)
+	}
 	return desc, nil
 }
 
-// ReadFile reads a file by either OwningTag or RefTag. With OwningTag, the
-// version manifest is resolved directly and its file referrers are scanned
-// for a name match. With RefTag, the alias manifest is resolved first, its
-// subject followed to the canonical version manifest, and the same scan
-// runs from there.
+// ReadFile reads a file by either OwningTag or RefTag.
+//
+// With OwningTag, the file manifest is resolved directly via the
+// deterministic _f_<sha256(OwningTag\0Name)> tag that AddFile attaches.
+// That's two backend round-trips on the hot path (Resolve + Fetch
+// manifest) before the blob fetch, instead of the four serial RTTs the
+// old Resolve-version → Referrers → fetchBlobDescriptor → Fetch path
+// paid. At a 30ms backend RTT that's ~60ms saved per file, which
+// compounds into seconds across a cold `mvn dependency:resolve` or
+// `npm install`.
+//
+// With RefTag, the alias manifest is resolved first, the canonical
+// version tag is read out of its AliasTargetAnnotation, and the
+// deterministic file tag is computed against the canonical name. The
+// alias path keeps the extra round-trip to fetch the alias manifest
+// body but still skips the Referrers walk.
 func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, io.ReadCloser, error) {
 	if f.OwningTag == "" && f.RefTag == "" {
 		return nil, nil, fmt.Errorf("either OwningTag or RefTag must be set")
@@ -694,73 +732,70 @@ func (r *Registry) ReadFile(ctx context.Context, f *RepoFile) (*FileDescriptor, 
 		return nil, nil, err
 	}
 
-	versionDesc, err := r.resolveVersionDescriptor(ctx, backend, f)
+	canonicalTag, err := r.resolveCanonicalTag(ctx, backend, f)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	refs, err := registry.Referrers(ctx, backend, versionDesc, r.fileArtifactType)
+	fileManifestDesc, err := backend.Resolve(ctx, fileTagFor(canonicalTag, f.Name))
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list file referrers: %w", err)
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil, nil, fmt.Errorf("file %q not found in version %q: %w", f.Name, canonicalTag, errdef.ErrNotFound)
+		}
+		return nil, nil, fmt.Errorf("failed to resolve file manifest tag: %w", err)
 	}
-
-	for i := range refs {
-		if refs[i].Annotations[FileNameAnnotation] != f.Name {
-			continue
-		}
-		fileManifestDesc := refs[i]
-		blobDesc, err := fetchBlobDescriptor(ctx, backend, fileManifestDesc)
-		if err != nil {
-			return nil, nil, err
-		}
-		if f.Digest != "" && string(blobDesc.Digest) != f.Digest {
-			return nil, nil, fmt.Errorf("file digest mismatch: %q != %q", blobDesc.Digest, f.Digest)
-		}
-		rc, err := backend.Fetch(ctx, blobDesc)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch file blob: %w", err)
-		}
-		return &FileDescriptor{Manifest: fileManifestDesc, File: blobDesc}, rc, nil
+	blobDesc, err := fetchBlobDescriptor(ctx, backend, fileManifestDesc)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	return nil, nil, fmt.Errorf("file %q not found in version: %w", f.Name, errdef.ErrNotFound)
+	if f.Digest != "" && string(blobDesc.Digest) != f.Digest {
+		return nil, nil, fmt.Errorf("file digest mismatch: %q != %q", blobDesc.Digest, f.Digest)
+	}
+	rc, err := backend.Fetch(ctx, blobDesc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch file blob: %w", err)
+	}
+	return &FileDescriptor{Manifest: fileManifestDesc, File: blobDesc}, rc, nil
 }
 
-// resolveVersionDescriptor turns a RepoFile (which may identify the version
-// directly via OwningTag or indirectly via RefTag) into the descriptor of
-// the canonical version manifest. The RefTag path follows the alias
-// manifest's subject field.
-func (r *Registry) resolveVersionDescriptor(ctx context.Context, backend destRepo, f *RepoFile) (ocispec.Descriptor, error) {
+// resolveCanonicalTag turns a RepoFile that identifies a version either
+// directly (OwningTag) or via an alias (RefTag) into the canonical
+// version tag string. The string is what fileTagFor hashes; we don't
+// need the version manifest descriptor on the per-file read path because
+// the deterministic file tag short-circuits the Referrers walk.
+//
+// The alias path still pays one Resolve + one Fetch (to inspect the
+// alias manifest's AliasTargetAnnotation), but skips the Referrers list
+// that used to walk every file under the canonical version.
+func (r *Registry) resolveCanonicalTag(ctx context.Context, backend destRepo, f *RepoFile) (string, error) {
 	if f.OwningTag != "" {
-		desc, err := backend.Resolve(ctx, f.OwningTag)
-		if err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("failed to resolve version tag %q: %w", f.OwningTag, err)
-		}
-		return desc, nil
+		return f.OwningTag, nil
 	}
 
 	aliasDesc, err := backend.Resolve(ctx, f.RefTag)
 	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("failed to resolve alias tag %q: %w", f.RefTag, err)
+		return "", fmt.Errorf("failed to resolve alias tag %q: %w", f.RefTag, err)
 	}
 	var aliasManifest ocispec.Manifest
 	if err := fetchManifestJSON(ctx, backend, aliasDesc, &aliasManifest); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("failed to fetch alias manifest %q: %w", f.RefTag, err)
+		return "", fmt.Errorf("failed to fetch alias manifest %q: %w", f.RefTag, err)
 	}
 	if aliasManifest.ArtifactType != r.aliasArtifactType {
-		return ocispec.Descriptor{}, fmt.Errorf("%w: tag %q has artifactType %q (expected %q)", ErrAliasCollision, f.RefTag, aliasManifest.ArtifactType, r.aliasArtifactType)
+		return "", fmt.Errorf("%w: tag %q has artifactType %q (expected %q)", ErrAliasCollision, f.RefTag, aliasManifest.ArtifactType, r.aliasArtifactType)
 	}
-	if aliasManifest.Subject == nil {
-		return ocispec.Descriptor{}, fmt.Errorf("alias manifest %q has no subject", f.RefTag)
+	canonical := aliasManifest.Annotations[AliasTargetAnnotation]
+	if canonical == "" {
+		return "", fmt.Errorf("alias manifest %q is missing %s annotation", f.RefTag, AliasTargetAnnotation)
 	}
-	return *aliasManifest.Subject, nil
+	return canonical, nil
 }
 
-// ListTags lists the tags for a repository. Both canonical version tags
-// and alias tags are returned in the same flat list — the legacy ref_
-// prefix filter is gone. Callers that need version-vs-alias discrimination
-// should use a sibling helper (added when first needed; the current
-// in-tree caller is python's "index" repo, which has no aliases).
+// ListTags lists the tags for a repository. Canonical version tags and
+// alias tags are returned in the same flat list; deterministic file
+// tags (the _f_<sha256> entries AddFile attaches to each file manifest
+// so ReadFile can resolve a file in one round-trip) are filtered out
+// so callers see the same "versions + aliases" view they did before
+// the deterministic-tag fast path landed.
 //
 // 404 NAME_UNKNOWN responses (zot returns this for repositories that
 // have never been pushed to) are normalized to errdef.ErrNotFound so
@@ -772,7 +807,17 @@ func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) 
 		return nil, err
 	}
 	tags, err := registry.Tags(ctx, backend)
-	return tags, normalizeNotFound(err)
+	if err != nil {
+		return nil, normalizeNotFound(err)
+	}
+	out := tags[:0]
+	for _, t := range tags {
+		if isFileTag(t) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 // ListFiles enumerates all files across all canonical versions in repo.
@@ -793,6 +838,13 @@ func (r *Registry) ListFiles(ctx context.Context, repo string) ([]*RepoFile, err
 
 	var files []*RepoFile
 	for _, tag := range tags {
+		// Deterministic file tags (_f_<sha256>) point at file manifests
+		// directly; iterating over them would re-enter the file
+		// manifest scan and double-count every file. Skip them up
+		// front rather than relying on the artifactType filter below.
+		if isFileTag(tag) {
+			continue
+		}
 		versionDesc, err := backend.Resolve(ctx, tag)
 		if err != nil {
 			if errors.Is(err, errdef.ErrNotFound) {
@@ -932,6 +984,17 @@ func (r *Registry) deleteTagFiles(ctx context.Context, backend destRepo, tag str
 			return fmt.Errorf("failed to list referrers for tag %q: %w", tag, err)
 		}
 		for _, ref := range refs {
+			// Untag the deterministic file tag first so an in-flight
+			// reader that already resolved the tag is the only race
+			// window — without this, ListTags would keep returning
+			// _f_* entries that point at a soon-deleted digest. Only
+			// file manifests carry one; alias manifests don't, and
+			// the call is a no-op against a missing tag.
+			if name := ref.Annotations[FileNameAnnotation]; name != "" {
+				if err := backend.DeleteTag(ctx, fileTagFor(tag, name)); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+					return fmt.Errorf("failed to untag file %q: %w", name, err)
+				}
+			}
 			if err := backend.Delete(ctx, ref); err != nil && !errors.Is(err, errdef.ErrNotFound) {
 				return fmt.Errorf("failed to delete referrer %s: %w", ref.Digest, err)
 			}
@@ -1227,11 +1290,50 @@ func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error
 }
 
 // remoteRepo adapts oras-go's *remote.Repository to our destRepo
-// interface. The wrapper exists only so the package compiles when oras-go
-// adds further methods that conflict with destRepo's surface; today it is
-// a thin pass-through.
+// interface. The wrapper exists so we can attach DeleteTag — oras-go's
+// public surface only exposes manifest deletion by digest, but the OCI
+// distribution spec allows DELETE /v2/<repo>/manifests/<tag> to remove
+// the tag reference (leaving the underlying manifest alone if other
+// tags or referrers still pin it).
 type remoteRepo struct {
 	*remote.Repository
+}
+
+// DeleteTag issues a direct HTTP DELETE against
+// /v2/<repo>/manifests/<tag>. Used by the deterministic file-tag
+// cleanup paths so removed file manifests don't leave dangling _f_*
+// tags behind. A 404 from the backend is translated to
+// errdef.ErrNotFound so callers can use errors.Is to swallow
+// already-gone tags.
+func (r remoteRepo) DeleteTag(ctx context.Context, tag string) error {
+	ref := r.Repository.Reference
+	ref.Reference = tag
+	scheme := "https"
+	if r.Repository.PlainHTTP {
+		scheme = "http"
+	}
+	deleteURL := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, ref.Host(), ref.Repository, tag)
+
+	delCtx := auth.AppendRepositoryScope(ctx, ref, auth.ActionDelete)
+	req, err := http.NewRequestWithContext(delCtx, http.MethodDelete, deleteURL, nil)
+	if err != nil {
+		return fmt.Errorf("build delete-tag request: %w", err)
+	}
+	resp, err := r.Repository.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete tag %q: %w", tag, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
+	case http.StatusNotFound:
+		return errdef.ErrNotFound
+	default:
+		return fmt.Errorf("delete tag %q: backend returned %s", tag, resp.Status)
+	}
 }
 
 // newStreamPusher constructs a streamPusher that talks directly to the

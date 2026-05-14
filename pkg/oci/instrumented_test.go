@@ -76,14 +76,15 @@ func (f *fakeRecorder) backendOpStatuses() []string {
 // exercise the wrapper's classification logic against synthetic
 // successes and failures.
 type stubRepo struct {
-	pushErr    error
-	fetchErr   error
-	existsErr  error
-	resolveErr error
-	tagErr     error
-	deleteErr  error
-	tagsErr    error
-	predErr    error
+	pushErr      error
+	fetchErr     error
+	existsErr    error
+	resolveErr   error
+	tagErr       error
+	deleteErr    error
+	deleteTagErr error
+	tagsErr      error
+	predErr      error
 }
 
 func (s *stubRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
@@ -109,6 +110,9 @@ func (s *stubRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference s
 }
 func (s *stubRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
 	return s.deleteErr
+}
+func (s *stubRepo) DeleteTag(ctx context.Context, tag string) error {
+	return s.deleteTagErr
 }
 func (s *stubRepo) Tags(ctx context.Context, last string, fn func(tags []string) error) error {
 	return s.tagsErr
@@ -154,12 +158,13 @@ func TestInstrumentedRepo_LabelsByMediaTypeAndError(t *testing.T) {
 			want: []string{"fetch_blob:ok"},
 		},
 		{
-			name: "exists, resolve, tag, delete, list_tags, list_referrers",
+			name: "exists, resolve, tag, delete, delete_tag, list_tags, list_referrers",
 			exercise: func(repo destRepo) {
 				_, _ = repo.Exists(t.Context(), ocispec.Descriptor{})
 				_, _ = repo.Resolve(t.Context(), "tag")
 				_ = repo.Tag(t.Context(), ocispec.Descriptor{}, "tag")
 				_ = repo.Delete(t.Context(), ocispec.Descriptor{})
+				_ = repo.DeleteTag(t.Context(), "tag")
 				_ = repo.(interface {
 					Tags(ctx context.Context, last string, fn func(tags []string) error) error
 				}).Tags(t.Context(), "", func([]string) error { return nil })
@@ -172,6 +177,7 @@ func TestInstrumentedRepo_LabelsByMediaTypeAndError(t *testing.T) {
 				"resolve:ok",
 				"tag:ok",
 				"delete:ok",
+				"delete_tag:ok",
 				"list_tags:ok",
 				"list_referrers:ok",
 			},
