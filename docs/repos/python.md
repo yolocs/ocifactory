@@ -85,6 +85,35 @@ the dedicated client-integration job. Locally:
 go test -tags=integration ./pkg/handler/python/...
 ```
 
+## Retrying a failed `twine upload`
+
+`twine` issues one POST per file in `dist/`. If the run is interrupted
+partway through — TCP reset, CI timeout, killed process — the files
+that landed before the failure are durably on the backend and the rest
+are not. The release directory on the registry is partially populated.
+
+The safe retry is:
+
+```bash
+twine upload --skip-existing dist/*
+```
+
+`--skip-existing` makes `twine` treat ocifactory's `409 Conflict` (the
+default response for an immutable-add collision with
+`--allow-overwrite=false`) as "already there, move on" instead of
+erroring. Files that didn't land the first time get pushed cleanly;
+files that did land are skipped.
+
+If a file was *almost* uploaded but the digest mismatched, it's not on
+the backend at all — the blob upload aborts on digest mismatch and no
+manifest is written, so the re-upload pushes it cleanly. Per-file
+writes are atomic; there's no partial-byte intermediate state to worry
+about.
+
+See [`../operations/partial-uploads.md`](../operations/partial-uploads.md)
+for the full picture, including why per-version atomicity isn't a
+property either ocifactory or PyPI provides.
+
 ## OCI storage layout
 
 Two OCI repositories under `--backend-registry`:
