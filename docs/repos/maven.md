@@ -167,6 +167,53 @@ them in the dedicated client-integration job. Locally:
 go test -tags=integration ./pkg/handler/maven/...
 ```
 
+## Retrying a failed `mvn deploy`
+
+`mvn deploy` issues ~12 PUTs per artifact (jar, pom, sources, javadoc,
+their checksums, and the artifact-level `maven-metadata.xml`). If the
+run is interrupted partway through, the files that landed are durably
+on the backend and the rest are not — including, often,
+`maven-metadata.xml`, which `mvn` writes last.
+
+The right recovery depends on whether you're deploying a snapshot or a
+release.
+
+**Snapshot (`<version>-SNAPSHOT`):** snapshot versions are
+always-overwrite by design, so the safe retry is just:
+
+```bash
+mvn deploy
+```
+
+Every file that already landed gets overwritten with the new build's
+copy, and the files that didn't land get pushed. No additional flags
+needed.
+
+**Release (`<version>`, no `-SNAPSHOT`):** the safe retry depends on
+your overwrite policy.
+
+- If you run ocifactory with `--allow-overwrite=true` (which the
+  operator-requirement warning at the top of this doc says every
+  working Maven deployment needs anyway), re-running `mvn deploy`
+  works the same as for snapshots — it overwrites whatever landed
+  and pushes the rest.
+- If you need stricter release immutability, adopt a Sonatype-style
+  staging workflow: deploy first to a staging namespace (or a separate
+  ocifactory instance), validate end-to-end, then promote the
+  artifacts (`oras cp` or a publisher pipeline) to your release repo.
+  The staging repo absorbs the partial-deploy risk; the release repo
+  only ever sees complete sets.
+
+Either way, `mvn deploy -DretryFailedDeploymentCount=N` is worth
+enabling: it retries the *failing PUT* in-process without re-running
+the whole deploy. If the failure is network-level and the earlier
+PUTs landed cleanly, that's the cheapest recovery and skips
+everything above.
+
+See [`../operations/partial-uploads.md`](../operations/partial-uploads.md)
+for the full picture, including why per-version atomicity isn't a
+property the Maven 2 wire protocol provides on its own.
+
 ## OCI storage layout
 
 Each `(OCI repo, canonical tag)` tuple holds one version anchor
