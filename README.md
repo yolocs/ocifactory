@@ -66,8 +66,14 @@ client ──► handler/<format> ──► pkg/oci.Registry ──► OCI regis
 
 One Go binary. One process. Storage offloaded entirely to your OCI registry.
 Each artifact format gets its own `pkg/handler/<format>` package implementing
-the relevant protocol. See [`AGENTS.md`](AGENTS.md) for the full design notes
-and [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's coming.
+the relevant protocol.
+
+For the on-OCI shape — version anchors, file manifests, alias manifests, and
+why ocifactory uses the OCI 1.1 referrers layout instead of one fat manifest
+per version — see
+[`docs/architecture/storage-model.md`](docs/architecture/storage-model.md).
+See [`AGENTS.md`](AGENTS.md) for the full design notes and
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for what's coming.
 
 ## Contributing
 

@@ -72,12 +72,19 @@ HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)    │
                      └─────────────────────────────────────┘
 ```
 
+The on-OCI shape `pkg/oci` writes — version anchors, file manifests,
+alias manifests, the deterministic `_f_*` file tag, and why it's not a
+fat per-version manifest — is documented in
+[`docs/architecture/storage-model.md`](docs/architecture/storage-model.md).
+Read that doc before touching the `pkg/oci` write paths.
+
 ### Key types
 
 - `oci.RepoFile{OwningRepo, OwningTag, RefTag, Name, MediaType, Digest}` — addresses one file inside the OCI-backed virtual store.
   - `OwningRepo` is the OCI repository name (e.g. `packages/requests`, `com/foo/bar`).
-  - `OwningTag` is the canonical version tag (e.g. `2.31.0`). One OCI manifest per `OwningTag`; layers are the files in that version.
-  - `RefTag` is an alias tag like `latest`. Stored prefixed with `ref_` in the backend so `ListTags` can filter them out (callers see clean tag names).
+  - `OwningTag` is the canonical version tag (e.g. `2.31.0`). It identifies the **version manifest** — a constant-size anchor in the [OCI 1.1 referrers layout](docs/architecture/storage-model.md). Files for that version are *not* layers on this manifest; each file is its own **file manifest** with `subject = versionDesc`, addressed via the referrers API and tagged with a deterministic `_f_<sha256>` tag so reads resolve in one round-trip.
+  - `RefTag` is an alias tag like `latest`. It identifies an **alias manifest** with `subject = versionDesc` and the canonical version recorded in the `ocifactory.alias.target` annotation.
+  - The three manifest kinds are distinguished by `artifactType` suffix — `.version`, `.file`, `.alias` — appended to the operator-configured base type (e.g. `application/vnd.ocifactory.python.version`).
 - `handler.Registry` — the interface every per-format handler depends on. Keep it minimal; do not push format-specific concepts into it.
 - `cred.Cred` — credentials carried in the request `context.Context`. Today only `Basic`. When adding OAuth/OIDC/JWT, add a new field rather than overloading `Basic`.
 

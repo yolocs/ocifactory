@@ -1,10 +1,17 @@
 # Maven
 
 ocifactory speaks the [Maven 2 repository layout](https://maven.apache.org/repository/layout.html)
-that `mvn`, `gradle`, `sbt`, and friends already know. Each
-`(groupId, artifactId, version)` becomes one OCI manifest, and the files
-inside that version (jar, pom, sources, javadoc, checksum companions)
-become its layers.
+that `mvn`, `gradle`, `sbt`, and friends already know. Each uploaded
+file (jar, pom, sources, javadoc, checksum companion, `maven-metadata.xml`)
+becomes its own file manifest attached via `subject` to a per-version
+anchor manifest, so the dozen-plus PUTs `mvn deploy` fires for one
+release land independently and never read-modify-write each other.
+
+> **How it's stored on OCI:** see
+> [`docs/architecture/storage-model.md`](../architecture/storage-model.md).
+> That doc walks `mvn deploy` step-by-step through the manifests and
+> tags ocifactory writes for one release, including why the layout is
+> race-free under `mvn deploy -T <n>`.
 
 ## 🚨 Operator requirement: `--allow-overwrite=true`
 
@@ -162,10 +169,14 @@ go test -tags=integration ./pkg/handler/maven/...
 
 ## OCI storage layout
 
-ocifactory writes one OCI manifest per `(repo, tag)` tuple, with the
-uploaded files as layers. The mapping from Maven URL to OCI tuple:
+Each `(OCI repo, canonical tag)` tuple holds one version anchor
+manifest tagged with the canonical tag, plus one file manifest per
+uploaded file (subject-linked to the anchor, addressable via the
+OCI 1.1 referrers API, and individually tagged with a deterministic
+`_f_<sha256>` for fast reads). The mapping from Maven URL to the tuple
+the file lands under:
 
-| Maven URL | OCI repo | OCI tag | Layer name |
+| Maven URL | OCI repo | Canonical tag | File name on the file manifest |
 |---|---|---|---|
 | `/{groupId}/{artifactId}/{version}/{filename}` | `{groupId}/{artifactId}` | `{version}` | `{filename}` |
 | `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
@@ -174,9 +185,15 @@ uploaded files as layers. The mapping from Maven URL to OCI tuple:
 
 `{groupId}` keeps its slash form (`com/example/foo`), matching the URL.
 
-The OCI manifest `artifactType` is `application/vnd.ocifactory.maven`
-so a backend with multiple ocifactory tenants (or formats) can tell
-them apart.
+The base `artifactType` is `application/vnd.ocifactory.maven` and
+ocifactory appends `.version`, `.file`, and `.alias` suffixes to
+distinguish the three manifest kinds — operators inspecting the
+registry see e.g. `application/vnd.ocifactory.maven.file` on the JAR.
+
+For the manifest graph and a worked example walking `mvn deploy`'s
+~12 PUTs through to the per-file `AddFile` calls (and why parallel
+reactor mode `-T <n>` doesn't lose files), see
+[`docs/architecture/storage-model.md`](../architecture/storage-model.md).
 
 ## Checksum verification
 
