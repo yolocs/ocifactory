@@ -2,9 +2,17 @@
 
 ocifactory speaks the [npm registry HTTP protocol](https://github.com/npm/registry/blob/main/docs/REGISTRY-API.md)
 that `npm`, `yarn`, and `pnpm` already know. Storage is your OCI
-registry — one OCI manifest per `(package, version)` carrying the
-tarball and the version metadata as layers, plus a parallel `index`
-repo whose tags enumerate the packages you've published.
+registry — every published `(package, version)` writes a per-version
+anchor manifest plus two file manifests (the tarball and
+`package.json` metadata blob) attached via `subject`, with dist-tags
+landing as alias manifests on the same OCI repo. A parallel `index`
+repo's tags enumerate the packages you've published.
+
+> **How it's stored on OCI:** see
+> [`docs/architecture/storage-model.md`](../architecture/storage-model.md).
+> That doc walks the manifest graph (version anchor / file manifests /
+> alias manifests) end-to-end; the worked examples are for python and
+> maven, but npm uses the exact same shape.
 
 ## Quickstart
 
@@ -100,18 +108,29 @@ go test -tags=integration ./pkg/handler/npm/...
 
 Two OCI repositories per namespace under `--backend-registry`:
 
-| OCI repo | Tag | Layers |
+| OCI repo | Canonical tags | What's stored |
 |---|---|---|
-| `packages/u/<name>` | `<version>` | `<name>-<version>.tgz` (the tarball) and `package.json` (the version metadata). Used for unscoped packages. |
-| `packages/s/<scope>/<name>` | `<version>` | Same two layers; used for scoped (`@scope/name`) packages. |
-| `index` | `<encoded-name>` | A single sentinel layer (`name=present`, body=`"1"`). `ListTags("index")` is the package list. |
+| `packages/u/<name>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus two file manifests (tarball `<name>-<version>.tgz` and `package.json`) subject-linked to the anchor and addressable via the OCI 1.1 referrers API. Used for unscoped packages. |
+| `packages/s/<scope>/<name>` | `<version>` per release | Same shape; used for scoped (`@scope/name`) packages. |
+| `index` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"1"`). `ListTags("index")` is the package list. |
 
-Dist-tag aliases land as OCI alias tags on the same `packages/...`
-repo: `npm dist-tag add foo@1.0.0 latest` creates a `latest` alias
-pointing at the `1.0.0` version manifest, exactly the same shape
-python's `latest`/`stable` aliases use.
+Each file manifest also carries a deterministic `_f_<sha256>` tag so
+tarball downloads resolve in one round-trip.
 
-`artifactType` = `application/vnd.ocifactory.npm`.
+Dist-tag aliases land as alias manifests on the same `packages/...`
+repo, tagged with the dist-tag name: `npm dist-tag add foo@1.0.0 latest`
+creates a `latest` alias subject-linked to the `1.0.0` version anchor,
+with `ocifactory.alias.target = "1.0.0"` recorded as an annotation —
+exactly the same shape python's `latest`/`stable` aliases use.
+
+The base `artifactType` is `application/vnd.ocifactory.npm` and
+ocifactory appends `.version`, `.file`, and `.alias` suffixes to
+distinguish the three manifest kinds — operators inspecting the
+registry see e.g. `application/vnd.ocifactory.npm.alias` on the
+`latest` dist-tag.
+
+For the full manifest graph and worked examples, see
+[`docs/architecture/storage-model.md`](../architecture/storage-model.md).
 
 ### Name encoding
 

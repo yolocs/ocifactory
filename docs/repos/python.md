@@ -2,9 +2,15 @@
 
 ocifactory speaks the [PEP 503](https://peps.python.org/pep-0503/) /
 [PEP 691](https://peps.python.org/pep-0691/) "simple repository" protocol
-clients like `pip` and `twine` already know. Storage is your OCI registry —
-one OCI manifest per `(package, version)` and a parallel `index` repo whose
-tags enumerate the packages you've published.
+clients like `pip` and `twine` already know. Storage is your OCI
+registry — every uploaded wheel / sdist becomes its own file manifest
+attached via `subject` to a per-version anchor manifest, with a parallel
+`index` repo whose tags enumerate the packages you've published.
+
+> **How it's stored on OCI:** see
+> [`docs/architecture/storage-model.md`](../architecture/storage-model.md).
+> That doc walks `twine upload dist/*` step-by-step through the
+> manifests and tags ocifactory writes for one release.
 
 ## Quickstart
 
@@ -83,14 +89,22 @@ go test -tags=integration ./pkg/handler/python/...
 
 Two OCI repositories under `--backend-registry`:
 
-| OCI repo | Tag | Layers |
+| OCI repo | Canonical tags | What's stored |
 |---|---|---|
-| `packages/<pkg>` | `<version>` | The wheel / sdist files uploaded for that version (one layer per file). |
-| `index` | `<pkg>` | A single sentinel layer (`name=present`, body=`"1"`). The body is unused; `ListTags("index")` is the package list. |
+| `packages/<pkg>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus one file manifest per uploaded wheel / sdist (subject-linked to the version anchor and addressable via the OCI 1.1 referrers API). Each file manifest also carries a deterministic `_f_<sha256>` tag so reads resolve in one round-trip. |
+| `index` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"1"`). The body is unused; `ListTags("index")` is the package list. |
 
-`<pkg>` is always the PEP 503 normalised name. The OCI manifest
-`artifactType` is `application/vnd.ocifactory.python` so a backend with
-multiple ocifactory tenants (or formats) can tell them apart at a glance.
+`<pkg>` is always the PEP 503 normalised name. The base
+`artifactType` is `application/vnd.ocifactory.python` and ocifactory
+appends `.version`, `.file`, and `.alias` suffixes to distinguish the
+three manifest kinds — operators inspecting the registry see e.g.
+`application/vnd.ocifactory.python.file` and can tell at a glance.
+
+For the manifest graph (version anchor / file manifests / alias
+manifests), the read path that turns a file lookup into a single tag
+resolve, and a worked example tracing `twine upload dist/*` through to
+the per-file `AddFile` calls it produces, see
+[`docs/architecture/storage-model.md`](../architecture/storage-model.md).
 
 The `index` repo write is one sentinel **per package**, not per version.
 The first upload of a given package writes the sentinel; later uploads
