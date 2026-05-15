@@ -1,0 +1,185 @@
+# Goreleaser config for ocifactory. Drives the release pipeline:
+# linux/darwin x amd64/arm64 archives, multi-arch GHCR container,
+# CycloneDX SBOMs, sha256 checksums, cosign keyless signatures.
+#
+# Run locally for a smoke test:
+#   make snapshot
+# (which runs `goreleaser release --snapshot --clean --skip=publish`).
+
+version: 2
+
+project_name: 'ocifactory'
+
+before:
+  hooks:
+    - 'go mod download'
+
+builds:
+  - id: 'ocifactory'
+    main: './cmd/ocifactory'
+    binary: 'ocifactory'
+    env:
+      - 'CGO_ENABLED=0'
+    flags:
+      - '-trimpath'
+    ldflags:
+      # Stamp Version with a leading `v` so snapshot builds also
+      # carry their `v0.0.1-next-<sha>` identity. For tagged
+      # releases this equals `.Tag` (`v0.1.0`, `v0.1.0-rc.1`, ...).
+      - '-s -w'
+      - '-X github.com/yolocs/ocifactory/internal/version.Version=v{{ .Version }}'
+      - '-X github.com/yolocs/ocifactory/internal/version.Commit={{ .FullCommit }}'
+    # Pin binary mtime to the commit timestamp so the same source
+    # produces a byte-identical build regardless of when CI runs.
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    goos:
+      - 'linux'
+      - 'darwin'
+    goarch:
+      - 'amd64'
+      - 'arm64'
+
+archives:
+  - id: 'default'
+    ids:
+      - 'ocifactory'
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    formats:
+      - 'tar.gz'
+    files:
+      - 'LICENSE'
+      - 'README.md'
+      - 'RELEASING.md'
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: 'sha256'
+
+snapshot:
+  # Snapshot images get a `-next-<shortsha>` suffix so they cannot
+  # collide with a real release tag in anyone's local docker.
+  version_template: '{{ incpatch .Version }}-next-{{ .ShortCommit }}'
+
+# One docker build per arch (no buildx multi-arch in a single
+# invocation -- we assemble a manifest list below instead). Goreleaser
+# copies the produced binary into the build context, the Dockerfile
+# just COPYs it onto distroless static.
+dockers:
+  - id: 'ocifactory-amd64'
+    use: 'buildx'
+    goos: 'linux'
+    goarch: 'amd64'
+    dockerfile: 'Dockerfile.goreleaser'
+    image_templates:
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+    build_flag_templates:
+      - '--platform=linux/amd64'
+      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
+      - '--label=org.opencontainers.image.description=ocifactory artifact registry'
+      - '--label=org.opencontainers.image.url=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.source=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.documentation=https://github.com/yolocs/ocifactory/tree/main/docs'
+      - '--label=org.opencontainers.image.version={{ .Version }}'
+      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
+      - '--label=org.opencontainers.image.created={{ .Date }}'
+      - '--label=org.opencontainers.image.licenses=Apache-2.0'
+
+  - id: 'ocifactory-arm64'
+    use: 'buildx'
+    goos: 'linux'
+    goarch: 'arm64'
+    dockerfile: 'Dockerfile.goreleaser'
+    image_templates:
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
+    build_flag_templates:
+      - '--platform=linux/arm64'
+      - '--label=org.opencontainers.image.title={{ .ProjectName }}'
+      - '--label=org.opencontainers.image.description=ocifactory artifact registry'
+      - '--label=org.opencontainers.image.url=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.source=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.documentation=https://github.com/yolocs/ocifactory/tree/main/docs'
+      - '--label=org.opencontainers.image.version={{ .Version }}'
+      - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
+      - '--label=org.opencontainers.image.created={{ .Date }}'
+      - '--label=org.opencontainers.image.licenses=Apache-2.0'
+
+# Manifest list per published tag. `vX.Y.Z` is always published.
+# `vX.Y` and `latest` use `skip_push: auto` so prereleases (anything
+# with a `-rc.N` / `-beta.N` suffix) do not silently advance the
+# rolling-minor or latest pointer.
+docker_manifests:
+  - name_template: 'ghcr.io/yolocs/ocifactory:v{{ .Version }}'
+    image_templates:
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
+
+  - name_template: 'ghcr.io/yolocs/ocifactory:v{{ .Major }}.{{ .Minor }}'
+    skip_push: 'auto'
+    image_templates:
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
+
+  - name_template: 'ghcr.io/yolocs/ocifactory:latest'
+    skip_push: 'auto'
+    image_templates:
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
+
+sboms:
+  - id: 'archive'
+    artifacts: 'archive'
+    documents:
+      - '{{ .ArtifactName }}.sbom.cdx.json'
+
+# Keyless signing on archives. The workflow runs with id-token: write
+# so cosign mints a Sigstore certificate from the GitHub OIDC token.
+signs:
+  - id: 'archives'
+    cmd: 'cosign'
+    artifacts: 'archive'
+    signature: '${artifact}.sig'
+    certificate: '${artifact}.cert'
+    args:
+      - 'sign-blob'
+      - '--yes'
+      - '--output-signature=${signature}'
+      - '--output-certificate=${certificate}'
+      - '${artifact}'
+    output: true
+
+# Keyless signing on container manifests.
+docker_signs:
+  - id: 'manifests'
+    cmd: 'cosign'
+    artifacts: 'manifests'
+    args:
+      - 'sign'
+      - '--yes'
+      - '${artifact}'
+    output: true
+
+release:
+  github:
+    owner: 'yolocs'
+    name: 'ocifactory'
+  draft: false
+  # Auto-flag prereleases so the GitHub Release UI labels them
+  # accordingly. Matches the docker_manifests skip_push gating.
+  prerelease: 'auto'
+  name_template: '{{ .Tag }}'
+
+# Group commits by title prefix. `Features` and `Fixes` are the
+# headline groups; anything else (notably dependabot `Bump ...`
+# commits) falls through to `Other`.
+changelog:
+  use: 'github'
+  sort: 'asc'
+  groups:
+    - title: 'Features'
+      regexp: '^Add'
+      order: 0
+    - title: 'Fixes'
+      regexp: '^Fix'
+      order: 1
+    - title: 'Other'
+      order: 999

@@ -1,0 +1,11 @@
+# Minimal Dockerfile consumed by Goreleaser's `dockers:` block. The
+# build context contains only the already-compiled ocifactory binary
+# Goreleaser dropped in next to this file (see .dockerignore). Do not
+# `RUN` anything here -- distroless has no shell.
+FROM gcr.io/distroless/static:nonroot
+
+COPY ocifactory /usr/local/bin/ocifactory
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/ocifactory"]

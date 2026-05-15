@@ -1,0 +1,135 @@
+name: 'release'
+
+# Manual-only. A maintainer dispatches with a semver `version` input
+# and the workflow:
+#   1. validates the input matches the locked regex,
+#   2. creates and pushes an annotated git tag from that input,
+#   3. runs Goreleaser on the tag, which builds binaries + multi-arch
+#      GHCR image, signs everything with cosign keyless, and publishes
+#      the GitHub Release.
+#
+# There is no push/tag trigger by design -- releases are intentional.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. v0.1.0 or v0.1.0-rc.1.'
+        required: true
+        type: 'string'
+
+permissions:
+  contents: 'read'
+
+concurrency:
+  # Serialize release runs so we cannot race two dispatches against
+  # the same tag. `cancel-in-progress: false` because cancelling a
+  # mid-flight release that already pushed the tag would leave junk
+  # behind.
+  group: 'release'
+  cancel-in-progress: false
+
+jobs:
+  # Validate the version input against the locked regex before doing
+  # anything destructive (tag push, GHCR push, release creation).
+  validate:
+    name: 'validate'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Validate version input'
+        env:
+          INPUT_VERSION: '${{ inputs.version }}'
+        run: |
+          set -euo pipefail
+          if [[ ! "${INPUT_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '${INPUT_VERSION}' does not match ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?\$"
+            echo "Examples of valid inputs: v0.1.0, v1.2.3, v0.1.0-rc.1, v1.2.3-beta.2"
+            exit 1
+          fi
+          echo "version=${INPUT_VERSION} OK"
+
+  # Create and push the annotated tag. Maintainers never push tags by
+  # hand -- this keeps the release trail consistent.
+  tag:
+    name: 'tag'
+    needs: 'validate'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'write'
+    outputs:
+      tag: '${{ steps.create.outputs.tag }}'
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: 'Create and push annotated tag'
+        id: 'create'
+        env:
+          TAG: '${{ inputs.version }}'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} already exists locally"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} already exists on origin"
+            exit 1
+          fi
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+  # Build + sign + publish via Goreleaser. Runs on the freshly-pushed
+  # tag (checkout uses `ref: ${{ needs.tag.outputs.tag }}`) so
+  # Goreleaser sees the tag as the working-tree commit and stamps the
+  # binary accordingly.
+  goreleaser:
+    name: 'goreleaser'
+    needs: 'tag'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'write'   # publish the GitHub Release
+      packages: 'write'   # push to ghcr.io
+      id-token: 'write'   # cosign keyless OIDC
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+        with:
+          fetch-depth: 0
+          ref: '${{ needs.tag.outputs.tag }}'
+
+      - uses: 'actions/setup-go@v5' # ratchet:exclude
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: 'Set up QEMU (cross-arch container builds)'
+        uses: 'docker/setup-qemu-action@v3' # ratchet:exclude
+
+      - name: 'Set up Buildx'
+        uses: 'docker/setup-buildx-action@v3' # ratchet:exclude
+
+      - name: 'Log in to GHCR'
+        uses: 'docker/login-action@v3' # ratchet:exclude
+        with:
+          registry: 'ghcr.io'
+          username: '${{ github.actor }}'
+          password: '${{ secrets.GITHUB_TOKEN }}'
+
+      - name: 'Install syft (SBOM generator)'
+        uses: 'anchore/sbom-action/download-syft@v0' # ratchet:exclude
+
+      - name: 'Install cosign'
+        uses: 'sigstore/cosign-installer@v3' # ratchet:exclude
+
+      - name: 'Run Goreleaser'
+        uses: 'goreleaser/goreleaser-action@v6' # ratchet:exclude
+        with:
+          distribution: 'goreleaser'
+          version: '~> v2'
+          args: 'release --clean'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
