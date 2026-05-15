@@ -71,13 +71,14 @@ dockers:
     goarch: 'amd64'
     dockerfile: 'Dockerfile.goreleaser'
     image_templates:
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
     build_flag_templates:
       - '--platform=linux/amd64'
       - '--label=org.opencontainers.image.title={{ .ProjectName }}'
       - '--label=org.opencontainers.image.description=ocifactory artifact registry'
       - '--label=org.opencontainers.image.url=https://github.com/yolocs/ocifactory'
       - '--label=org.opencontainers.image.source=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.documentation=https://github.com/yolocs/ocifactory/tree/main/docs'
       - '--label=org.opencontainers.image.version={{ .Version }}'
       - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
       - '--label=org.opencontainers.image.created={{ .Date }}'
@@ -89,13 +90,14 @@ dockers:
     goarch: 'arm64'
     dockerfile: 'Dockerfile.goreleaser'
     image_templates:
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-arm64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
     build_flag_templates:
       - '--platform=linux/arm64'
       - '--label=org.opencontainers.image.title={{ .ProjectName }}'
       - '--label=org.opencontainers.image.description=ocifactory artifact registry'
       - '--label=org.opencontainers.image.url=https://github.com/yolocs/ocifactory'
       - '--label=org.opencontainers.image.source=https://github.com/yolocs/ocifactory'
+      - '--label=org.opencontainers.image.documentation=https://github.com/yolocs/ocifactory/tree/main/docs'
       - '--label=org.opencontainers.image.version={{ .Version }}'
       - '--label=org.opencontainers.image.revision={{ .FullCommit }}'
       - '--label=org.opencontainers.image.created={{ .Date }}'
@@ -106,22 +108,22 @@ dockers:
 # with a `-rc.N` / `-beta.N` suffix) do not silently advance the
 # rolling-minor or latest pointer.
 docker_manifests:
-  - name_template: 'ghcr.io/yolocs/ocifactory:{{ .Version }}'
+  - name_template: 'ghcr.io/yolocs/ocifactory:v{{ .Version }}'
     image_templates:
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-amd64'
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-arm64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
 
   - name_template: 'ghcr.io/yolocs/ocifactory:v{{ .Major }}.{{ .Minor }}'
     skip_push: 'auto'
     image_templates:
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-amd64'
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-arm64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
 
   - name_template: 'ghcr.io/yolocs/ocifactory:latest'
     skip_push: 'auto'
     image_templates:
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-amd64'
-      - 'ghcr.io/yolocs/ocifactory:{{ .Version }}-arm64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-amd64'
+      - 'ghcr.io/yolocs/ocifactory:v{{ .Version }}-arm64'
 
 sboms:
   - id: 'archive'
