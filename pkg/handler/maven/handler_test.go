@@ -536,6 +536,82 @@ func TestHandlePut_DefaultMaxUploadBytes(t *testing.T) {
 	}
 }
 
+// TestHandlePut_SnapshotOverwrite locks the snapshot-vs-release
+// overwrite contract: snapshot versions and per-version snapshot
+// metadata are always overwritable regardless of the registry's
+// --allow-overwrite default, while release versions still 409 by
+// default. This is the load-bearing contract for `mvn deploy` of a
+// snapshot version twice in a row against ocifactory's default
+// strict-overwrite config.
+func TestHandlePut_SnapshotOverwrite(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		registryOverwrite bool
+		path              string
+		wantSecondStatus  int
+	}{
+		{
+			name:              "snapshot jar overwrites under strict registry",
+			registryOverwrite: false,
+			path:              nsPath("/com/example/project/1.0-SNAPSHOT/project-1.0-SNAPSHOT.jar"),
+			wantSecondStatus:  http.StatusCreated,
+		},
+		{
+			name:              "snapshot jar with lowercase suffix overwrites under strict registry",
+			registryOverwrite: false,
+			path:              nsPath("/com/example/project/1.0-snapshot/project-1.0-snapshot.jar"),
+			wantSecondStatus:  http.StatusCreated,
+		},
+		{
+			name:              "release jar 409s under strict registry",
+			registryOverwrite: false,
+			path:              nsPath("/com/example/project/1.0/project-1.0.jar"),
+			wantSecondStatus:  http.StatusConflict,
+		},
+		{
+			name:              "release jar overwrites under permissive registry",
+			registryOverwrite: true,
+			path:              nsPath("/com/example/project/1.0/project-1.0.jar"),
+			wantSecondStatus:  http.StatusCreated,
+		},
+		{
+			name:              "per-version snapshot metadata overwrites under strict registry",
+			registryOverwrite: false,
+			path:              nsPath("/com/example/project/1.0-SNAPSHOT/maven-metadata.xml"),
+			wantSecondStatus:  http.StatusCreated,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := oci.NewFakeRegistry()
+			reg.AllowOverwrite = tc.registryOverwrite
+			h, _ := newTestHandler(t, reg)
+			m := h.Mux()
+
+			send := func(body string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPut, tc.path, strings.NewReader(body))
+				rec := httptest.NewRecorder()
+				m.ServeHTTP(rec, req)
+				return rec
+			}
+
+			if rec := send("first"); rec.Code != http.StatusCreated {
+				t.Fatalf("first PUT status=%d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+
+			rec := send("second")
+			if got, want := rec.Code, tc.wantSecondStatus; got != want {
+				t.Fatalf("second PUT status=%d, want %d (body=%s)", got, want, rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestHandlePut_ReuploadConflict locks the wire-level shape of the
 // re-upload contract for Maven uploads.
 func TestHandlePut_ReuploadConflict(t *testing.T) {

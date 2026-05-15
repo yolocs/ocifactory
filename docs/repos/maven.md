@@ -6,46 +6,49 @@ that `mvn`, `gradle`, `sbt`, and friends already know. Each
 inside that version (jar, pom, sources, javadoc, checksum companions)
 become its layers.
 
-## 🚨 Operator requirement: `--allow-overwrite=true`
+## Snapshots vs releases: overwrite semantics
 
-**You must run `--allow-overwrite=true` for any production Maven
-deployment.** The default `--allow-overwrite=false` rejects every
-re-upload with `409 Conflict`, which sounds reasonable but breaks
-`mvn deploy` on the second invocation of *any* artifact:
+ocifactory matches Maven's own immutability rules:
 
-`mvn` rewrites the artifact-level `maven-metadata.xml` (the file at
-`<groupId>/<artifactId>/maven-metadata.xml` that lists known versions)
-on every deploy as part of the standard release/snapshot workflow.
-With overwrite disabled the second push of that file 409s and the
-deploy fails. The same is true for the version-level metadata of
-snapshots.
+- **Snapshot versions** (any version ending in `-SNAPSHOT`,
+  case-insensitive) are **always overwritable**, regardless of the
+  registry's `--allow-overwrite` flag. The second `mvn deploy` of a
+  `1.0-SNAPSHOT` succeeds against the default
+  `--allow-overwrite=false`. This covers both the artifact files
+  themselves (jars, poms, sources, javadoc, checksums) and the
+  per-version `maven-metadata.xml` that tracks the latest timestamped
+  build under a unique-snapshot setup.
+- **Release versions** are **immutable by default**. A second deploy
+  of `1.0` returns `409 Conflict` unless you started ocifactory with
+  `--allow-overwrite=true`. Pass `--allow-overwrite=true` when you
+  need lax behaviour for releases too (e.g. fix-the-CI-job retries,
+  ephemeral staging) and add a CI gate of your own if you also want
+  immutable fixed-version releases.
 
-Concretely, run:
+The artifact-level `maven-metadata.xml`
+(`<groupId>/<artifactId>/maven-metadata.xml`) follows the same
+release-immutability rule. With the default `--allow-overwrite=false`
+the second rewrite of the artifact-level metadata 409s — workflows
+that rewrite it on every deploy (some `mvn deploy:deploy-file`
+invocations, custom uploaders) need `--allow-overwrite=true`.
+Snapshot CI workflows are unaffected because everything under a
+`-SNAPSHOT` version is always overwritable.
+
+A typical Maven server config:
 
 ```bash
 ocifactory serve \
   --repo-type=maven \
   --backend-registry=zot.local:5000/ocifactory \
-  --allow-overwrite=true \
   --authn-kind=oidc \
   --authn-oidc-issuers=https://accounts.google.com \
   --authn-oidc-audience=https://ocifactory.your-domain \
   --port=8080
 ```
 
-This loosens immutability for **every** Maven file type, not just
-metadata — operators who require immutable releases (production
-binaries that should never be silently re-published) should add a CI
-gate that refuses re-deploys of fixed-version artifacts. A future
-code-side fix that special-cases `maven-metadata.xml` for overwrite
-without affecting other files is tracked separately; until that lands,
-`--allow-overwrite=true` is the only way to run a working Maven
-ocifactory.
-
 ## Quickstart
 
-After starting the server with `--allow-overwrite=true` (above),
-configure `~/.m2/settings.xml`:
+After starting the server (above), configure `~/.m2/settings.xml`:
 
 ```xml
 <settings>
@@ -103,8 +106,8 @@ for resolve.
 |---|---|
 | `/{groupId}/{artifactId}/{version}/{filename}` | Regular artifact (jar, pom, sources, javadoc). |
 | `/{groupId}/{artifactId}/{version}/{filename}.{sha1,md5,sha256,sha512}` | Checksum companion. **Must arrive after the artifact it covers.** |
-| `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | Version-level snapshot metadata. |
-| `/{groupId}/{artifactId}/maven-metadata.xml` | Artifact-level metadata (mvn rewrites this on every deploy — see overwrite warning above). |
+| `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | Version-level snapshot metadata. Always overwritable (snapshot-mutable). |
+| `/{groupId}/{artifactId}/maven-metadata.xml` | Artifact-level metadata. Follows release-immutability semantics — see the [Snapshots vs releases](#snapshots-vs-releases-overwrite-semantics) section above. |
 | `/archetype-catalog.xml` | Global archetype catalog. |
 
 `{groupId}` is the dotted Java group with `.` rewritten to `/`
@@ -228,7 +231,7 @@ artifact. Tracked by [#49](https://github.com/yolocs/ocifactory/issues/49).
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--allow-overwrite` | `false` | **REQUIRED to set to `true` for any working Maven deployment** — see the warning at the top. |
+| `--allow-overwrite` | `false` | Whether to allow re-uploading release-version files. Snapshot versions (`-SNAPSHOT`) are *always* overwritable regardless of this flag — see [Snapshots vs releases](#snapshots-vs-releases-overwrite-semantics). Flip to `true` if your workflow also re-publishes the artifact-level `maven-metadata.xml` on every deploy. |
 | `--maven-max-upload-bytes` | `1073741824` (1 GiB) | Caps the total request body the upload endpoint accepts. Defends against an authenticated client streaming arbitrary bytes to burn instance hours / egress before the OCI backend rejects the layer. Set to `0` to disable; tighten for cost-sensitive deployments. Oversize requests are rejected with `413 Payload Too Large` before they touch the OCI backend. |
 | `--disable-streaming-push` | `false` | Force buffered+monolithic uploads through the OCI backend instead of chunked PATCH. Set only if your backend has broken chunked-PATCH support. |
 | `--disable-blob-redirect` | `false` | Disable `307` redirects to backend-issued presigned URLs on blob downloads. Set when exposing backend URLs to clients is unacceptable (egress restrictions, DLP, audit). |
@@ -257,7 +260,11 @@ are documented in [`docs/auth.md`](../auth.md) and
   no "stage to a sandbox repo, then promote to releases" feature.
 - **No pull-through caching of Maven Central.** Tracked under Phase 4
   of [`docs/ROADMAP.md`](../ROADMAP.md).
-- **`--allow-overwrite=true` loosens immutability for every file type.**
-  Operators who want immutable release jars should add a CI gate that
-  refuses re-deploys of fixed-version artifacts; ocifactory itself
-  does not distinguish "metadata" from "jar" once overwrite is on.
+- **`--allow-overwrite=true` loosens immutability for every release
+  file type.** Snapshot versions are always overwritable by design,
+  independent of the flag. Operators who want immutable release jars
+  but also need to re-publish the artifact-level `maven-metadata.xml`
+  should leave the flag at its default (`false`) and use a Maven
+  workflow that publishes only snapshots, or accept that toggling the
+  flag will let release artifacts be overwritten too and add a CI
+  gate that refuses re-deploys of fixed-version artifacts.

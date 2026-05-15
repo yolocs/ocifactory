@@ -5,6 +5,26 @@ import (
 	"strings"
 )
 
+// snapshotSuffix is Maven's case-insensitive sentinel that marks a
+// mutable version. We compare against the lower-case form because
+// `strings.EqualFold` allocates and Maven coordinates are ASCII.
+const snapshotSuffix = "-snapshot"
+
+// isSnapshotVersion reports whether version is a Maven snapshot
+// version. Maven's spec is unambiguous: a version is a snapshot iff it
+// ends with `-SNAPSHOT` (case-insensitive). Snapshot versions are
+// mutable by design — every `mvn deploy` either rewrites bytes (non-
+// unique snapshots) or updates the per-version maven-metadata.xml
+// (unique snapshots, Maven 3+ default) — so the handler opts into
+// per-call AllowOverwrite for them regardless of the registry's
+// default.
+func isSnapshotVersion(version string) bool {
+	if len(version) < len(snapshotSuffix) {
+		return false
+	}
+	return strings.EqualFold(version[len(version)-len(snapshotSuffix):], snapshotSuffix)
+}
+
 // validatePath rejects path components that contain traversal segments
 // (".", ".."), empty segments, or characters outside the conservative
 // Maven coordinate grammar [A-Za-z0-9._-] (with "/" only allowed inside

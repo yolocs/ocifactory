@@ -1281,6 +1281,110 @@ func TestAddFile_ReuploadAllowedWithOverwrite(t *testing.T) {
 	}
 }
 
+// TestAddFile_ReuploadPerCallOverwrite locks the per-call
+// RepoFile.AllowOverwrite contract: a true on the RepoFile loosens a
+// strict-default registry for that one call, a false on the RepoFile
+// cannot tighten a permissive registry, and the strict-default both-
+// false case still 409s. This is the load-bearing knob Maven uses to
+// flip overwrite on for snapshot versions while leaving release
+// immutability intact.
+func TestAddFile_ReuploadPerCallOverwrite(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	tests := []struct {
+		name              string
+		registryOverwrite bool
+		repoFileOverwrite bool
+		wantSecondErr     error
+	}{
+		{
+			name:              "strict registry, per-call true overwrites",
+			registryOverwrite: false,
+			repoFileOverwrite: true,
+			wantSecondErr:     nil,
+		},
+		{
+			name:              "strict registry, per-call false still 409s",
+			registryOverwrite: false,
+			repoFileOverwrite: false,
+			wantSecondErr:     ErrAlreadyExists,
+		},
+		{
+			name:              "permissive registry, per-call false still overwrites",
+			registryOverwrite: true,
+			repoFileOverwrite: false,
+			wantSecondErr:     nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var opts []RegistryOption
+			if tc.registryOverwrite {
+				opts = append(opts, WithAllowOverwrite(true))
+			}
+			r, err := NewRegistry(&url.URL{Scheme: "https", Host: "example.com"}, opts...)
+			if err != nil {
+				t.Fatalf("NewRegistry() error = %v", err)
+			}
+			memRepo := &inMemoryRepo{Store: memory.New(), allTags: map[string]string{}}
+			r.newBackendFunc = func(_ context.Context, _ *RepoFile) (destRepo, error) {
+				return memRepo, nil
+			}
+
+			f := &RepoFile{
+				OwningRepo:     "pkg",
+				OwningTag:      "1.0-SNAPSHOT",
+				Name:           "a.txt",
+				AllowOverwrite: tc.repoFileOverwrite,
+			}
+			if _, err := r.AddFile(ctx, f, strings.NewReader("first")); err != nil {
+				t.Fatalf("AddFile() first call error = %v", err)
+			}
+
+			second, err := r.AddFile(ctx, f, strings.NewReader("second"))
+			if tc.wantSecondErr != nil {
+				if !errors.Is(err, tc.wantSecondErr) {
+					t.Fatalf("AddFile() second call error = %v, want errors.Is %v", err, tc.wantSecondErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AddFile() second call error = %v, want nil", err)
+			}
+
+			files, err := r.ListFiles(ctx, "pkg")
+			if err != nil {
+				t.Fatalf("ListFiles() error = %v", err)
+			}
+			if got, want := len(files), 1; got != want {
+				t.Fatalf("ListFiles() = %d files, want %d (got: %+v)", got, want, files)
+			}
+
+			_, body, err := r.ReadFile(ctx, f)
+			if err != nil {
+				t.Fatalf("ReadFile() error = %v", err)
+			}
+			got, _ := io.ReadAll(body)
+			body.Close()
+			if string(got) != "second" {
+				t.Errorf("ReadFile() after overwrite = %q, want %q", got, "second")
+			}
+
+			tag := fileTagFor(f.OwningTag, f.Name)
+			memRepo.mu.Lock()
+			pointsAt := memRepo.allTags[tag]
+			memRepo.mu.Unlock()
+			if pointsAt != second.Manifest.Digest.String() {
+				t.Errorf("deterministic tag %q points at %q, want new manifest digest %q", tag, pointsAt, second.Manifest.Digest)
+			}
+		})
+	}
+}
+
 // TestAddFile_ReuploadDistinctNamesNotAffected proves the existence
 // probe scopes its match by Name: a second AddFile with a different
 // filename under the same OwningTag is the normal multi-file case

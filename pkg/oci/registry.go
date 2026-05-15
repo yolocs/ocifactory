@@ -293,6 +293,18 @@ type RepoFile struct {
 	// "unknown" sentinel of -1) means unknown and AddFile falls back to
 	// peeking up to uploadMemThreshold+1 bytes.
 	Size int64
+
+	// AllowOverwrite, when true, forces this single AddFile call to
+	// behave as if the registry was constructed with
+	// WithAllowOverwrite(true). The semantics are "force on, not force
+	// off": the effective policy is registry.allowOverwrite ||
+	// RepoFile.AllowOverwrite, so a per-call true cannot tighten a
+	// permissive registry, only loosen a strict one. Handlers that
+	// need format-specific overwrite (e.g. Maven snapshot versions)
+	// set this on the snapshot path and leave it false everywhere
+	// else, so release immutability stays intact under the registry's
+	// default.
+	AllowOverwrite bool
 }
 
 // FileDescriptor identifies a file within the OCI-backed registry. Manifest
@@ -420,13 +432,15 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 //     (artifactType ≠ versionArtifactType), AddFile returns
 //     ErrAliasCollision rather than silently overwriting the alias.
 //   - If a file with the same (OwningRepo, OwningTag, Name) already
-//     exists and the registry was constructed without
-//     WithAllowOverwrite(true), AddFile returns ErrAlreadyExists
-//     before the body is read so a rejected re-upload doesn't pay for
-//     a wasted upload. With WithAllowOverwrite(true), the previous
-//     file manifest is unlinked from the version's referrer set after
-//     the new one is pushed; readers only ever see one match per
-//     filename, even across overwrites.
+//     exists and neither the registry was constructed with
+//     WithAllowOverwrite(true) nor RepoFile.AllowOverwrite is set,
+//     AddFile returns ErrAlreadyExists before the body is read so a
+//     rejected re-upload doesn't pay for a wasted upload. When either
+//     the registry-level or per-call flag is on, the previous file
+//     manifest is unlinked from the version's referrer set after the
+//     new one is pushed; readers only ever see one match per
+//     filename, even across overwrites. The per-call flag only
+//     loosens — it cannot tighten an already-permissive registry.
 func (r *Registry) AddFile(ctx context.Context, f *RepoFile, ro io.Reader) (*FileDescriptor, error) {
 	if f.OwningTag == "" {
 		return nil, fmt.Errorf("OwningTag must be set")
@@ -521,11 +535,12 @@ func (r *Registry) probeExistingFile(ctx context.Context, f *RepoFile) (*ocispec
 	if err != nil {
 		return nil, fmt.Errorf("failed to list file referrers for %q: %w", f.OwningTag, err)
 	}
+	allowOverwrite := r.allowOverwrite || f.AllowOverwrite
 	for i := range refs {
 		if refs[i].Annotations[FileNameAnnotation] != f.Name {
 			continue
 		}
-		if !r.allowOverwrite {
+		if !allowOverwrite {
 			return nil, fmt.Errorf("%w: %s/%s/%s", ErrAlreadyExists, f.OwningRepo, f.OwningTag, f.Name)
 		}
 		return &refs[i], nil
