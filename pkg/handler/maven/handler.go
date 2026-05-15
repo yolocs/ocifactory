@@ -181,6 +181,11 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
+		// Per-version snapshot metadata is rewritten on every deploy
+		// (unique snapshots track the latest timestamped build).
+		// Always allow overwrite here so the second `mvn deploy` of a
+		// snapshot doesn't 409 on the metadata write.
+		AllowOverwrite: true,
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)
@@ -231,6 +236,13 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		OwningTag:  version,
 		Name:       filename,
 		MediaType:  detectMediaType(filename),
+		// Maven snapshot versions are mutable by design: non-unique
+		// snapshots overwrite the same artifact path on every deploy,
+		// and unique snapshots leave behind a per-version
+		// maven-metadata.xml that the snapshot-metadata route also
+		// rewrites. Release versions stay immutable and respect the
+		// registry-level --allow-overwrite default.
+		AllowOverwrite: isSnapshotVersion(version),
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)

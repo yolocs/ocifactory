@@ -153,3 +153,33 @@ func TestValidatePath(t *testing.T) {
 		})
 	}
 }
+
+func TestIsSnapshotVersion(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		version string
+		want    bool
+	}{
+		{name: "canonical snapshot", version: "1.0-SNAPSHOT", want: true},
+		{name: "lowercase snapshot", version: "1.0-snapshot", want: true},
+		{name: "mixed case snapshot", version: "1.0-SnApShOt", want: true},
+		{name: "multi segment snapshot", version: "1.0.0-RC1-SNAPSHOT", want: true},
+		{name: "release version", version: "1.0.0", want: false},
+		{name: "release with -RC1 qualifier", version: "1.0.0-RC1", want: false},
+		{name: "release with embedded SNAPSHOT not at end", version: "1.0-SNAPSHOT-final", want: false},
+		{name: "empty string", version: "", want: false},
+		{name: "shorter than suffix", version: "1.0", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := isSnapshotVersion(tc.version); got != tc.want {
+				t.Errorf("isSnapshotVersion(%q) = %v, want %v", tc.version, got, tc.want)
+			}
+		})
+	}
+}
