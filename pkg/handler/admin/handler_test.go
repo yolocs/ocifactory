@@ -119,6 +119,33 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			wantBody:   map[string]string{"error": "invalid proxy: proxy block must be empty on mode \"hosted\""},
 		},
 		{
+			// Filter is an opaque json.RawMessage today (concrete shape
+			// lands in #110), so unknown keys inside a filter object
+			// must NOT trip the DisallowUnknownFields top-level guard —
+			// otherwise an older binary would reject a body written by
+			// a newer binary that added typed filter fields. Pin that
+			// property here so a future refactor can't silently break
+			// the forward-compat contract.
+			name:       "put proxy with future filter fields",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/futureproxy",
+			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"future_filter_field":true,"nested":{"k":"v"}}]}}`,
+			wantStatus: http.StatusCreated,
+			wantBody: &namespace.Namespace{
+				Name: "futureproxy",
+				Spec: namespace.Spec{
+					SchemaVersion: namespace.CurrentSchemaVersion,
+					Mode:          namespace.ModeProxy,
+					Proxy: namespace.Proxy{
+						Upstream: "https://pypi.org",
+						Filters: []namespace.Filter{
+							[]byte(`{"future_filter_field":true,"nested":{"k":"v"}}`),
+						},
+					},
+				},
+			},
+		},
+		{
 			name:       "put malformed json",
 			method:     http.MethodPut,
 			path:       "/admin/v1/namespaces/badjson",

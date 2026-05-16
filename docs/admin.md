@@ -71,7 +71,7 @@ Names must satisfy:
 ```json
 {
   "schema_version": 1,
-  "mode": "hosted",
+  "mode": "proxy",
   "policy": {
     "readers": [
       {"issuer": "https://accounts.google.com"}
@@ -87,11 +87,13 @@ Names must satisfy:
 ```
 
 - `mode` selects the namespace's operating mode. `"hosted"` (the
-  default — empty resolves to hosted) stores artifacts uploaded by
-  clients and serves them back; `"proxy"` mirrors an upstream
-  registry on demand. Existing namespaces written before this field
-  was introduced load unchanged. On write, an explicit `"hosted"`
-  collapses to the empty default to keep the on-disk shape compact.
+  default) stores artifacts uploaded by clients and serves them back;
+  `"proxy"` mirrors an upstream registry on demand. The hosted
+  default is encoded by omitting the field — ocifactory canonicalises
+  an explicit `"hosted"` to the empty default on write, so a hosted
+  namespace's persisted body never contains a `mode` key. Subsequent
+  `GET` reflects the canonical form. Namespaces written before this
+  field was introduced load unchanged.
 - `policy.readers` / `policy.writers` are independent
   `SubjectMatcher` lists. **An entirely empty policy is deny-all** —
   a caller is allowed to perform an op only if at least one matcher
@@ -155,8 +157,8 @@ curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/pypi \
 ```
 
 Response: `201 Created`. Validation rejects `mode: "proxy"` without a
-parseable `proxy.upstream`, and rejects a `proxy` block on a hosted
-namespace (empty `mode` or explicit `"hosted"`).
+parseable `proxy.upstream`, and rejects a non-empty `proxy` block on
+a hosted namespace.
 
 ### Policy propagation
 
