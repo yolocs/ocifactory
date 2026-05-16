@@ -5,8 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
 // TestSpec_JSONRoundtrip pins the on-disk JSON shape so future spec
@@ -124,13 +126,14 @@ func TestSpec_JSONRoundtrip(t *testing.T) {
 				Mode: ModeProxy,
 				Proxy: Proxy{
 					Upstream: "https://registry.npmjs.org",
-					Filters: []Filter{
-						json.RawMessage(`{"type":"allowlist","patterns":["@myorg/*"]}`),
-						json.RawMessage(`{"type":"delay","min_age":"24h"}`),
+					Filters: filter.Filters{
+						&filter.Allowlist{Patterns: []string{"@myorg/*"}},
+						&filter.Denylist{Patterns: []string{"evil-*"}},
+						&filter.Delay{MinAge: 24 * time.Hour},
 					},
 				},
 			},
-			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"type":"allowlist","patterns":["@myorg/*"]},{"type":"delay","min_age":"24h"}]}}`,
+			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","patterns":["evil-*"]},{"kind":"delay","min_age":"24h0m0s"}]}}`,
 		},
 	}
 
@@ -262,8 +265,8 @@ func TestSpec_Validate_ModeAndProxy(t *testing.T) {
 			name: "proxy-with-empty-upstream-and-filters",
 			spec: Spec{
 				Mode: ModeProxy,
-				Proxy: Proxy{Filters: []Filter{
-					[]byte(`{"type":"allowlist"}`),
+				Proxy: Proxy{Filters: filter.Filters{
+					&filter.Allowlist{Patterns: []string{"foo"}},
 				}},
 			},
 			wantErr:         ErrInvalidProxy,
@@ -289,7 +292,9 @@ func TestSpec_Validate_ModeAndProxy(t *testing.T) {
 		{
 			name: "hosted-rejects-proxy-filters",
 			spec: Spec{
-				Proxy: Proxy{Filters: []Filter{[]byte(`{}`)}},
+				Proxy: Proxy{Filters: filter.Filters{
+					&filter.Allowlist{Patterns: []string{"foo"}},
+				}},
 			},
 			wantErr:         ErrInvalidProxy,
 			wantMsgContains: "proxy block must be empty",
