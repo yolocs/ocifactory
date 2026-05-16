@@ -85,6 +85,40 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			wantBody:   map[string]string{"error": "readers[0]: invalid policy: matcher must populate at least one field"},
 		},
 		{
+			name:   "put proxy namespace",
+			method: http.MethodPut,
+			path:   "/admin/v1/namespaces/pypi-proxy",
+			body: namespace.Spec{
+				Mode:  namespace.ModeProxy,
+				Proxy: namespace.Proxy{Upstream: "https://pypi.org"},
+			},
+			wantStatus: http.StatusCreated,
+			wantBody: &namespace.Namespace{
+				Name: "pypi-proxy",
+				Spec: namespace.Spec{
+					SchemaVersion: namespace.CurrentSchemaVersion,
+					Mode:          namespace.ModeProxy,
+					Proxy:         namespace.Proxy{Upstream: "https://pypi.org"},
+				},
+			},
+		},
+		{
+			name:       "put proxy without upstream",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/badproxy",
+			rawBody:    `{"mode":"proxy"}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": "invalid proxy: upstream is required on mode \"proxy\""},
+		},
+		{
+			name:       "put hosted with proxy block",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/badhosted",
+			rawBody:    `{"proxy":{"upstream":"https://pypi.org"}}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": "invalid proxy: proxy block must be empty on mode \"hosted\""},
+		},
+		{
 			name:       "put malformed json",
 			method:     http.MethodPut,
 			path:       "/admin/v1/namespaces/badjson",

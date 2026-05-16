@@ -174,6 +174,7 @@ func writeAdminError(ctx context.Context, w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, namespace.ErrInvalidName),
 		errors.Is(err, namespace.ErrInvalidPolicy),
+		errors.Is(err, namespace.ErrInvalidProxy),
 		errors.Is(err, namespace.ErrUnsupportedSchemaVersion):
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 	case errors.Is(err, namespace.ErrNotFound):

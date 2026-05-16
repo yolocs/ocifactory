@@ -39,12 +39,25 @@ type Spec struct {
 	// than silently dropping fields an older binary can't see.
 	SchemaVersion int `json:"schema_version,omitempty"`
 
+	// Mode selects the namespace's operating mode. [ModeHosted] is
+	// the historical (and only pre-Phase-4) behaviour; [ModeProxy]
+	// turns the namespace into a pull-through mirror of [Proxy.Upstream].
+	// Empty resolves to [ModeHosted] so existing namespaces load
+	// unchanged; [Spec.Normalize] canonicalises an explicit "hosted"
+	// back to empty to keep the on-disk shape compact.
+	Mode string `json:"mode,omitempty"`
+
 	// Policy is the authz block. An empty Policy is deny-all.
 	//
 	// omitzero (Go 1.24+) is required here: omitempty does not omit
 	// a zero-value struct, which would lock "policy":{} into the
 	// on-disk shape for every namespace that hasn't set a policy.
 	Policy Policy `json:"policy,omitzero"`
+
+	// Proxy is the pull-through proxy block. Only honored when [Mode]
+	// is [ModeProxy]; presence on a hosted namespace is rejected by
+	// [Spec.Validate].
+	Proxy Proxy `json:"proxy,omitzero"`
 
 	// Format is reserved for future format-specific knobs. Preserved
 	// across roundtrips so a newer ocifactory's keys aren't silently
@@ -64,15 +77,23 @@ func (s *Spec) Validate() error {
 	if v > CurrentSchemaVersion {
 		return fmt.Errorf("%w %d (this ocifactory understands up to %d)", ErrUnsupportedSchemaVersion, v, CurrentSchemaVersion)
 	}
-	return s.Policy.Validate()
+	if err := s.Policy.Validate(); err != nil {
+		return err
+	}
+	return s.Proxy.Validate(s.Mode)
 }
 
-// Normalize stamps [CurrentSchemaVersion] onto s. The admin write path
-// calls it before persisting so every body on disk carries an explicit
-// version. Idempotent.
+// Normalize stamps [CurrentSchemaVersion] onto s and canonicalises the
+// mode field so the on-disk shape stays compact for hosted namespaces
+// (explicit "hosted" collapses to empty, which loads back as
+// [ModeHosted] by default). The admin write path calls Normalize
+// before persisting. Idempotent.
 func (s *Spec) Normalize() {
 	if s == nil {
 		return
 	}
 	s.SchemaVersion = CurrentSchemaVersion
+	if s.Mode == ModeHosted {
+		s.Mode = ""
+	}
 }
