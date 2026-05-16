@@ -71,6 +71,7 @@ Names must satisfy:
 ```json
 {
   "schema_version": 1,
+  "mode": "proxy",
   "policy": {
     "readers": [
       {"issuer": "https://accounts.google.com"}
@@ -80,10 +81,19 @@ Names must satisfy:
        "email": "release-bot@myteam.example"}
     ]
   },
+  "proxy": { /* only honored when mode == "proxy"; see below */ },
   "format": { /* reserved for future format-specific knobs */ }
 }
 ```
 
+- `mode` selects the namespace's operating mode. `"hosted"` (the
+  default) stores artifacts uploaded by clients and serves them back;
+  `"proxy"` mirrors an upstream registry on demand. The hosted
+  default is encoded by omitting the field — ocifactory canonicalises
+  an explicit `"hosted"` to the empty default on write, so a hosted
+  namespace's persisted body never contains a `mode` key. Subsequent
+  `GET` reflects the canonical form. Namespaces written before this
+  field was introduced load unchanged.
 - `policy.readers` / `policy.writers` are independent
   `SubjectMatcher` lists. **An entirely empty policy is deny-all** —
   a caller is allowed to perform an op only if at least one matcher
@@ -95,6 +105,17 @@ Names must satisfy:
   your pattern already starts with `^` or ends with `$`, the anchor
   isn't duplicated. See [`auth.md`](auth.md#subjectmatcher-reference)
   for the full reference and worked examples.
+- `proxy.upstream` is the canonical URL of the upstream registry the
+  namespace mirrors (e.g. `https://pypi.org`,
+  `https://registry.npmjs.org`, `https://repo1.maven.org/maven2`).
+  Required when `mode` is `"proxy"`; must parse as an absolute
+  `http`/`https` URL. A `proxy` block on a hosted namespace is
+  rejected at validation.
+- `proxy.filters` is the ordered filter chain applied before any
+  upstream call (allowlist / denylist / publish-time delay). The
+  concrete shape lands in a follow-up issue; today ocifactory accepts
+  and roundtrips arbitrary filter JSON so an operator's spec written
+  for a newer ocifactory survives older binaries.
 - `format` is reserved for future format-specific knobs; ocifactory
   preserves it across roundtrips so a newer ocifactory's keys aren't
   silently dropped by an older one.
@@ -113,6 +134,31 @@ curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/myteam \
 
 Response: `201 Created` with the persisted document (including the
 `schema_version: 1` ocifactory stamped on write).
+
+### Worked example — create a proxy namespace
+
+A proxy namespace mirrors an upstream registry on demand. The data
+plane will not auto-discover this — every URL still lives under
+`/{namespace}/...`, but reads to it fetch from `proxy.upstream`
+through the per-format proxy code path (which lands in follow-up
+issues).
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/pypi \
+  -H 'content-type: application/json' \
+  -d '{
+        "mode": "proxy",
+        "proxy": {"upstream": "https://pypi.org"},
+        "policy": {
+          "readers":[{"issuer":"https://token.actions.githubusercontent.com",
+                      "sub_match":"repo:myorg/.+"}]
+        }
+      }'
+```
+
+Response: `201 Created`. Validation rejects `mode: "proxy"` without a
+parseable `proxy.upstream`, and rejects a non-empty `proxy` block on
+a hosted namespace.
 
 ### Policy propagation
 
