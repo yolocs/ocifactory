@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,18 +13,13 @@ import (
 	"github.com/yolocs/ocifactory/pkg/proxy"
 )
 
-// newTestClient builds a Client with the no-op sleep injected so
-// retry tests don't actually wait. Tests that want to assert on the
-// sleep durations pass their own collector via opts.sleep.
+// newTestClient builds a Client with a no-op wait so retry tests
+// don't actually sleep. Tests that want to observe backoff
+// durations install their own wait directly.
 func newTestClient(t *testing.T, opts Options) *Client {
 	t.Helper()
-	if opts.sleep == nil {
-		opts.sleep = func(time.Duration) {}
-	}
-	c, err := New(opts)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	c := New(opts)
+	c.wait = func(context.Context, time.Duration) error { return nil }
 	return c
 }
 
@@ -44,10 +38,7 @@ func readBody(t *testing.T, resp *Response) string {
 func TestNew_Defaults(t *testing.T) {
 	t.Parallel()
 
-	c, err := New(Options{})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	c := New(Options{})
 	if c.timeout != DefaultTimeout {
 		t.Errorf("timeout = %v, want %v", c.timeout, DefaultTimeout)
 	}
@@ -60,15 +51,15 @@ func TestNew_Defaults(t *testing.T) {
 	if c.maxBackoff != DefaultMaxBackoff {
 		t.Errorf("maxBackoff = %v, want %v", c.maxBackoff, DefaultMaxBackoff)
 	}
+	if c.wait == nil {
+		t.Errorf("wait is nil; expected ctxWait default")
+	}
 }
 
 func TestNew_NegativeRetriesDisables(t *testing.T) {
 	t.Parallel()
 
-	c, err := New(Options{MaxRetries: -1})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	c := New(Options{MaxRetries: -1})
 	if c.maxRetries != 0 {
 		t.Errorf("maxRetries = %d, want 0 (negative disables)", c.maxRetries)
 	}
@@ -222,9 +213,8 @@ func TestClient_Get_NoRetryOn4xx(t *testing.T) {
 func TestClient_Get_Timeout(t *testing.T) {
 	t.Parallel()
 
-	// Server sleeps longer than the client's per-request timeout. We
-	// disable retries to keep the total test wall time near the
-	// timeout itself.
+	// Server hangs longer than the client's per-request timeout. We
+	// disable retries to keep total wall time near the timeout.
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +248,6 @@ func TestClient_Get_ConditionalGet(t *testing.T) {
 
 	c := newTestClient(t, Options{})
 
-	// First call: no ETag → fresh response.
 	resp, err := c.Get(t.Context(), srv.URL, GetOptions{})
 	if err != nil {
 		t.Fatalf("first Get: %v", err)
@@ -273,8 +262,6 @@ func TestClient_Get_ConditionalGet(t *testing.T) {
 		t.Errorf("first body = %q, want %q", got, "fresh")
 	}
 
-	// Second call: pass the ETag back → 304 → NotModified surfaced
-	// to the caller without an error.
 	resp2, err := c.Get(t.Context(), srv.URL, GetOptions{IfNoneMatch: etag})
 	if err != nil {
 		t.Fatalf("conditional Get: %v", err)
@@ -342,9 +329,10 @@ func TestClient_Get_RedirectsFollowedWithinCap(t *testing.T) {
 func TestClient_Get_RedirectCapExceeded(t *testing.T) {
 	t.Parallel()
 
-	// Each request redirects back to the same URL; the client must
-	// surface ErrUpstreamMalformed once the cap is reached, not loop
-	// forever.
+	// Each request redirects back to the same URL. The client must
+	// surface ErrUpstreamMalformed once the cap is reached, not
+	// loop forever — and crucially NOT classify as unavailable, so
+	// callers don't waste retry budget on a redirect loop.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, r.URL.String(), http.StatusFound)
 	}))
@@ -355,8 +343,6 @@ func TestClient_Get_RedirectCapExceeded(t *testing.T) {
 	if !errors.Is(err, proxy.ErrUpstreamMalformed) {
 		t.Fatalf("err = %v, want ErrUpstreamMalformed", err)
 	}
-	// Critically, malformed is NOT classified as unavailable —
-	// retrying a redirect loop is useless.
 	if errors.Is(err, proxy.ErrUpstreamUnavailable) {
 		t.Errorf("err satisfies ErrUpstreamUnavailable, should be malformed-only")
 	}
@@ -430,9 +416,9 @@ func TestClient_Get_NetworkError(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	// Close immediately so the URL is unreachable for the upcoming
-	// Get. This exercises the dial-failure path without depending on
-	// firewall behaviour for a fixed-port "unreachable" address.
+	// Close immediately so the URL is unreachable. Exercises the
+	// dial-failure path without depending on firewall behaviour
+	// for a fixed-port "unreachable" address.
 	srv.Close()
 
 	c := newTestClient(t, Options{MaxRetries: -1})
@@ -461,21 +447,20 @@ func TestClient_Get_BackoffGrowsExponentially(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	var waits []time.Duration
-	c, err := New(Options{
+	c := New(Options{
 		MaxRetries:     3,
 		InitialBackoff: 10 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
-		sleep:          func(d time.Duration) { waits = append(waits, d) },
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	c.wait = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
 	}
-	_, err = c.Get(t.Context(), srv.URL, GetOptions{})
+	_, err := c.Get(t.Context(), srv.URL, GetOptions{})
 	if !errors.Is(err, proxy.ErrUpstreamUnavailable) {
 		t.Fatalf("err = %v, want ErrUpstreamUnavailable", err)
 	}
-	// 3 retries → 3 sleeps before attempts 1, 2, 3. Should be
-	// 10ms, 20ms, 40ms.
+	// 3 retries → 3 sleeps before attempts 1, 2, 3 → 10, 20, 40 ms.
 	want := []time.Duration{
 		10 * time.Millisecond,
 		20 * time.Millisecond,
@@ -500,24 +485,35 @@ func TestClient_Get_BackoffCappedAtMaxBackoff(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	var waits []time.Duration
-	c, err := New(Options{
+	c := New(Options{
 		MaxRetries:     5,
 		InitialBackoff: 100 * time.Millisecond,
 		MaxBackoff:     150 * time.Millisecond,
-		sleep:          func(d time.Duration) { waits = append(waits, d) },
 	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	c.wait = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
 	}
 	_, _ = c.Get(t.Context(), srv.URL, GetOptions{})
-	for i, w := range waits {
-		if w > 150*time.Millisecond {
-			t.Errorf("wait[%d] = %v exceeds max 150ms", i, w)
+	// Want: 100, 150, 150, 150, 150 — initial wait, then capped.
+	want := []time.Duration{
+		100 * time.Millisecond,
+		150 * time.Millisecond,
+		150 * time.Millisecond,
+		150 * time.Millisecond,
+		150 * time.Millisecond,
+	}
+	if len(waits) != len(want) {
+		t.Fatalf("waits = %v, want length %d", waits, len(want))
+	}
+	for i, w := range want {
+		if waits[i] != w {
+			t.Errorf("wait[%d] = %v, want %v", i, waits[i], w)
 		}
 	}
 }
 
-func TestClient_Get_ContextCancelStopsRetries(t *testing.T) {
+func TestClient_Get_PreCancelledContextReturnsCallerError(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -526,19 +522,82 @@ func TestClient_Get_ContextCancelStopsRetries(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	cancel() // pre-cancel so the first ctx.Err() in the loop fires.
+	cancel() // cancel before any upstream attempt happens.
 
 	c := newTestClient(t, Options{MaxRetries: 3})
 	_, err := c.Get(ctx, srv.URL, GetOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	// Caller-side cancel BEFORE any upstream call must NOT be
+	// classified as upstream unavailable.
+	if errors.Is(err, proxy.ErrUpstreamUnavailable) {
+		t.Errorf("err = %v wrongly satisfies ErrUpstreamUnavailable for caller-side cancel", err)
+	}
+}
+
+func TestClient_Get_MidLoopCancelPreservesLastErr(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	c := New(Options{MaxRetries: 3})
+	// Cancel the outer context during the first backoff so the
+	// loop exits after at least one upstream failure.
+	c.wait = func(_ context.Context, _ time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+	_, err := c.Get(ctx, srv.URL, GetOptions{})
+
+	// Both the upstream failure and the cancellation contributed
+	// to giving up; the error chain must surface both.
 	if !errors.Is(err, proxy.ErrUpstreamUnavailable) {
-		t.Fatalf("err = %v, want ErrUpstreamUnavailable", err)
+		t.Errorf("err = %v, want chain to include ErrUpstreamUnavailable (lastErr preserved)", err)
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want chain to include context.Canceled", err)
 	}
 }
 
-func TestClient_Get_BodyCloseReleasesTimeoutContext(t *testing.T) {
+func TestClient_Get_CancelDuringBackoffStopsRetriesPromptly(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Use the real ctxWait (don't override). A very long
+	// InitialBackoff would normally pin the goroutine; the
+	// context cancel must wake the wait.
+	c := New(Options{
+		MaxRetries:     3,
+		InitialBackoff: 10 * time.Second,
+		MaxBackoff:     10 * time.Second,
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	// Cancel after a short delay so the first attempt completes
+	// (5xx → enter backoff) and the cancel fires during the wait.
+	time.AfterFunc(20*time.Millisecond, cancel)
+
+	start := time.Now()
+	_, err := c.Get(ctx, srv.URL, GetOptions{})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Get took %v; expected ctx cancel to wake backoff in well under InitialBackoff", elapsed)
+	}
+}
+
+func TestClient_Get_BodyCloseCancelsRequestContext(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -546,25 +605,33 @@ func TestClient_Get_BodyCloseReleasesTimeoutContext(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := newTestClient(t, Options{})
+	// Capture the per-request context via a custom transport so
+	// we can directly observe whether Close cancels it.
+	var capturedCtx context.Context
+	rt := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		capturedCtx = r.Context()
+		return http.DefaultTransport.RoundTrip(r)
+	})
+
+	c := newTestClient(t, Options{Transport: rt})
 	resp, err := c.Get(t.Context(), srv.URL, GetOptions{})
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	body, ok := resp.Body.(*cancelingBody)
-	if !ok {
-		t.Fatalf("resp.Body has type %T, want *cancelingBody", resp.Body)
+	if capturedCtx == nil {
+		t.Fatalf("transport did not capture request context")
 	}
-	// Closing must run the underlying body's Close AND the cancel
-	// func. We can't observe the cancel from outside cleanly, so
-	// re-read after close to confirm it errors instead of hanging.
-	if err := body.Close(); err != nil {
+	if err := capturedCtx.Err(); err != nil {
+		t.Fatalf("captured ctx already cancelled before Close: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
-	if _, err := io.ReadAll(body); err == nil {
-		// Reading a closed body returns an error; absence here would
-		// mean we never actually closed.
-		t.Errorf("ReadAll after Close: err = nil, want non-nil")
+	select {
+	case <-capturedCtx.Done():
+		// expected: Close ran the per-request cancel func.
+	default:
+		t.Errorf("per-request context not cancelled after Body.Close()")
 	}
 }
 
@@ -576,9 +643,9 @@ func TestClient_Get_TransportOverride(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	// A trivial RoundTripper that rewrites every request to point at
-	// srv. Exercises the Transport option without needing a custom
-	// proxy server.
+	// Trivial RoundTripper that rewrites every request to point at
+	// srv. Exercises the Transport option without needing a
+	// custom proxy server.
 	rt := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		newURL := srv.URL + r.URL.Path
 		newReq, err := http.NewRequestWithContext(r.Context(), r.Method, newURL, r.Body)
@@ -595,28 +662,6 @@ func TestClient_Get_TransportOverride(t *testing.T) {
 	}
 	if got := readBody(t, resp); got != "ok" {
 		t.Errorf("body = %q, want %q", got, "ok")
-	}
-}
-
-func TestClient_Get_5xxErrorBodyDoesNotLeak(t *testing.T) {
-	t.Parallel()
-
-	// Hand a large body with each 5xx so a leaked body would be
-	// observable (the connection wouldn't be reused; we'd see fewer
-	// hits than retries on a kept-alive server). The simpler signal:
-	// after retries the client returns the sentinel without exposing
-	// the 5xx body. We rely on the drain-and-close in Get; this test
-	// asserts the contract by checking the sentinel.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-		io.WriteString(w, strings.Repeat("x", 1<<14))
-	}))
-	t.Cleanup(srv.Close)
-
-	c := newTestClient(t, Options{MaxRetries: 2})
-	_, err := c.Get(t.Context(), srv.URL, GetOptions{})
-	if !errors.Is(err, proxy.ErrUpstreamUnavailable) {
-		t.Fatalf("err = %v, want ErrUpstreamUnavailable", err)
 	}
 }
 

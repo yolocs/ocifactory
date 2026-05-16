@@ -1,20 +1,6 @@
-// Package proxy defines the shared building blocks the per-format
-// proxy fetchers under pkg/proxy/<format> use.
-//
-// v1 ships a small, deliberate surface:
-//
-//   - the typed upstream errors defined here, which per-format fetchers
-//     wrap with %w so handler code can classify failures uniformly
-//     (errors.Is) without learning each upstream's error vocabulary;
-//   - the HTTP client utility in pkg/proxy/httpclient, which provides
-//     timeouts, bounded retries, conditional GET, and a redirect cap.
-//
-// There is intentionally no Fetcher interface. The three upstream
-// APIs (PyPI HTML/JSON, npm packument JSON, Maven Central XML)
-// don't normalize usefully and nothing in the codebase dispatches
-// generically over fetchers. Each format owns its own concrete
-// Fetcher type. If real overlap emerges later, an interface can be
-// extracted then.
+// Package proxy holds the shared building blocks (typed upstream
+// errors here; the HTTP client in pkg/proxy/httpclient) that the
+// per-format proxy fetchers under pkg/proxy/<format> compose.
 package proxy
 
 import "errors"

@@ -1,12 +1,11 @@
-// Package httpclient is the shared HTTP client every per-format
-// proxy fetcher under pkg/proxy/<format> composes.
+// Package httpclient is the shared HTTP client per-format proxy
+// fetchers under pkg/proxy/<format> compose. A Client applies a
+// per-request timeout, bounded retries with exponential backoff on
+// transient upstream failures, conditional GET (ETag /
+// Last-Modified), and a hard redirect cap.
 //
-// A Client applies a per-request timeout, bounded retries with
-// exponential backoff on transient upstream failures, conditional
-// GET (ETag / Last-Modified), and a hard redirect cap.
-//
-// Error classification is deliberately coarse and lives here so
-// per-format fetchers don't each reinvent it:
+// Error classification lives here so per-format fetchers don't each
+// reinvent it:
 //
 //   - 304 Not Modified surfaces as Response.NotModified == true,
 //     never as an error.
@@ -19,6 +18,10 @@
 //     body intact; the per-format fetcher decides which codes map
 //     to proxy.ErrNotFound and which to other format-specific
 //     sentinels.
+//   - Caller-side cancellation (ctx.Err() != nil before any
+//     upstream call) surfaces unwrapped so errors.Is(err,
+//     context.Canceled) is true without errors.Is(err,
+//     proxy.ErrUpstreamUnavailable).
 //
 // A Client is safe for concurrent use by multiple goroutines.
 package httpclient
@@ -36,20 +39,18 @@ import (
 
 const (
 	// DefaultTimeout is the per-request timeout applied to each
-	// individual attempt (the original call and every retry).
+	// individual attempt (original call and every retry).
 	DefaultTimeout = 30 * time.Second
 
-	// DefaultMaxRetries is the number of additional attempts the
-	// client makes after a retryable failure. The first attempt is
-	// not counted; total request count is 1 + MaxRetries.
+	// DefaultMaxRetries is the number of additional attempts after a
+	// retryable failure. Total request count is 1 + MaxRetries.
 	DefaultMaxRetries = 3
 
-	// DefaultMaxRedirects caps the redirect chain the client will
-	// follow. Anything beyond surfaces as proxy.ErrUpstreamMalformed.
+	// DefaultMaxRedirects caps the redirect chain. Beyond this the
+	// client surfaces proxy.ErrUpstreamMalformed.
 	DefaultMaxRedirects = 10
 
 	// DefaultInitialBackoff is the wait before the first retry.
-	// Subsequent retries double the wait, capped at MaxBackoff.
 	DefaultInitialBackoff = 250 * time.Millisecond
 
 	// DefaultMaxBackoff caps exponential backoff growth.
@@ -57,13 +58,9 @@ const (
 )
 
 // Credential is the optional upstream credential a Client attaches
-// to each request.
-//
-// v1 leaves the credential UNUSED — the field exists on Options so
-// that adding authenticated upstreams later does not reshape the
-// constructor. When v1.x grows real credential support the rule
-// will be: BearerToken wins over Username/Password; an empty
-// Credential is the "anonymous" call public registries accept.
+// to each request. v1 leaves the credential UNUSED — the field
+// exists on Options so adding authenticated upstreams later does
+// not reshape the constructor.
 type Credential struct {
 	Username    string
 	Password    string
@@ -81,21 +78,19 @@ type Options struct {
 	// Zero falls back to DefaultTimeout.
 	Timeout time.Duration
 
-	// MaxRetries bounds retry attempts on transient failures
-	// (network errors, per-request timeouts, and 5xx responses).
+	// MaxRetries bounds retry attempts on transient failures.
 	// Zero falls back to DefaultMaxRetries; a negative value
 	// disables retries entirely. 4xx is never retried.
 	MaxRetries int
 
 	// MaxRedirects caps the redirect chain. Zero falls back to
 	// DefaultMaxRedirects; a negative value disables redirect
-	// following entirely (the redirect response is returned to the
-	// caller as-is).
+	// following (the redirect response is returned as-is).
 	MaxRedirects int
 
-	// InitialBackoff is the wait before the first retry. Subsequent
-	// retries double the wait, capped at MaxBackoff. Zero falls
-	// back to DefaultInitialBackoff.
+	// InitialBackoff is the wait before the first retry; doubles
+	// on subsequent retries up to MaxBackoff. Zero falls back to
+	// DefaultInitialBackoff.
 	InitialBackoff time.Duration
 
 	// MaxBackoff caps exponential backoff growth. Zero falls back
@@ -111,16 +106,8 @@ type Options struct {
 	Credential Credential
 
 	// Transport overrides the http.RoundTripper used to send
-	// requests. Defaults to http.DefaultTransport. Provided
-	// primarily so tests can drop in an httptest server; production
-	// code rarely needs to set it.
+	// requests. Defaults to http.DefaultTransport.
 	Transport http.RoundTripper
-
-	// sleep is the wait function used between retries. nil falls
-	// back to time.Sleep; tests inject a no-op or counting
-	// implementation. Kept unexported so it doesn't pollute the
-	// public knob list.
-	sleep func(time.Duration)
 }
 
 // Client is the configured HTTP client per-format proxy fetchers
@@ -133,12 +120,16 @@ type Client struct {
 	maxBackoff     time.Duration
 	userAgent      string
 	credential     Credential
-	sleep          func(time.Duration)
+
+	// wait blocks for d or until ctx is cancelled. Tests replace
+	// it with a no-op (to skip real sleeps) or a collector (to
+	// assert backoff durations). Kept off Options so the test seam
+	// doesn't pollute the public config surface.
+	wait func(ctx context.Context, d time.Duration) error
 }
 
-// New constructs a Client from opts. Returning an error is reserved
-// for future configuration that may be invalid; v1 always succeeds.
-func New(opts Options) (*Client, error) {
+// New constructs a Client from opts.
+func New(opts Options) *Client {
 	timeout := opts.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -162,10 +153,6 @@ func New(opts Options) (*Client, error) {
 	if maxBackoff <= 0 {
 		maxBackoff = DefaultMaxBackoff
 	}
-	sleep := opts.sleep
-	if sleep == nil {
-		sleep = time.Sleep
-	}
 	transport := opts.Transport
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -182,14 +169,12 @@ func New(opts Options) (*Client, error) {
 	}
 
 	return &Client{
+		// No client-level Timeout: timeouts are applied per attempt
+		// via context.WithTimeout so they compose with the caller's
+		// own deadline and bound body reading.
 		inner: &http.Client{
 			Transport:     transport,
 			CheckRedirect: checkRedirect,
-			// No client-level Timeout: we apply timeouts per
-			// attempt via context.WithTimeout. A client-level
-			// timeout would also abort body reads, which is fine,
-			// but a context-based one composes with the caller's
-			// own deadline.
 		},
 		timeout:        timeout,
 		maxRetries:     maxRetries,
@@ -197,8 +182,8 @@ func New(opts Options) (*Client, error) {
 		maxBackoff:     maxBackoff,
 		userAgent:      opts.UserAgent,
 		credential:     opts.Credential,
-		sleep:          sleep,
-	}, nil
+		wait:           ctxWait,
+	}
 }
 
 // GetOptions tunes a single Get call.
@@ -210,7 +195,7 @@ type GetOptions struct {
 
 	// IfModifiedSince, when non-empty, is sent as the
 	// If-Modified-Since request header. Formatting (HTTP-date) is
-	// the caller's responsibility — usually echoing back the
+	// the caller's responsibility — usually echoing the
 	// Last-Modified header from a previous response.
 	IfModifiedSince string
 
@@ -236,12 +221,12 @@ type Response struct {
 	Body io.ReadCloser
 
 	// ETag is the response's ETag header value (empty if absent),
-	// for the caller to store and pass back via
-	// GetOptions.IfNoneMatch on a later conditional GET.
+	// for the caller to pass back via GetOptions.IfNoneMatch on a
+	// later conditional GET.
 	ETag string
 
 	// LastModified is the response's Last-Modified header value
-	// (empty if absent), for the caller to store and pass back via
+	// (empty if absent), for the caller to pass back via
 	// GetOptions.IfModifiedSince on a later conditional GET.
 	LastModified string
 
@@ -250,21 +235,19 @@ type Response struct {
 }
 
 // Get fetches rawURL, applying retries, conditional GET, and the
-// configured redirect cap.
-//
-// See the package doc for the error-classification rules.
+// configured redirect cap. See the package doc for error
+// classification rules.
 func (c *Client) Get(ctx context.Context, rawURL string, opts GetOptions) (*Response, error) {
 	backoff := c.initialBackoff
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return nil, lastErr
-			}
-			return nil, fmt.Errorf("%w: %w", proxy.ErrUpstreamUnavailable, err)
+			return nil, ctxErr(lastErr, err)
 		}
 		if attempt > 0 {
-			c.sleep(backoff)
+			if err := c.wait(ctx, backoff); err != nil {
+				return nil, ctxErr(lastErr, err)
+			}
 			backoff *= 2
 			if backoff > c.maxBackoff {
 				backoff = c.maxBackoff
@@ -280,8 +263,9 @@ func (c *Client) Get(ctx context.Context, rawURL string, opts GetOptions) (*Resp
 			return nil, err
 		}
 		if resp.StatusCode >= 500 {
-			// Drain & close so the connection can be reused on the
-			// next attempt.
+			// Drain so the underlying connection can be reused on
+			// the next attempt; bounded by the per-request context
+			// the body still carries.
 			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("%w: upstream returned %d", proxy.ErrUpstreamUnavailable, resp.StatusCode)
@@ -289,10 +273,20 @@ func (c *Client) Get(ctx context.Context, rawURL string, opts GetOptions) (*Resp
 		}
 		return resp, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("%w: exhausted retries", proxy.ErrUpstreamUnavailable)
-	}
+	// Loop exit without return implies every iteration continued,
+	// each of which sets lastErr — so lastErr is non-nil here.
 	return nil, lastErr
+}
+
+// ctxErr blends a prior upstream failure (lastErr) with a context
+// error (cause) into a single chain. When lastErr is nil the caller
+// cancelled before any upstream attempt completed, so the cause is
+// purely a caller-side cancel and surfaces unwrapped.
+func ctxErr(lastErr, cause error) error {
+	if lastErr == nil {
+		return cause
+	}
+	return fmt.Errorf("%w: %w", lastErr, cause)
 }
 
 func (c *Client) do(ctx context.Context, rawURL string, opts GetOptions) (*Response, error) {
@@ -320,19 +314,22 @@ func (c *Client) do(ctx context.Context, rawURL string, opts GetOptions) (*Respo
 	resp, err := c.inner.Do(req)
 	if err != nil {
 		cancel()
-		// CheckRedirect's malformed sentinel surfaces unchanged so
-		// the caller can classify it without learning Go's url.Error
-		// wrapping rules. Anything else (DNS, dial, transport,
-		// context cancel/timeout) is "upstream unavailable".
+		// Defensive: net/http's docs say Body is closed when
+		// CheckRedirect returns an error, but it costs us nothing
+		// to be explicit and protect against future changes.
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 		if errors.Is(err, proxy.ErrUpstreamMalformed) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w: %w", proxy.ErrUpstreamUnavailable, err)
 	}
 
-	// Do NOT call cancel() yet — the per-request timeout must outlive
-	// the response so it bounds body reading too. Wrap the body so
-	// closing it releases the context.
+	// Do NOT call cancel() yet — the per-request timeout must
+	// outlive the response so it bounds body reading too. Closing
+	// the body releases the context.
 	return &Response{
 		StatusCode:   resp.StatusCode,
 		Header:       resp.Header,
@@ -343,10 +340,21 @@ func (c *Client) do(ctx context.Context, rawURL string, opts GetOptions) (*Respo
 	}, nil
 }
 
+// ctxWait blocks for d or returns early on ctx cancellation.
+func ctxWait(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // cancelingBody wraps a response body so Close releases the
-// per-request context. Without this the per-request timeout's
-// cancel func would leak until the runtime's context finalizer
-// fired.
+// per-request context, preventing the cancel func from leaking
+// until the runtime's context finalizer fires.
 type cancelingBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
