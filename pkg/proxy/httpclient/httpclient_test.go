@@ -56,6 +56,30 @@ func TestNew_Defaults(t *testing.T) {
 	}
 }
 
+func TestNew_DefaultTransportTunedForProxy(t *testing.T) {
+	t.Parallel()
+
+	c := New(Options{})
+	tr, ok := c.inner.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("inner.Transport has type %T, want *http.Transport", c.inner.Transport)
+	}
+	// Go's default of 2 is the proxy footgun this fixes. Anything
+	// lower would silently regress connection reuse under load.
+	if tr.MaxIdleConnsPerHost < 100 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want >= 100", tr.MaxIdleConnsPerHost)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 = false, want true")
+	}
+	if tr.IdleConnTimeout == 0 {
+		t.Errorf("IdleConnTimeout = 0, want > 0 (idle conns must eventually be reaped)")
+	}
+	if tr.TLSHandshakeTimeout == 0 {
+		t.Errorf("TLSHandshakeTimeout = 0, want > 0")
+	}
+}
+
 func TestNew_NegativeRetriesDisables(t *testing.T) {
 	t.Parallel()
 

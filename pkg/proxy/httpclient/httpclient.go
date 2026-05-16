@@ -31,8 +31,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/yolocs/ocifactory/pkg/proxy"
 )
@@ -155,7 +158,7 @@ func New(opts Options) *Client {
 	}
 	transport := opts.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = newDefaultTransport()
 	}
 
 	checkRedirect := func(_ *http.Request, via []*http.Request) error {
@@ -338,6 +341,47 @@ func (c *Client) do(ctx context.Context, rawURL string, opts GetOptions) (*Respo
 		LastModified: resp.Header.Get("Last-Modified"),
 		NotModified:  resp.StatusCode == http.StatusNotModified,
 	}, nil
+}
+
+// newDefaultTransport builds the http.RoundTripper used when the
+// caller does not supply one. It diverges from http.DefaultTransport
+// in two places that matter for a pull-through proxy:
+//
+//   - MaxIdleConnsPerHost is bumped from the Go default of 2 to 100.
+//     A proxy fronts a small number of upstream hosts (pypi.org,
+//     registry.npmjs.org, repo1.maven.org) with potentially many
+//     concurrent client requests; the default ceiling makes anything
+//     past the second concurrent request churn a fresh TCP+TLS
+//     handshake on every call.
+//
+//   - HTTP/2 ReadIdleTimeout / PingTimeout are configured so the
+//     transport notices half-open connections (NAT timeouts, load
+//     balancer resets) and reconnects, instead of pinning streams to
+//     a dead connection until the per-request timeout fires.
+func newDefaultTransport() http.RoundTripper {
+	t := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	// Best-effort: enable HTTP/2 and tune dead-connection
+	// detection. ConfigureTransports failure (e.g. running on a
+	// future Go where the function signature changes) just leaves
+	// us with HTTP/2-via-ALPN minus the read-idle ping — not worth
+	// failing New over.
+	if h2, err := http2.ConfigureTransports(t); err == nil && h2 != nil {
+		h2.ReadIdleTimeout = 30 * time.Second
+		h2.PingTimeout = 15 * time.Second
+	}
+	return t
 }
 
 // ctxWait blocks for d or returns early on ctx cancellation.
