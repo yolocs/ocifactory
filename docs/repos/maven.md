@@ -55,7 +55,20 @@ ocifactory serve \
 
 ## Quickstart
 
-After starting the server (above), configure `~/.m2/settings.xml`:
+After starting the server (above), create a namespace via the admin
+service (see [`../admin.md`](../admin.md)). Every Maven URL lives
+under `/{namespace}/maven2/...` — there is no implicit root namespace.
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/myteam \
+  -H 'content-type: application/json' \
+  -d '{"policy":{
+        "readers":[{"issuer":"https://accounts.google.com"}],
+        "writers":[{"issuer":"https://accounts.google.com",
+                    "email":"release-bot@myteam.example"}]}}'
+```
+
+Then configure `~/.m2/settings.xml`:
 
 ```xml
 <settings>
@@ -74,7 +87,7 @@ After starting the server (above), configure `~/.m2/settings.xml`:
       <repositories>
         <repository>
           <id>ocifactory</id>
-          <url>https://ocifactory.your-domain/</url>
+          <url>https://ocifactory.your-domain/myteam/maven2/</url>
         </repository>
       </repositories>
     </profile>
@@ -91,11 +104,11 @@ And in `pom.xml`:
 <distributionManagement>
   <repository>
     <id>ocifactory</id>
-    <url>https://ocifactory.your-domain/</url>
+    <url>https://ocifactory.your-domain/myteam/maven2/</url>
   </repository>
   <snapshotRepository>
     <id>ocifactory</id>
-    <url>https://ocifactory.your-domain/</url>
+    <url>https://ocifactory.your-domain/myteam/maven2/</url>
   </snapshotRepository>
 </distributionManagement>
 ```
@@ -106,16 +119,23 @@ The `password` is an OIDC ID token — there is no static-password path.
 
 ## URL layout
 
+Every route lives under `/{namespace}/maven2/...`. The `maven2/`
+segment after the namespace is a fixed format prefix — it lets one
+hostname route python, maven, and npm under disjoint paths per
+namespace without ambiguity. Requests to an unknown namespace return
+`404 Not Found`; requests whose verified OIDC subject doesn't match
+the namespace's `readers` / `writers` policy return `403 Forbidden`.
+
 All routes accept `PUT` and `POST` for upload, and `GET` and `HEAD`
 for resolve.
 
-| Path | Purpose |
+| Path (under `/{namespace}/maven2/`) | Purpose |
 |---|---|
 | `/{groupId}/{artifactId}/{version}/{filename}` | Regular artifact (jar, pom, sources, javadoc). |
 | `/{groupId}/{artifactId}/{version}/{filename}.{sha1,md5,sha256,sha512}` | Checksum companion. **Must arrive after the artifact it covers.** |
 | `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | Version-level snapshot metadata. Always overwritable (snapshot-mutable). |
 | `/{groupId}/{artifactId}/maven-metadata.xml` | Artifact-level metadata. Follows release-immutability semantics — see the [Snapshots vs releases](#snapshots-vs-releases-overwrite-semantics) section above. |
-| `/archetype-catalog.xml` | Global archetype catalog. |
+| `/archetype-catalog.xml` | Global archetype catalog (one per namespace). |
 
 `{groupId}` is the dotted Java group with `.` rewritten to `/`
 (e.g. `com.example.foo` → `/com/example/foo/`), matching standard
@@ -126,16 +146,16 @@ version segment.
 ### Concrete examples
 
 ```
-PUT /com/example/foo/1.0.0/foo-1.0.0.jar
-PUT /com/example/foo/1.0.0/foo-1.0.0.jar.sha1
-PUT /com/example/foo/1.0.0/foo-1.0.0.pom
-PUT /com/example/foo/1.0.0/foo-1.0.0.pom.sha1
-PUT /com/example/foo/maven-metadata.xml
-PUT /com/example/foo/maven-metadata.xml.sha1
+PUT /myteam/maven2/com/example/foo/1.0.0/foo-1.0.0.jar
+PUT /myteam/maven2/com/example/foo/1.0.0/foo-1.0.0.jar.sha1
+PUT /myteam/maven2/com/example/foo/1.0.0/foo-1.0.0.pom
+PUT /myteam/maven2/com/example/foo/1.0.0/foo-1.0.0.pom.sha1
+PUT /myteam/maven2/com/example/foo/maven-metadata.xml
+PUT /myteam/maven2/com/example/foo/maven-metadata.xml.sha1
 
 # Snapshot
-PUT /com/example/foo/1.1.0-SNAPSHOT/foo-1.1.0-20260101.123456-1.jar
-PUT /com/example/foo/1.1.0-SNAPSHOT/maven-metadata.xml
+PUT /myteam/maven2/com/example/foo/1.1.0-SNAPSHOT/foo-1.1.0-20260101.123456-1.jar
+PUT /myteam/maven2/com/example/foo/1.1.0-SNAPSHOT/maven-metadata.xml
 ```
 
 ## Path validation grammar
@@ -224,16 +244,26 @@ manifest tagged with the canonical tag, plus one file manifest per
 uploaded file (subject-linked to the anchor, addressable via the
 OCI 1.1 referrers API, and individually tagged with a deterministic
 `_f_<sha256>` for fast reads). The mapping from Maven URL to the tuple
-the file lands under:
+the file lands under (with `<ns>` standing for the URL's namespace
+segment):
 
 | Maven URL | OCI repo | Canonical tag | File name on the file manifest |
 |---|---|---|---|
-| `/{groupId}/{artifactId}/{version}/{filename}` | `{groupId}/{artifactId}` | `{version}` | `{filename}` |
-| `/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
-| `/{groupId}/{artifactId}/maven-metadata.xml` | `{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
-| `/archetype-catalog.xml` | `archetype` | `latest` | `archetype-catalog.xml` |
+| `/{ns}/maven2/{groupId}/{artifactId}/{version}/{filename}` | `<ns>/{groupId}/{artifactId}` | `{version}` | `{filename}` |
+| `/{ns}/maven2/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `<ns>/{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
+| `/{ns}/maven2/{groupId}/{artifactId}/maven-metadata.xml` | `<ns>/{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
+| `/{ns}/maven2/archetype-catalog.xml` | `<ns>/archetype` | `latest` | `archetype-catalog.xml` |
 
 `{groupId}` keeps its slash form (`com/example/foo`), matching the URL.
+The namespace wrapper adds the `<ns>/` prefix transparently; the maven
+handler addresses repos as `{groupId}/{artifactId}` and the wrapper
+turns them into `<ns>/{groupId}/{artifactId}` before they hit the OCI
+backend.
+
+A fourth per-namespace repo, `<ns>/ocifactory-packages`, is maintained
+by the namespace wrapper itself — its tags enumerate every owning-repo
+the wrapper has written to. It backs the admin service's "namespace is
+empty" check on soft delete; operators don't write to it directly.
 
 The base `artifactType` is `application/vnd.ocifactory.maven` and
 ocifactory appends `.version`, `.file`, and `.alias` suffixes to
@@ -277,7 +307,7 @@ practice because checksum files arrive immediately after the artifact
 
 Reference: `pkg/handler/maven/checksum.go`.
 
-## Authentication
+## Authentication and authorization
 
 Every Maven route is gated by `pkg/auth.Middleware` — there are no
 public-by-default endpoints in the Maven format. The middleware chain
@@ -287,9 +317,19 @@ a `401 Unauthorized` before touching the OCI backend.
 Configure the authenticator via `--authn-*` (or `--disable-authn` for
 local dev). See [`docs/auth.md`](../auth.md) for the full table.
 
-Authorization (per-coordinate, per-operation policy) is **not**
-implemented yet — every authenticated caller can read and write every
-artifact. Tracked by [#49](https://github.com/yolocs/ocifactory/issues/49).
+Authorization is **per-namespace**: every read and write is checked
+against the namespace's `Policy` (the `readers` / `writers` matchers
+operators wrote when they created the namespace via the admin API).
+Authenticated callers whose `(issuer, sub, email, claims)` don't match
+any matcher get a `403 Forbidden`. Granularity is coarse — `OpRead`
+covers blob fetches and metadata reads, `OpWrite` covers every PUT/POST.
+There is no per-coordinate granularity today: every reader in a
+namespace can read every coordinate in it, every writer can write to
+any. Out-of-tree authorizers (OPA / Cedar / Casbin) plug in via
+`namespace.WithAuthzFactory` if you need finer control.
+
+See [`docs/auth.md`](../auth.md#namespace-authorization) for the
+policy model and matcher reference.
 
 ## Operator knobs
 

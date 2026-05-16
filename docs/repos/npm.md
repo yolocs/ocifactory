@@ -28,6 +28,20 @@ ocifactory serve \
   --port=8080
 ```
 
+Create a namespace via the admin service (see
+[`../admin.md`](../admin.md)) — every npm URL lives under
+`/{namespace}/...`, there is no implicit root namespace:
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/myteam \
+  -H 'content-type: application/json' \
+  -d '{"policy":{
+        "readers":[{"issuer":"https://token.actions.githubusercontent.com",
+                    "sub_match":"repo:myorg/.*"}],
+        "writers":[{"issuer":"https://token.actions.githubusercontent.com",
+                    "sub_match":"repo:myorg/myapp:.*"}]}}'
+```
+
 Configure `~/.npmrc`:
 
 ```ini
@@ -50,9 +64,12 @@ npm install some-package
 
 Every route lives under `/{namespace}/` so the same ocifactory
 instance can host disjoint npm teams. `{namespace}` is what an
-operator chose via the admin namespace API; the per-team `~/.npmrc`
-points npm at `https://ocifactory.your-domain/{namespace}/` and every
-client request lands there.
+operator chose via the admin namespace API (see
+[`../admin.md`](../admin.md)); the per-team `~/.npmrc` points npm at
+`https://ocifactory.your-domain/{namespace}/` and every client request
+lands there. Requests to an unknown namespace return `404 Not Found`;
+requests whose verified OIDC subject doesn't match the namespace's
+`readers` / `writers` policy return `403 Forbidden`.
 
 | Method | Path (under `/{namespace}/`) | Purpose |
 |---|---|---|
@@ -106,13 +123,20 @@ go test -tags=integration ./pkg/handler/npm/...
 
 ## OCI storage layout
 
-Two OCI repositories per namespace under `--backend-registry`:
+Three OCI repositories per namespace under `--backend-registry`,
+prefixed with the namespace segment by the data-plane wrapper:
 
 | OCI repo | Canonical tags | What's stored |
 |---|---|---|
-| `packages/u/<name>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus two file manifests (tarball `<name>-<version>.tgz` and `package.json`) subject-linked to the anchor and addressable via the OCI 1.1 referrers API. Used for unscoped packages. |
-| `packages/s/<scope>/<name>` | `<version>` per release | Same shape; used for scoped (`@scope/name`) packages. |
-| `index` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"1"`). `ListTags("index")` is the package list. |
+| `<namespace>/packages/u/<name>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus two file manifests (tarball `<name>-<version>.tgz` and `package.json`) subject-linked to the anchor and addressable via the OCI 1.1 referrers API. Used for unscoped packages. |
+| `<namespace>/packages/s/<scope>/<name>` | `<version>` per release | Same shape; used for scoped (`@scope/name`) packages. |
+| `<namespace>/index` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"1"`). `ListTags("<namespace>/index")` is the namespace's package list. |
+
+A fourth per-namespace repo, `<namespace>/ocifactory-packages`, is
+maintained by the namespace wrapper itself — its tags enumerate every
+owning-repo the wrapper has recorded a write for. It backs the admin
+service's "namespace is empty" check on soft delete; operators don't
+write to it directly.
 
 Each file manifest also carries a deterministic `_f_<sha256>` tag so
 tarball downloads resolve in one round-trip.
@@ -174,7 +198,7 @@ The handler:
 6. Writes the per-package index sentinel if it's the first version.
 7. Returns `201 {"ok": true, "id": "<name>", "rev": "<server-token>"}`.
 
-## Authentication
+## Authentication and authorization
 
 Every npm route is gated by `pkg/auth.Middleware` — there are no
 public-by-default endpoints in the npm format. The middleware chain
@@ -184,10 +208,20 @@ a `401 Unauthorized` before touching the OCI backend.
 Configure the authenticator via `--authn-*` (or `--disable-authn` for
 local dev). See [`docs/auth.md`](../auth.md) for the full table.
 
-Authorization (per-package, per-operation policy) is **not**
-implemented yet — every authenticated caller in a namespace's
-reader / writer matchers can read and write every package in that
-namespace.
+Authorization is **per-namespace**: every read and write is checked
+against the namespace's `Policy` (the `readers` / `writers` matchers
+operators wrote when they created the namespace via the admin API).
+Authenticated callers whose `(issuer, sub, email, claims)` don't match
+any matcher get a `403 Forbidden`. Granularity is coarse — `OpRead`
+covers packument GETs, tarball downloads, and dist-tag listings;
+`OpWrite` covers publish and dist-tag add. There is no per-package
+granularity today: every reader in a namespace can read every package
+in it, every writer can publish any package in it. Out-of-tree
+authorizers (OPA / Cedar / Casbin) plug in via
+`namespace.WithAuthzFactory` if you need finer control.
+
+See [`docs/auth.md`](../auth.md#namespace-authorization) for the
+policy model and matcher reference.
 
 ## Operator knobs
 

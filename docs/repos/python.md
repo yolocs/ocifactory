@@ -26,19 +26,32 @@ ocifactory serve \
   --port=8080
 ```
 
+Create a namespace via the admin service (see
+[`../admin.md`](../admin.md)). Every PyPI URL lives under
+`/{namespace}/...` — there is no implicit root namespace.
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/myteam \
+  -H 'content-type: application/json' \
+  -d '{"policy":{
+        "readers":[{"issuer":"https://accounts.google.com"}],
+        "writers":[{"issuer":"https://accounts.google.com",
+                    "email":"release-bot@myteam.example"}]}}'
+```
+
 Configure `pip`:
 
 ```ini
 # ~/.pip/pip.conf  (or pip.ini on Windows)
 [global]
-index-url = https://_oidc:${OCIFACTORY_TOKEN}@ocifactory.your-domain/simple/
+index-url = https://_oidc:${OCIFACTORY_TOKEN}@ocifactory.your-domain/myteam/simple/
 ```
 
 Configure `twine`:
 
 ```bash
 twine upload \
-  --repository-url https://ocifactory.your-domain/ \
+  --repository-url https://ocifactory.your-domain/myteam/ \
   --username _oidc \
   --password "$OCIFACTORY_TOKEN" \
   dist/*
@@ -51,11 +64,17 @@ ocifactory has no static-password path on purpose.
 
 ## URL layout
 
-| Method | Path | Purpose |
+Every route lives under `/{namespace}/...` — the namespace is the team /
+project / environment slot an operator created via the admin API. Requests
+to an unknown namespace return `404 Not Found`; requests whose verified
+OIDC subject doesn't match the namespace's `readers` or `writers` policy
+return `403 Forbidden`.
+
+| Method | Path (under `/{namespace}/`) | Purpose |
 |---|---|---|
 | `POST /` (or `PUT /`) | (multipart) | `twine upload` — accepts the legacy PyPI multipart form. |
-| `GET /simple/` | — | Root simple index: every package the registry knows about. |
-| `GET /simple/{pkg}/` | — | Per-package simple index: every file for `pkg`. |
+| `GET /simple/` | — | Root simple index: every package this namespace knows about. |
+| `GET /simple/{pkg}/` | — | Per-package simple index: every file for `pkg` in this namespace. |
 | `GET\|HEAD /packages/{pkg}/{version}/{filename}` | — | Download a wheel/sdist blob. |
 
 Trailing slashes are tolerated on `/simple` and `/simple/{pkg}` — both
@@ -116,12 +135,18 @@ property either ocifactory or PyPI provides.
 
 ## OCI storage layout
 
-Two OCI repositories under `--backend-registry`:
+Two OCI repositories **per namespace** under `--backend-registry`:
 
 | OCI repo | Canonical tags | What's stored |
 |---|---|---|
-| `packages/<pkg>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus one file manifest per uploaded wheel / sdist (subject-linked to the version anchor and addressable via the OCI 1.1 referrers API). Each file manifest also carries a deterministic `_f_<sha256>` tag so reads resolve in one round-trip. |
-| `index` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"1"`). The body is unused; `ListTags("index")` is the package list. |
+| `<namespace>/packages/<pkg>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus one file manifest per uploaded wheel / sdist (subject-linked to the version anchor and addressable via the OCI 1.1 referrers API). Each file manifest also carries a deterministic `_f_<sha256>` tag so reads resolve in one round-trip. |
+| `<namespace>/index` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"1"`). The body is unused; `ListTags("<namespace>/index")` is the package list for this namespace. |
+
+A third per-namespace repo, `<namespace>/ocifactory-packages`, is
+maintained by the data-plane namespace wrapper itself — its tags
+enumerate every OwningRepo the wrapper has recorded a write for, and
+it backs the admin service's "namespace is empty" check on soft
+delete. Operators don't write to it directly.
 
 `<pkg>` is always the PEP 503 normalised name. The base
 `artifactType` is `application/vnd.ocifactory.python` and ocifactory
@@ -159,7 +184,7 @@ verify the download against the OCI backend's digest without an extra
 round-trip. The JSON index emits the same digest under
 `files[].hashes.sha256`.
 
-## Authentication
+## Authentication and authorization
 
 Every PyPI route is gated by `pkg/auth.Middleware` — there are no
 public-by-default endpoints in the Python format. The middleware
@@ -169,9 +194,20 @@ gets a `401 Unauthorized` before touching the OCI backend.
 Configure the authenticator via `--authn-*` (or `--disable-authn` for
 local dev). See [`docs/auth.md`](../auth.md) for the full table.
 
-Authorization (per-package, per-operation policy) is **not** implemented
-yet — every authenticated caller can read and write every package.
-Tracked by [#49](https://github.com/yolocs/ocifactory/issues/49).
+Authorization is **per-namespace**: every read and write is checked
+against the namespace's `Policy` (the `readers` / `writers` matchers
+operators wrote when they created the namespace via the admin API).
+Authenticated callers whose `(issuer, sub, email, claims)` don't match
+any matcher get a `403 Forbidden`. Granularity is coarse — `OpRead`
+covers `/simple/...` listings and `/packages/.../<file>` blob fetches;
+`OpWrite` covers `POST /` (twine upload). There is no per-package
+granularity today: every reader in a namespace can read every package
+in it, every writer can write to any package in it. Out-of-tree
+authorizers (OPA / Cedar / Casbin) plug in via
+`namespace.WithAuthzFactory` if you need finer control.
+
+See [`docs/auth.md`](../auth.md#namespace-authorization) for the
+policy model and matcher reference.
 
 ## Operator knobs
 
@@ -185,27 +221,45 @@ Common server-wide flags (`--port`, `--backend-registry`, `--enable-metrics`,
 the `--authn-*` and `--backend-auth-*` families) are documented in
 [`docs/auth.md`](../auth.md) and [`docs/observability.md`](../observability.md).
 
-## Migration: pre-existing un-normalized data in the OCI backend
+## Migration: pre-existing data in the OCI backend
+
+Two migrations may apply.
+
+### 1. Pre-existing un-normalized package names
 
 The handler normalises package names at every entry point: writes
 canonicalise `Foo_Bar` → `foo-bar` before pushing, and reads
 canonicalise the requested name before looking up. **Reads of the
 un-normalized name are not aliased back to the canonical name.**
 
-Concretely: if you populated `packages/Foo_Bar:1.0` in your OCI backend
-before upgrading to a normalising ocifactory, `pip install Foo_Bar`
-will look for `packages/foo-bar:1.0` and 404. Two ways forward:
+Concretely: if you populated `<namespace>/packages/Foo_Bar:1.0` in your
+OCI backend before upgrading to a normalising ocifactory, `pip install
+Foo_Bar` will look for `<namespace>/packages/foo-bar:1.0` and 404. Two
+ways forward:
 
 1. **Re-upload** the affected versions (`twine upload`). The handler
    normalises on write, so the new manifest lands at
-   `packages/foo-bar:1.0`. The old `packages/Foo_Bar` repo is harmless
-   but unreachable; clean it up via your OCI backend's tooling.
+   `<namespace>/packages/foo-bar:1.0`. The old `Foo_Bar` repo is
+   harmless but unreachable; clean it up via your OCI backend's
+   tooling.
 2. **Rename in place** at the OCI layer. Out of ocifactory's scope —
    doable with `oras cp` against your backend, but verify the resulting
    manifest's `artifactType` annotation still reads
-   `application/vnd.ocifactory.python`.
+   `application/vnd.ocifactory.python.version` /
+   `.file` / `.alias`.
 
 For new deployments this never matters: every write canonicalises.
+
+### 2. Data published before the namespace prefix
+
+Earlier ocifactory versions served PyPI URLs at the registry root
+(`/simple/`, `/packages/...`). Today every URL lives under a
+namespace. If you have `packages/<pkg>` repos in your OCI backend left
+over from that era, point ocifactory at them by `oras cp`-ing them
+under a namespace prefix (`<namespace>/packages/<pkg>`) and creating
+the matching namespace via the admin API. The on-manifest shape (file
+manifests + version anchors + alias manifests) is unchanged across
+this migration — only the repo path moved.
 
 ## Limitations
 

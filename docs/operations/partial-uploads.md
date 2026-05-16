@@ -71,12 +71,13 @@ requests-2.31.0-cp310-cp310-manylinux_2_17_x86_64.whl
 requests-2.31.0-cp311-cp311-manylinux_2_17_x86_64.whl
 ```
 
-`twine` fires four independent POSTs against `/`. Suppose POST #3 fails
-mid-stream (say a TCP reset during the upload of the cp310 wheel).
-State on the backend:
+`twine` fires four independent POSTs against `/{namespace}/`. Suppose
+POST #3 fails mid-stream (say a TCP reset during the upload of the
+cp310 wheel). State on the backend (with `<ns>` standing for the
+namespace the URL targeted):
 
 ```
-packages/requests
+<ns>/packages/requests
 ├── 2.31.0                                (version anchor manifest)
 ├── _f_<sha256("2.31.0\0requests-2.31.0.tar.gz")>   ← file manifest, present
 ├── _f_<sha256("2.31.0\0…py3-none-any.whl")>        ← file manifest, present
@@ -96,13 +97,15 @@ state.
 
 ### Maven — partial `mvn deploy`
 
-A single release deploy fires roughly 12 PUTs (JAR + POM + sources +
-javadoc, each with two or three checksum companions, plus the
-artifact-level `maven-metadata.xml`). Say PUT #7 fails — network drop
-between sources upload and javadoc upload. State on the backend:
+A single release deploy fires roughly 12 PUTs against
+`/{namespace}/maven2/...` (JAR + POM + sources + javadoc, each with
+two or three checksum companions, plus the artifact-level
+`maven-metadata.xml`). Say PUT #7 fails — network drop between
+sources upload and javadoc upload. State on the backend (with `<ns>`
+standing for the namespace the URL targeted):
 
 ```
-com/example/foo
+<ns>/com/example/foo
 ├── 1.0.0                                (version anchor manifest)
 ├── _f_<…foo-1.0.0.jar>                  ← present
 ├── _f_<…foo-1.0.0.jar.sha1>             ← present

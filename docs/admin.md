@@ -9,6 +9,13 @@ separate hostname behind platform or network access controls.
 > authenticated invoker, an internal load balancer ACL, an identity-aware proxy,
 > or equivalent controls before exposing it to operators.
 
+The admin service owns the **namespace catalogue** — the documents that say
+"a namespace named `myteam` exists, and these are the OIDC subjects allowed
+to read and write its packages". Every data-plane URL ocifactory serves lives
+under a namespace prefix (`/{namespace}/...` for python and npm,
+`/{namespace}/maven2/...` for maven), and the data plane fetches each
+namespace's spec from the same OCI backend the admin service writes to.
+
 ## Start the service
 
 ```bash
@@ -46,6 +53,76 @@ Errors use `{"error":"message"}`. Invalid namespace names and invalid specs
 return `400`; missing namespaces return `404`; soft-delete of a non-empty
 namespace returns `409`.
 
+### Namespace name validation
+
+Names must satisfy:
+
+- 1–64 characters, lowercase ASCII alphanumerics and `-`.
+- No leading or trailing `-`; no leading `_` or `.` (both reserved for
+  internal use).
+- Not one of a small reserved set: `admin`, `healthz`, `readyz`,
+  `metrics`, `simple`, `maven2`, `v2`, `npm`,
+  `ocifactory-namespaces`, plus a few `_`-prefixed historical names.
+  Reservations are conservative on purpose — better to over-reserve in
+  v1 than collide with future routing.
+
+### `Spec` shape
+
+```json
+{
+  "schema_version": 1,
+  "policy": {
+    "readers": [
+      {"issuer": "https://accounts.google.com"}
+    ],
+    "writers": [
+      {"issuer": "https://accounts.google.com",
+       "email": "release-bot@myteam.example"}
+    ]
+  },
+  "format": { /* reserved for future format-specific knobs */ }
+}
+```
+
+- `policy.readers` / `policy.writers` are independent
+  `SubjectMatcher` lists. **An entirely empty policy is deny-all** —
+  a caller is allowed to perform an op only if at least one matcher
+  in the corresponding list matches. Granting `write` does not imply
+  `read`.
+- Every matcher must populate at least one of `issuer`, `sub_match`
+  (RE2 regex), `email`, `claims_match` (map of claim → regex), or
+  `kind`. Regex patterns are anchored at both ends (`^...$`); if
+  your pattern already starts with `^` or ends with `$`, the anchor
+  isn't duplicated. See [`auth.md`](auth.md#subjectmatcher-reference)
+  for the full reference and worked examples.
+- `format` is reserved for future format-specific knobs; ocifactory
+  preserves it across roundtrips so a newer ocifactory's keys aren't
+  silently dropped by an older one.
+
+### Worked example — create a namespace
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/myteam \
+  -H 'content-type: application/json' \
+  -d '{"policy":{
+        "readers":[{"issuer":"https://token.actions.githubusercontent.com",
+                    "sub_match":"repo:myorg/.+"}],
+        "writers":[{"issuer":"https://token.actions.githubusercontent.com",
+                    "sub_match":"repo:myorg/myapp:ref:refs/heads/main"}]}}'
+```
+
+Response: `201 Created` with the persisted document (including the
+`schema_version: 1` ocifactory stamped on write).
+
+### Policy propagation
+
+Policy changes via this API take effect on the very next data-plane
+request. The admin `Store` fires a mutation hook on `Put` / `Delete`
+that the data plane's `namespace.Registry` consumes to invalidate its
+cached authorizer for the affected namespace. Without that hook,
+changes would only land after the cache TTL (`DefaultPolicyCacheTTL = 60s`)
+expired.
+
 ## Soft delete
 
 `DELETE` is intentionally conservative in this phase. ocifactory checks the
@@ -68,8 +145,21 @@ Namespace metadata is stored with OCI artifact type
 `application/vnd.ocifactory.namespace`, independent of the data-plane format
 served by a process. If you experimented with namespace metadata from the short
 window before this admin service existed, recreate those namespaces through the
-admin API so Python, Maven, and future repo types all read the same control-plane
-documents.
+admin API so Python, Maven, npm, and future repo types all read the same
+control-plane documents.
+
+Concretely, for a namespace named `myteam` with `--namespace-prefix=""`
+(the default):
+
+| OCI repo | Tag | Body |
+|---|---|---|
+| `myteam` | `_metadata` | The JSON-serialised `Spec` written by the admin `PUT`. |
+| `ocifactory-namespaces` | `myteam` | A single sentinel layer — the tag's existence is the catalogue entry. |
+
+A non-empty `--namespace-prefix` (e.g. `control-plane`) shifts both
+repos under that prefix (`control-plane/myteam`, `control-plane/ocifactory-namespaces`).
+Operators sharing one OCI registry between an ocifactory deployment and
+unrelated artifacts use the prefix to keep the namespaces out of the way.
 
 ## `schema_version`
 
