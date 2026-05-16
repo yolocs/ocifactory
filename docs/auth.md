@@ -1,17 +1,24 @@
-# Authentication
+# Authentication and authorization
 
-ocifactory has two independent identities:
+ocifactory has three independent identities and policy surfaces:
 
-- **Frontend** — how callers of the ocifactory HTTP API authenticate
-  to ocifactory. OIDC only; configured via `OCIFACTORY_AUTHN_*`.
-- **Backend** — how ocifactory authenticates to the backend OCI
-  registry. Pluggable `backend.Provider` interface with in-tree
-  adapters for ADC, env vars, and docker config; configured via
-  `OCIFACTORY_BACKEND_AUTH_*`.
+- **Frontend authentication** — how callers of the ocifactory HTTP
+  API authenticate _to ocifactory_. OIDC only; configured via
+  `OCIFACTORY_AUTHN_*`.
+- **Per-namespace authorization** — what an authenticated caller is
+  allowed to do on a specific namespace. Defined inside each
+  namespace's `Policy` (set via the admin API) and enforced
+  automatically by the data-plane wrapper.
+- **Backend authentication** — how ocifactory authenticates _to the
+  backend OCI registry_. Pluggable `backend.Provider` interface with
+  in-tree adapters for ADC, env vars, and docker config; configured
+  via `OCIFACTORY_BACKEND_AUTH_*`.
 
 There is no config file. Every knob is a CLI flag or environment
 variable so deployments on Cloud Run / k8s / docker compose stay a
-single deployable unit with no extra mounts.
+single deployable unit with no extra mounts. The only state outside
+the binary is what lives in the OCI backend — including namespace
+metadata.
 
 ## Where auth runs
 
@@ -23,14 +30,22 @@ router, so:
 - Observability endpoints (`/healthz`, `/readyz`, `/metrics`) are
   reachable without auth — they're served before any format
   handler runs.
-- Today both built-in formats (python, maven) gate every route
-  via `router.Use(authMW)` on their root router.
-- Future formats with a public/private route split (npm registry
-  reads, Go module proxy listings) can chain the middleware on a
-  sub-router and leave public routes ungated.
-- Outlier endpoints that need their own auth contract (e.g. an
-  npm login bootstrap that mints a token) sit on a sub-router
-  that doesn't `Use(authMW)`.
+- Today every built-in format (python, maven, npm) gates every
+  route via `router.Use(authMW)` on the root router (python,
+  maven) or on the `/{namespace}` sub-router (npm).
+- Future formats with a public/private route split (Go module
+  proxy listings, anonymous-read mirrors) can chain the middleware
+  on a sub-router and leave public routes ungated.
+- Outlier endpoints that need their own auth contract (e.g. a
+  future npm login bootstrap that mints a token) would sit on a
+  sub-router that doesn't `Use(authMW)`.
+
+Authorization runs one layer deeper, inside the
+`namespace.ScopedRegistry` wrapper: every `AddFile` / `ReadFile` /
+`ListTags` / `ListFiles` call routes through the namespace's
+compiled `Policy` before reaching the OCI backend, so even a
+handler bug that skipped its own pre-check would not let a request
+bypass authz.
 
 ## Frontend: authenticating clients
 
@@ -62,6 +77,134 @@ verification. Mismatched issuers fall through silently to the next
 authenticator, so a multi-issuer chain (Google + GitHub Actions +
 ...) accepts tokens from any of its members without
 short-circuiting on the first one.
+
+## Namespace authorization
+
+Every data-plane URL ocifactory serves lives under a namespace
+prefix (`/{namespace}/...` for python and npm, `/{namespace}/maven2/...`
+for maven). Each namespace carries its own `Policy` — a pair of
+`SubjectMatcher` lists, one for `readers` and one for `writers` —
+that gates every read and write through the namespace.
+
+The control plane is `ocifactory admin serve`; see
+[`admin.md`](admin.md) for the CRUD API. The data plane
+(`ocifactory serve`) reads namespace specs out of the same OCI
+backend, caches the compiled authorizer (default
+`DefaultPolicyCacheTTL = 60s`), and invalidates the cache the moment
+an admin `Put` or `Delete` lands so policy changes take effect on
+the next request.
+
+### Op model
+
+Today there are two ops, deliberately coarse:
+
+| Op | What it covers |
+|---|---|
+| `read` | Every artifact fetch and listing (`pip install`, `mvn dependency:get`, `npm install`, `GET /simple/`, `GET <pkg>`, dist-tag GET, tarball GET, …). |
+| `write` | Every publish (`twine upload`, `mvn deploy`, `npm publish`, `npm dist-tag add`). |
+
+Granularity is per-namespace, not per-package. A caller matched by
+any reader matcher can read every package in the namespace; a caller
+matched by any writer matcher can write to any. Per-coordinate
+granularity is intentionally deferred — operators who need it plug
+in their own `Authorizer` via `namespace.WithAuthzFactory` (OPA,
+Cedar, Casbin) and consume the same `AuthContext`.
+
+### Policy shape
+
+A namespace `Spec` looks like:
+
+```json
+{
+  "schema_version": 1,
+  "policy": {
+    "readers": [
+      {"issuer": "https://accounts.google.com"}
+    ],
+    "writers": [
+      {"issuer": "https://token.actions.githubusercontent.com",
+       "sub_match": "repo:myorg/myapp:ref:refs/heads/main"},
+      {"issuer": "https://accounts.google.com",
+       "email": "release-bot@myteam.example"}
+    ]
+  }
+}
+```
+
+An **empty** policy is **deny-all**: a caller is allowed to perform
+an op only if at least one matcher in the corresponding list
+matches. The `readers` and `writers` lists are independent —
+granting `write` does not implicitly grant `read`.
+
+### `SubjectMatcher` reference
+
+Every populated field on a matcher must match the corresponding
+field on the verified `AuthContext` (fields AND together). An
+entirely-empty matcher is rejected at admin write time.
+
+| Field | Match against | Notes |
+|---|---|---|
+| `issuer` | `AuthContext.Issuer` (OIDC `iss`) | Exact string. |
+| `sub_match` | `AuthContext.ID` (OIDC `sub`) | RE2 regex anchored at both ends (`^...$`). Anchors that already exist on the pattern are honoured. |
+| `email` | `AuthContext.Email` (OIDC `email`, only when `email_verified=true`) | Exact string. |
+| `claims_match` | Other verified claims (`AuthContext.Claims`) | Map from claim name → RE2 regex (anchored). Non-string claim values are JSON-encoded (with sorted object keys) before matching. |
+| `kind` | Credential family | `"oidc"` (default) is the only supported value in v1; `"basictoken"` is reserved and rejected at validation time. |
+
+### Worked example — restrict writes to one GitHub repo's main branch
+
+```json
+{
+  "policy": {
+    "readers": [
+      {"issuer": "https://token.actions.githubusercontent.com",
+       "sub_match": "repo:myorg/.+"}
+    ],
+    "writers": [
+      {"issuer": "https://token.actions.githubusercontent.com",
+       "sub_match": "repo:myorg/myapp:ref:refs/heads/main"}
+    ]
+  }
+}
+```
+
+Any GitHub Actions workflow in any `myorg/*` repository can pull
+artifacts; only a run on `myorg/myapp`'s `main` branch can publish.
+The GitHub Actions `sub` is structured (see [Worked example: GitHub
+Actions OIDC](#worked-example-github-actions-oidc)) so policies can
+match on environment, ref, or workflow file precisely.
+
+### Failure modes
+
+| Case | Status |
+|---|---|
+| Unknown namespace | `404 Not Found` (`namespace not found`). |
+| Authenticated caller, no matching reader/writer matcher | `403 Forbidden`. |
+| Spec JSON has an unknown `schema_version` | Admin `PUT` returns `400`; data-plane `Get` returns `500` (operator must upgrade ocifactory). |
+| Owning-repo with `..` / absolute / reserved-prefix path | `400 Bad Request` — defends against cross-namespace escape via crafted URL parameters. |
+
+### Plugging in an alternative authorizer
+
+`namespace.AuthzFactory` is `func(Policy) (auth.Authorizer, error)`.
+A custom main can replace the built-in factory:
+
+```go
+import (
+    "github.com/yolocs/ocifactory/pkg/auth"
+    "github.com/yolocs/ocifactory/pkg/namespace"
+)
+
+reg := namespace.NewRegistry(ociReg, store,
+    namespace.WithAuthzFactory(func(p namespace.Policy) (auth.Authorizer, error) {
+        // compile p (or fetch a richer policy keyed by namespace name) into
+        // an authorizer that consumes auth.AuthContext.
+        return myOPAAuthorizer(p)
+    }),
+)
+```
+
+Out-of-tree authorizers slot in the same way as out-of-tree
+authenticators — implement `auth.Authorizer`, wire it into your own
+main, and the rest of the wiring is unchanged.
 
 ## Backend: how ocifactory talks to the OCI registry
 
@@ -303,9 +446,14 @@ OCI backend, no real artifacts. See `pkg/handler/echo`.
 
 ## What's out of scope (for now)
 
-- **Authorization** — what a verified caller is allowed to do.
-  Tracked separately; today every authenticated caller can
-  read/write everything.
+- **Per-coordinate authorization** — every reader in a namespace
+  can read every package in it, every writer can write to any.
+  Operators who need finer control plug in their own `Authorizer`
+  via `namespace.WithAuthzFactory` (OPA, Cedar, Casbin).
+- **Scoped-token issuance.** A planned `POST /admin/v1/tokens`
+  endpoint would take a verified OIDC token and mint a shorter-lived
+  ocifactory-audience token bound to a namespace and op; the wire
+  shape is open. Tracked in [`ROADMAP.md`](ROADMAP.md#phase-3--authauthz-extensibility).
 - **GitHub PATs / App tokens** — opaque, not OIDC. A future
   authenticator could validate them via `api.github.com/user`,
   but it has different perf characteristics; meanwhile the

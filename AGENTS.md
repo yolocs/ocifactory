@@ -18,58 +18,82 @@ Design pillars (in priority order):
 
 | Area | State |
 |---|---|
-| `pkg/oci` — OCI-backed registry primitives (Add/Read/List/Delete/AppendRefs) | Done, tested with in-memory fake |
-| `pkg/handler/python` — PEP 503 simple index, twine upload, pip download | Done, tested. Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
-| `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog) | Done, tested. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
-| `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`) | Done, tested. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
-| `pkg/handler` — `Server`, `PassThroughAuth`, `Logger`, `MetricsMiddleware` | Done |
+| `pkg/oci` — OCI-backed registry primitives (Add/Read/List/Delete/AppendRefs), streaming-push integration test against a real zot | Done, tested with in-memory fake + live-zot |
+| `pkg/oci` — deterministic `_f_<sha256>` file tags so file reads are one round-trip | Done |
+| `pkg/oci` — blob-download redirect to backend presigned URLs (GAR/ECR/ACR/GHCR/Docker Hub) | Done |
+| `pkg/handler/python` — PEP 503 simple index, twine upload, pip download, per-package simple-index cache | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
+| `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog), checksum verification, snapshot-always-overwrite | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
+| `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`), scoped + unscoped packages | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
+| `pkg/handler` — `Server`, `Logger`, `MetricsMiddleware`, `ObservabilityHandler` (intercepts `/healthz` / `/readyz` / `/metrics` before format mux) | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
-| `/healthz`, `/readyz`, `/metrics` endpoints (registered at server level) | Done |
 | `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC) | Done, tested. OIDC-only — static passwords are out-of-tree by design. Configured via `OCIFACTORY_AUTHN_*` flags / env vars. |
+| `pkg/auth` — Pluggable `Authorizer` interface with `OpRead` / `OpWrite` ops; `AllowAll` / `DenyAll` built-ins for tests / fallbacks | Done |
 | `pkg/auth/backend` — Pluggable backend credential `Provider` interface and in-tree adapters (`anonymous`, `gcpadc`, `staticenv`, `dockerconfig`) | Done, tested. Wired into `oci.Registry` via `WithBackendAuth`. Configured via `OCIFACTORY_BACKEND_AUTH_*` flags / env vars. |
-| `ocifactory admin serve` — control-plane namespace CRUD API | Done, tested. Operator docs: [`docs/admin.md`](docs/admin.md). |
+| `pkg/namespace` — Namespace data model, OCI-backed `Store`, JSON `Spec` with `SchemaVersion` | Done, tested. Operator docs: [`docs/admin.md`](docs/admin.md). |
+| `pkg/namespace` — Per-namespace `Policy` (readers/writers `SubjectMatcher`s on issuer / sub regex / email / claims), `PolicyAuthorizer`, data-plane `Registry` wrapper with policy cache + per-namespace package index | Done, tested. Authorizer is pluggable via `AuthzFactory`. |
+| `ocifactory admin serve` — control-plane namespace CRUD API (`PUT/GET/DELETE /admin/v1/namespaces/{name}`, list, soft-delete) | Done, tested. Operator docs: [`docs/admin.md`](docs/admin.md). |
 | `pkg/handler/echo` — No-op auth target for the GitHub OIDC CI job | Done. Not a real artifact format; no OCI backend, no `handler.Registry`. Exists to give CI a concrete request to make against a real OIDC issuer. |
-| `cmd/ocifactory serve` | Works for `--repo-type=python|maven|npm|echo` (echo runs without `--backend-registry`) |
+| `cmd/ocifactory serve` | Works for `--repo-type=python\|maven\|npm\|echo` (echo runs without `--backend-registry`). Every URL is namespace-prefixed: `/{namespace}/...` for python and npm; `/{namespace}/maven2/...` for maven. |
+| `cmd/ocifactory admin serve` | Works against any OCI backend; runs on a separate listener (`--port`, default `8081`). |
+| Dockerfile + multi-arch image publishing | Done. `Dockerfile.goreleaser` is distroless/nonroot; images at `ghcr.io/yolocs/ocifactory:vX.Y.Z` (+ `:vX.Y` / `:latest` for stable). Built via Goreleaser; release procedure in [`RELEASING.md`](RELEASING.md). |
+| Release pipeline | Done. Goreleaser builds binaries (linux/darwin × amd64/arm64), archives, sha256 sums, CycloneDX SBOMs (syft), cosign keyless signatures on every archive + image. |
+| `internal/version` — build-time version stamping via `-ldflags="-X .../internal/version.Version=..."`, fallbacks to `runtime/debug.ReadBuildInfo()` for dev builds | Done. `--version` surfaces it; `/readyz` includes it in the JSON body. |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
 | Pull-through proxy / caching | Not started |
 | Vulnerability scanning | Not started |
-| Authorization (per-repo, per-op policy) | Not started |
-| Dockerfile / deployment | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`. |
+| Authorization extensibility — multiple backends (OPA / Cedar / Casbin) | Pluggable via `namespace.AuthzFactory`; only the matcher-based built-in ships in-tree. |
+| Cloud Run / Cloudflare deployment guides | Not started |
+| Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
+| Rate limiting | Not started |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
 ```
-                     ┌─────────────────────────────────────┐
-HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)    │
-                     └────────────┬────────────────────────┘
-                                  │
-                     ┌────────────▼────────────────────────┐
-                     │  pkg/handler                         │
-                     │  • Server (port + middleware chain)  │
-                     │  • Logger, MetricsMiddleware         │
-                     │  • auth.Middleware (pkg/auth)        │
-                     │  • /healthz, /readyz, /metrics       │
-                     └────────────┬────────────────────────┘
-                                  │ http.Handler
-                     ┌────────────▼────────────────────────┐
-                     │  pkg/handler/{python,maven,npm,...}  │
-                     │  Each speaks one client protocol     │
-                     │  (pip, mvn, npm, go mod, apt, ...)   │
-                     └────────────┬────────────────────────┘
-                                  │ Registry interface (handler.Registry)
-                     ┌────────────▼────────────────────────┐
-                     │  pkg/oci.Registry                    │
-                     │  AddFile / ReadFile / ListTags /     │
-                     │  ListFiles / DeleteRepoFiles /       │
-                     │  AppendRefs                          │
-                     └────────────┬────────────────────────┘
-                                  │ ORAS (oras-go/v2)
-                     ┌────────────▼────────────────────────┐
-                     │  Any OCI registry                    │
-                     │  (GAR, ECR, GHCR, Harbor, zot, ...)  │
-                     └─────────────────────────────────────┘
+                     ┌──────────────────────────────────────────┐
+HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)         │
+                     │  Subcommands: serve / admin serve         │
+                     └───────────────┬──────────────────────────┘
+                                     │
+                     ┌───────────────▼──────────────────────────┐
+                     │  pkg/handler                              │
+                     │  • Server (port + middleware chain)       │
+                     │  • Logger, MetricsMiddleware              │
+                     │  • ObservabilityHandler                   │
+                     │    (/healthz, /readyz, /metrics)          │
+                     └───────────────┬──────────────────────────┘
+                                     │ http.Handler
+                     ┌───────────────▼──────────────────────────┐
+                     │  pkg/handler/{python,maven,npm,...}       │
+                     │  Each speaks one client protocol          │
+                     │  (pip, mvn, npm, go mod, apt, ...)        │
+                     │  Routes mounted under /{namespace}/...    │
+                     │  auth.Middleware (pkg/auth) chained on    │
+                     │    the format's root or sub-router        │
+                     └───────────────┬──────────────────────────┘
+                                     │ handler.Registry interface
+                     ┌───────────────▼──────────────────────────┐
+                     │  pkg/namespace.ScopedRegistry             │
+                     │  • authorizes (read/write) against the    │
+                     │    namespace's compiled Policy            │
+                     │  • prefixes OwningRepo with <namespace>/  │
+                     │  • records writes into the per-namespace  │
+                     │    package index (ocifactory-packages)    │
+                     └───────────────┬──────────────────────────┘
+                                     │ handler.Registry interface
+                     ┌───────────────▼──────────────────────────┐
+                     │  pkg/oci.Registry                         │
+                     │  AddFile / ReadFile / ListTags /          │
+                     │  ListFiles / DeleteRepoFiles /            │
+                     │  DeleteTagFiles / AppendRefs /            │
+                     │  BlobRedirectURL / Ping                   │
+                     └───────────────┬──────────────────────────┘
+                                     │ ORAS (oras-go/v2)
+                     ┌───────────────▼──────────────────────────┐
+                     │  Any OCI registry                         │
+                     │  (GAR, ECR, GHCR, Harbor, zot, ...)       │
+                     └──────────────────────────────────────────┘
 ```
 
 The on-OCI shape `pkg/oci` writes — version anchors, file manifests,
@@ -80,28 +104,51 @@ Read that doc before touching the `pkg/oci` write paths.
 
 ### Key types
 
-- `oci.RepoFile{OwningRepo, OwningTag, RefTag, Name, MediaType, Digest}` — addresses one file inside the OCI-backed virtual store.
-  - `OwningRepo` is the OCI repository name (e.g. `packages/requests`, `com/foo/bar`).
+- `oci.RepoFile{OwningRepo, OwningTag, RefTag, Name, MediaType, Digest, Size, AllowOverwrite}` — addresses one file inside the OCI-backed virtual store.
+  - `OwningRepo` is the OCI repository name **relative to the namespace** at the handler boundary (e.g. `packages/requests`, `com/foo/bar`). The `namespace.ScopedRegistry` wrapper prefixes it with `<namespace>/` before forwarding to `pkg/oci`, so on the real backend the repo is `<namespace>/packages/requests`.
   - `OwningTag` is the canonical version tag (e.g. `2.31.0`). It identifies the **version manifest** — a constant-size anchor in the [OCI 1.1 referrers layout](docs/architecture/storage-model.md). Files for that version are *not* layers on this manifest; each file is its own **file manifest** with `subject = versionDesc`, addressed via the referrers API and tagged with a deterministic `_f_<sha256>` tag so reads resolve in one round-trip.
   - `RefTag` is an alias tag like `latest`. It identifies an **alias manifest** with `subject = versionDesc` and the canonical version recorded in the `ocifactory.alias.target` annotation.
+  - `AllowOverwrite` is a per-file flag handlers set when the file is intentionally mutable (Maven snapshot artifacts, snapshot `maven-metadata.xml`). It overrides the registry-level `--allow-overwrite` default for that one call.
   - The three manifest kinds are distinguished by `artifactType` suffix — `.version`, `.file`, `.alias` — appended to the operator-configured base type (e.g. `application/vnd.ocifactory.python.version`).
-- `handler.Registry` — the interface every per-format handler depends on. Keep it minimal; do not push format-specific concepts into it.
-- `cred.Cred` — credentials carried in the request `context.Context`. Today only `Basic`. When adding OAuth/OIDC/JWT, add a new field rather than overloading `Basic`.
+- `handler.Registry` — the interface every per-format handler depends on. Keep it minimal; do not push format-specific concepts into it. Implementations are `*oci.Registry` (raw) and `*namespace.ScopedRegistry` (namespaced + authorized, used in production).
+- `namespace.Registry` / `namespace.ScopedRegistry` — the data-plane namespace wrapper. `Registry.For(ns)` returns a cheap per-request `ScopedRegistry` that handlers use as their `handler.Registry`. Authorizer instances are cached per namespace (`DefaultPolicyCacheTTL = 60s`) and invalidated automatically when admin-side `Store.Put` / `Store.Delete` fires the mutation hook.
+- `namespace.Policy` — the JSON-serialised authz block on a namespace `Spec`. Empty Policy is deny-all. `Readers` and `Writers` are independent `SubjectMatcher` lists; matchers ANDed across fields (`issuer`, `sub_match` regex, `email`, `claims_match`, `kind`).
+- `auth.AuthContext{Issuer, ID, Email, Claims}` — the verified caller identity the OIDC authenticator installs into the request context. The `namespace.PolicyAuthorizer` consumes it; out-of-tree authorizers (OPA / Cedar / Casbin) plug in via `namespace.WithAuthzFactory`.
+- `auth.Authorizer` / `auth.Op` (`OpRead`, `OpWrite`) — the coarse pluggable authz surface every namespace policy compiles to.
 
 ### How a per-format handler is structured
 
 Each `pkg/handler/<format>` package owns:
 - `RepoType` constant (`"npm"`, `"python"`, …) — used by `serve` to dispatch.
-- `ArtifactType` constant — the OCI manifest `artifactType` (e.g. `application/vnd.ocifactory.npm`). Unique per format so users can tell formats apart in their OCI registry.
-- `NewHandler(handler.Registry) (*Handler, error)`
-- `Mux() http.Handler` — gorilla/mux router for that format's URL scheme.
-- Translation logic mapping client protocol calls ↔ `RepoFile` operations.
+- `ArtifactType` constant — the OCI manifest `artifactType` base (e.g. `application/vnd.ocifactory.npm`). `pkg/oci` appends `.version` / `.file` / `.alias` to it so the three manifest kinds are distinguishable in the OCI backend.
+- `NewHandler(*namespace.Registry, opts ...Option) (*Handler, error)` — takes the namespace wrapper, not a raw `*oci.Registry`, so every request goes through the authorizer.
+- `Mux() http.Handler` — gorilla/mux router for that format's URL scheme. Mount every route on a `router.PathPrefix("/{namespace}").Subrouter()` (or `"/{namespace}/<format-prefix>"`) so the handler can read the namespace from `mux.Vars(req)` and call `r.For(ns)` to get a per-request `*namespace.ScopedRegistry`.
+- Translation logic mapping client protocol calls ↔ `RepoFile` operations through the scoped registry.
 
-When adding a new format, copy the structure from `pkg/handler/python` (it's the most complete reference, including the embedded simple index template and the dual-write trick that maintains an `index` repo for fast `list packages`).
+When adding a new format, copy the structure from `pkg/handler/python` (it's the most complete reference, including the embedded simple index template, the per-package simple-index cache, and the dual-write trick that maintains an `index` repo for fast "list packages").
+
+### Namespace URL layout
+
+Every format mounts under `/{namespace}/...`. Some formats add a fixed
+sub-prefix after the namespace to make the URL self-describing when a
+single hostname serves multiple formats per namespace:
+
+| Format | URL shape |
+|---|---|
+| python | `/{namespace}/simple/<pkg>/`, `/{namespace}/packages/<pkg>/<version>/<filename>`, `/{namespace}/` for twine upload |
+| maven  | `/{namespace}/maven2/<groupId>/<artifactId>/<version>/<filename>` (and the `maven-metadata.xml` / `archetype-catalog.xml` routes) |
+| npm    | `/{namespace}/<pkg>`, `/{namespace}/{@scope/name}`, `/{namespace}/-/package/<pkg>/dist-tags/<tag>`, `/{namespace}/-/ping` |
+
+Namespaces have to be created via the [admin API](docs/admin.md) before any
+request can land on them — there is no auto-vivification. `ScopedRegistry`
+returns `namespace.ErrNotFound` (mapped to 404 by `handler.WriteNamespaceError`)
+when the namespace's metadata document is missing.
 
 ### Index repos pattern
 
-For formats where you need "list all packages I have" (PyPI simple index, npm registry root, etc.), `python` handler maintains a parallel OCI repo named `index` whose tags are package names. This avoids needing a sidecar database — `ListTags("index")` is the package list. Reuse the pattern when implementing npm/Go/apt.
+For formats where you need "list all packages I have" (PyPI simple index, npm registry root, etc.), `python` handler maintains a parallel OCI repo named `index` (relative to the namespace, so `<namespace>/index` on the backend) whose tags are package names. This avoids needing a sidecar database — `ListTags("index")` is the package list. Reuse the pattern when implementing npm/Go/apt.
+
+Separately, `namespace.Registry` itself maintains a per-namespace **package index repo** at `<namespace>/ocifactory-packages` (configurable via `WithPackageIndexSuffix`). It's an in-process LRU-deduped record of every owning-repo the wrapper has written to, used by `admin serve`'s soft-delete to refuse deleting a non-empty namespace. Format handlers don't write to it directly — every `ScopedRegistry.AddFile` call updates it best-effort.
 
 ## Build, run, test
 
@@ -127,11 +174,20 @@ go vet ./...
 gofmt -s -w .
 go mod tidy
 
-# Run locally against a real OCI registry (e.g. local zot or GAR)
+# Run locally against a real OCI registry (e.g. local zot or GAR).
+# --disable-authn is required for the dev path — Validate refuses to
+# start with neither --authn-kind nor --disable-authn set.
 go run ./cmd/ocifactory serve \
   --repo-type=python \
   --backend-registry=zot.local:5000/ocifactory \
+  --disable-authn \
   --port=8080
+
+# Then create a namespace via the admin service so the data plane has
+# something to serve under.
+go run ./cmd/ocifactory admin serve \
+  --backend-registry=zot.local:5000/ocifactory \
+  --port=8081
 ```
 
 ## Code conventions
@@ -139,7 +195,7 @@ go run ./cmd/ocifactory serve \
 - **Languages:** Go is the only implementation language. Avoid pulling in shell scripts when a Go test will do.
 - **Style:** Write idiomatic Go. Follow [Effective Go](https://go.dev/doc/effective_go) and the Google Go style guide — [overview](https://google.github.io/styleguide/go/), [style decisions](https://google.github.io/styleguide/go/decisions), [best practices](https://google.github.io/styleguide/go/best-practices). Prefer explicit and boring over clever. `gofmt -s` and `go vet` must be clean before every commit.
 - **Errors:** wrap with `fmt.Errorf("...: %w", err)`. Use `errors.Is` / `errors.As` to check. The `pkg/oci` package already exposes `oci.HasCode(err, statusCode)` for translating ORAS HTTP errors — use it in handlers rather than re-deriving status codes.
-- **Logging:** `github.com/abcxyz/pkg/logging`. Read with `logging.FromContext(ctx)`; configure via `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`, `OCIFACTORY_LOG_DEBUG`.
+- **Logging:** `github.com/yolocs/ocifactory/pkg/logging`. Read with `logging.FromContext(ctx)`; configure via `OCIFACTORY_LOG_LEVEL`, `OCIFACTORY_LOG_FORMAT`, `OCIFACTORY_LOG_DEBUG`.
 - **Routing:** gorilla/mux (already adopted, see commit `26f36de`). Don't reach for stdlib `http.ServeMux` for new format handlers.
 - **Public API surface:** anything in `pkg/` is public. Don't expose internals you wouldn't want to support — when in doubt, lowercase it.
 - **Configuration:** Operator-tunable knobs (timeouts, thresholds, feature toggles, backend URLs) go through a CLI flag on `cmd/ocifactory serve`, not `os.Getenv` reads scattered inside library code. Library types (e.g. `oci.Registry`) accept the value through a typed option (`WithStreamingPushDisabled(bool)`, `WithArtifactType(string)`, …) so tests can override it without touching the environment and there's exactly one place — the flag definition — that enumerates every knob ocifactory exposes. Environment variables are reserved for what the runtime / harness sets (`OCIFACTORY_LOG_LEVEL`, secret material, GCP `GOOGLE_APPLICATION_CREDENTIALS` and friends), not product behaviour.
@@ -177,20 +233,22 @@ These are non-negotiable. Apply them to every test in the repo:
 
 1. Create `pkg/handler/<format>/` with `handler.go`, the `Mux()`, and translation logic.
 2. Define `RepoType` and `ArtifactType` constants.
-3. **Accept `WithAuthMiddleware(func(http.Handler) http.Handler)` as an Option** and chain the middleware on whichever routes need authentication. The convention today (python, maven) is `router.Use(mux.MiddlewareFunc(h.authMW))` on the root router so every route is gated. Public-by-default formats (npm registry root, Go module proxy listings) chain on a sub-router and leave reads ungated; outlier endpoints with their own auth contract (npm login bootstrap, Docker token server) sit on a sub-router that doesn't chain it at all. **Do not add an open default**: in `pkg/commands/serve.go`, always pass `WithAuthMiddleware(authMW)` when constructing the handler. The handler-side option is permissive (omitting it leaves routes ungated, which is what tests want), so the gate against silent-no-auth lives in serve.go — verify it's wired before merging.
-4. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Pass `WithAuthMiddleware(authMW)` (built earlier in `runServe`) to the handler constructor.
-5. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs.
-6. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`).
-7. Document the format under `docs/repos/<format>.md`: URL layout, supported client commands, known limitations. Copy [`docs/repos/_template.md`](docs/repos/_template.md) — it has the headings and depth `python.md` / `maven.md` use, plus inline notes on what to call out front-and-center (e.g. operator footguns that break the second invocation of the most common client command).
-8. Update the status table in this file.
+3. **Mount every route under a `/{namespace}` sub-router** so the handler can read the namespace from `mux.Vars(req)` and call `registry.For(ns)` to get a per-request `*namespace.ScopedRegistry`. Optionally prefix routes with a per-format segment (`/{namespace}/maven2/...`, `/{namespace}/simple/...`) when the URL would otherwise be ambiguous against another format on the same hostname.
+4. **Accept `WithAuthMiddleware(func(http.Handler) http.Handler)` as an Option** and chain the middleware on whichever routes need authentication. The convention today (python, maven, npm) is `router.Use(mux.MiddlewareFunc(h.authMW))` on the root router (python, maven) or on the `/{namespace}` sub-router (npm) so every route is gated. Public-by-default formats (Go module proxy listings, future read-without-token endpoints) would chain on a sub-router and leave reads ungated; outlier endpoints with their own auth contract sit on a sub-router that doesn't chain it at all. **Do not add an open default**: in `pkg/commands/serve.go`, always pass `WithAuthMiddleware(authMW)` when constructing the handler. The handler-side option is permissive (omitting it leaves routes ungated, which is what tests want), so the gate against silent-no-auth lives in serve.go — verify it's wired before merging.
+5. **Take a `*namespace.Registry` in `NewHandler`**, not a `*oci.Registry`. Every backend op flows through the scoped view so the namespace's compiled `Policy` runs on every read and write. Map `namespace.ErrNotFound`, `namespace.ErrInvalidName`, `namespace.ErrInvalidOwningRepo`, and `auth.ErrUnauthorized` to HTTP via `handler.WriteNamespaceError` — there's a shared helper because every format needs the same translation.
+6. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Build the `*namespace.Registry` next to the format-specific `*oci.Registry`, pass it to the handler constructor along with `WithAuthMiddleware(authMW)`.
+7. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs. Add a `pkg/handler/<format>/namespace_test.go` mirroring `pkg/handler/python/namespace_test.go`: unknown namespace → 404, deny-all policy → 403, cross-namespace request can't reach another namespace's data.
+8. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`). The harness in `pkg/handler/integrationtest/` seeds a `default` namespace via `Store.Put` before the subprocess starts; copy that pattern.
+9. Document the format under `docs/repos/<format>.md`: URL layout (including the `/{namespace}/` prefix), supported client commands, known limitations. Copy [`docs/repos/_template.md`](docs/repos/_template.md) — it has the headings and depth `python.md` / `maven.md` / `npm.md` use, plus inline notes on what to call out front-and-center (e.g. operator footguns that break the second invocation of the most common client command).
+10. Update the status table in this file.
 
 ## Roadmap (one step at a time)
 
 The intent is to ship each phase production-ready before starting the next. See `docs/ROADMAP.md` for the long form.
 
-1. **Phase 1 — Core formats:** npm → Go module proxy → Debian/apt. (Maven and PyPI already done.)
-2. **Phase 2 — Deployability:** Dockerfile, container image publishing in CI, Cloud Run / Cloudflare Workers deployment guide, basic Prometheus metrics.
-3. **Phase 3 — Auth/Authz extensibility:** OIDC + JWT verification, scoped tokens, pluggable authorizer interface (allow/deny per repo/operation).
+1. **Phase 1 — Core formats:** Go module proxy → Debian/apt. (Python, Maven, npm done.)
+2. **Phase 2 — Deployability:** Cloud Run + Cloudflare deployment guides, structured request logging, rate limiting. (Distroless image, multi-arch publishing, Goreleaser pipeline, Prometheus metrics, signed releases + SBOMs done.)
+3. **Phase 3 — Auth/Authz extensibility:** pluggable authn (OIDC) and per-namespace authz are shipped. Remaining: more authorizer plugins (OPA / Cedar / Casbin examples) and scoped token issuance.
 4. **Phase 4 — Pull-through proxy:** read-through caching from upstream npm/PyPI/Maven Central/proxy.golang.org/Debian mirrors. Cache TTLs, negative caching, immutable-version pinning.
 5. **Phase 5 — Add-ons:** vulnerability scanning (Grype/Trivy integration), retention policies, web UI.
 
@@ -240,8 +298,9 @@ The human is the product owner / reviewer; the agent does most of the implementa
 
 - Adding a new top-level dependency (especially anything implying state outside the OCI backend).
 - Changing the `handler.Registry` interface — every format handler depends on it.
-- Adding a new auth mechanism — discuss the interface shape first.
-- Anything that breaks backward compatibility of existing `--repo-type=python|maven` users (assume there's at least one in the wild).
+- Changing the `namespace.Spec` / `namespace.Policy` JSON shape — bump `CurrentSchemaVersion` and add a read-side migration so older bodies stay loadable; never silently drop fields.
+- Adding a new auth mechanism or `Op` value — discuss the interface shape first. Authenticator implementations must return one of the sentinel errors (`ErrNoCredential`, `ErrInvalidToken`, `ErrIssuerUnavailable`) so the middleware maps to the right HTTP status; authorizers must wrap `auth.ErrUnauthorized` on deny.
+- Anything that breaks backward compatibility of existing `--repo-type=python|maven|npm` users — incl. the URL shape, the on-OCI layout, or the admin API.
 
 ## Out of scope
 

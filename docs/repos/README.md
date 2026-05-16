@@ -16,10 +16,20 @@ using only the page.
 
 Cross-cutting concerns live elsewhere:
 
-- [`../auth.md`](../auth.md) — frontend (caller-to-ocifactory) and
-  backend (ocifactory-to-OCI) authentication.
+- [`../auth.md`](../auth.md) — frontend (caller-to-ocifactory)
+  authentication, per-namespace authorization model, and backend
+  (ocifactory-to-OCI) credentials.
+- [`../admin.md`](../admin.md) — control-plane namespace CRUD API
+  (the prerequisite for serving any data-plane URL).
 - [`../observability.md`](../observability.md) — `/healthz`,
   `/readyz`, `/metrics`, Prometheus metrics surface.
+- [`../operations/partial-uploads.md`](../operations/partial-uploads.md)
+  — what partially-failed `twine upload` / `mvn deploy` runs look
+  like on the backend and the right retry idiom per format.
+- [`../architecture/storage-model.md`](../architecture/storage-model.md)
+  — the on-OCI shape of a single published version: version
+  anchors, file manifests, alias manifests, the deterministic
+  `_f_*` file tag.
 - [`../ROADMAP.md`](../ROADMAP.md) — phased plan: Phase 1 core
   formats, Phase 2 deployability, Phase 3 authz, Phase 4 pull-through
   caching, Phase 5 add-ons.

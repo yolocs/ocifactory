@@ -7,7 +7,12 @@ link here from their "How it's stored" sections.
 
 The implementation lives in [`pkg/oci/registry.go`](../../pkg/oci/registry.go);
 the deterministic file-tag helper lives in
-[`pkg/oci/filetag.go`](../../pkg/oci/filetag.go).
+[`pkg/oci/filetag.go`](../../pkg/oci/filetag.go). The data-plane
+namespace wrapper that prefixes every backend repo with `<namespace>/`
+before reaching `pkg/oci` lives in
+[`pkg/namespace/registry.go`](../../pkg/namespace/registry.go); this
+doc shows the shape `pkg/oci` ends up writing, so every repo path
+below includes the namespace prefix the wrapper adds.
 
 ## TL;DR
 
@@ -83,7 +88,7 @@ etc. The three subtypes are derived in `NewRegistry`.
 A user runs:
 
 ```bash
-twine upload dist/*
+twine upload --repository-url https://ocifactory.your-domain/myteam/ dist/*
 ```
 
 with `dist/` containing:
@@ -94,9 +99,12 @@ requests-2.31.0-py3-none-any.whl
 requests-2.31.0-cp311-cp311-manylinux_2_17_x86_64.whl
 ```
 
-`twine` issues **three independent POSTs** to ocifactory's `/` endpoint
-— one per file. They may arrive in any order and may overlap if `twine`
-is parallelised across CI workers.
+`twine` issues **three independent POSTs** to ocifactory's
+`/{namespace}/` endpoint — one per file. They may arrive in any order
+and may overlap if `twine` is parallelised across CI workers. The
+namespace wrapper resolves each request to the `myteam` namespace's
+authorizer, prefixes the python handler's `packages/requests`
+owning-repo with the namespace segment, and forwards to `pkg/oci`.
 
 Each POST translates to one `Registry.AddFile` call. For the first one
 to land (say the sdist):
@@ -161,11 +169,13 @@ PUT /com/example/foo/maven-metadata.xml
 PUT /com/example/foo/maven-metadata.xml.sha1
 ```
 
-Each PUT lands as one `AddFile` call against the `com/example/foo` OCI
-repo. The first one (jar, say) walks the same five steps as the python
-sdist above: probe, push blob, ensure `1.0.0` version manifest, push
-file manifest with `subject = versionDesc`, tag with deterministic
-`_f_*` tag.
+Each PUT lands as one `AddFile` call against the
+`<namespace>/com/example/foo` OCI repo (the maven handler addresses
+the repo as `com/example/foo`; the namespace wrapper prefixes it
+before forwarding). The first one (jar, say) walks the same five
+steps as the python sdist above: probe, push blob, ensure `1.0.0`
+version manifest, push file manifest with `subject = versionDesc`,
+tag with deterministic `_f_*` tag.
 
 The other 13 PUTs short-circuit at step 3 — the version manifest
 already exists — and each one writes its own independent file
@@ -180,10 +190,12 @@ same file race on the deterministic `_f_*` tag, and last-writer-wins
 on the tag, with the loser's file manifest left as an unreferenced
 manifest the backend's GC eventually reaps.
 
-The artifact-level `maven-metadata.xml` (the file at
-`com/example/foo/maven-metadata.xml`) lands as a file in a separate
-"metadata" tag — see [`docs/repos/maven.md`](../repos/maven.md) for
-the URL-to-tag mapping.
+The artifact-level `maven-metadata.xml` (the URL at
+`/{namespace}/maven2/com/example/foo/maven-metadata.xml`) lands as a
+file in a separate `metadata` tag on the same
+`<namespace>/com/example/foo` repo — see
+[`docs/repos/maven.md`](../repos/maven.md) for the full URL-to-tag
+mapping.
 
 ## Read path
 
