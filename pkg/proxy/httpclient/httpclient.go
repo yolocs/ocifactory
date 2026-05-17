@@ -33,6 +33,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -119,6 +120,7 @@ type Client struct {
 	inner          *http.Client
 	timeout        time.Duration
 	maxRetries     int
+	maxRedirects   int
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 	userAgent      string
@@ -181,6 +183,7 @@ func New(opts Options) *Client {
 		},
 		timeout:        timeout,
 		maxRetries:     maxRetries,
+		maxRedirects:   maxRedirects,
 		initialBackoff: initialBackoff,
 		maxBackoff:     maxBackoff,
 		userAgent:      opts.UserAgent,
@@ -206,6 +209,11 @@ type GetOptions struct {
 	// is applied first; the conditional-GET headers and the
 	// configured User-Agent override on conflict.
 	Header http.Header
+
+	// ValidateRedirect, when set, is called for each redirect target
+	// before the client follows it. Returning an error stops the
+	// request and surfaces proxy.ErrUpstreamMalformed to callers.
+	ValidateRedirect func(*url.URL) error
 }
 
 // Response is the result of a successful Get. The caller MUST close
@@ -314,7 +322,23 @@ func (c *Client) do(ctx context.Context, rawURL string, opts GetOptions) (*Respo
 		req.Header.Set("User-Agent", c.userAgent)
 	}
 
-	resp, err := c.inner.Do(req)
+	client := *c.inner
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if c.maxRedirects < 0 {
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= c.maxRedirects {
+			return fmt.Errorf("%w: redirect chain exceeded %d hops", proxy.ErrUpstreamMalformed, c.maxRedirects)
+		}
+		if opts.ValidateRedirect != nil {
+			if err := opts.ValidateRedirect(next.URL); err != nil {
+				return fmt.Errorf("%w: redirect target %q: %w", proxy.ErrUpstreamMalformed, next.URL.String(), err)
+			}
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
 		// Defensive: net/http's docs say Body is closed when

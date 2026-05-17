@@ -192,6 +192,109 @@ func TestProxy_PackumentFetchRewritesAndCaches(t *testing.T) {
 	}
 }
 
+func TestProxy_PackumentRequiresReadAuthorization(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	fetcher.packument["left-pad"] = &proxynpm.PackumentResponse{
+		Body:        npmPackumentBody("left-pad", "1.0.0", "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"),
+		ContentType: "application/json",
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{Policy: namespace.Policy{
+		Readers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
+		Writers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/left-pad", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got, _ := fetcher.calls(); got != 0 {
+		t.Errorf("GetPackument calls=%d, want 0 when read authz denies", got)
+	}
+}
+
+func TestProxy_ReaderOnlyNamespaceCanFillTarballCache(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	body := "tgz-bytes"
+	packument := npmPackumentBody("left-pad", "1.0.0", "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz")
+	fetcher.tarballs["left-pad@1.0.0/left-pad-1.0.0.tgz"] = &proxynpm.TarballResponse{
+		Body:                 io.NopCloser(strings.NewReader(body)),
+		ContentType:          "application/octet-stream",
+		ContentLength:        int64(len(body)),
+		Packument:            packument,
+		PackumentContentType: "application/json",
+		Version:              versionRaw(t, packument, "1.0.0"),
+	}
+	h, _, backing := newProxyTestHandler(t, fetcher, namespace.Spec{Policy: namespace.Policy{
+		Readers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+		Writers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/left-pad/-/left-pad-1.0.0.tgz", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != body {
+		t.Errorf("body=%q, want %q", got, body)
+	}
+
+	key := testNS + "/" + packageOwningRepo("left-pad") + "/1.0.0/left-pad-1.0.0.tgz"
+	if got := string(backing.Files[key]); got != body {
+		t.Errorf("cached tarball at %q = %q, want %q", key, got, body)
+	}
+}
+
+func TestProxy_MalformedPackumentReturnsBadGateway(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	fetcher.packument["left-pad"] = &proxynpm.PackumentResponse{
+		Body:        npmPackumentBody("other", "1.0.0", "https://registry.npmjs.org/other/-/other-1.0.0.tgz"),
+		ContentType: "application/json",
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{})
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/left-pad", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProxy_DistTagListReadsUpstreamPackument(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	fetcher.packument["left-pad"] = &proxynpm.PackumentResponse{
+		Body:        npmPackumentBody("left-pad", "1.0.0", "https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"),
+		ContentType: "application/json",
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{})
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/-/package/left-pad/dist-tags", nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal dist-tags: %v", err)
+	}
+	want := map[string]string{"latest": "1.0.0"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("dist-tags mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestProxy_PackumentUpstreamUnavailableSynthesizesFromStoredVersions(t *testing.T) {
 	t.Parallel()
 

@@ -103,6 +103,8 @@ func TestNpmIntegration_LiveRegistryProxy(t *testing.T) {
 	t.Run("npm_install_through_proxy", func(t *testing.T) {
 		t.Parallel()
 
+		latest := packumentDistTag(t, registry, pkgName, "latest")
+
 		consumer := newLiveNPMConsumerProject(t)
 		runLiveNPM(t, consumer, registry,
 			"install",
@@ -130,6 +132,18 @@ func TestNpmIntegration_LiveRegistryProxy(t *testing.T) {
 			fmt.Sprintf("%s@%s", pkgName, version),
 		)
 		assertLiveNPMInstalled(t, consumer2, pkgName, version)
+
+		consumer3 := newLiveNPMConsumerProject(t)
+		runLiveNPM(t, consumer3, registry,
+			"install",
+			"--ignore-scripts",
+			"--no-audit",
+			"--no-fund",
+			"--prefer-online",
+			"--package-lock=false",
+			pkgName,
+		)
+		assertLiveNPMInstalled(t, consumer3, pkgName, latest)
 	})
 }
 
@@ -228,6 +242,40 @@ func assertLiveNPMInstalled(t *testing.T, dir, name, version string) {
 	if got, _ := m["version"].(string); got != version {
 		t.Errorf("installed version=%q, want %q", got, version)
 	}
+}
+
+func packumentDistTag(t *testing.T, registry, pkg, tag string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, registry+pkg, nil)
+	if err != nil {
+		t.Fatalf("build packument request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET packument: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		t.Fatalf("packument status = %d, want 200; body:\n%s", resp.StatusCode, body)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		t.Fatalf("read packument: %v", err)
+	}
+	var p struct {
+		DistTags map[string]string `json:"dist-tags"`
+	}
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatalf("parse packument: %v", err)
+	}
+	version := p.DistTags[tag]
+	if version == "" {
+		t.Fatalf("packument missing dist-tags.%s", tag)
+	}
+	return version
 }
 
 func packumentTarballURL(t *testing.T, body []byte, version string) string {

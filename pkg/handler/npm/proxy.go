@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"oras.land/oras-go/v2/errdef"
 
+	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
@@ -105,7 +106,7 @@ func newProxyState(cfg handlerConfig) *proxyState {
 		ttl = DefaultIndexCacheTTL
 	}
 	l1TTL := cfg.proxyL1IndexCacheTTL
-	if l1TTL <= 0 {
+	if l1TTL == 0 {
 		l1TTL = DefaultL1IndexCacheTTL
 	}
 	return &proxyState{
@@ -175,13 +176,88 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 
 func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
+	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "namespace authorization failed")
+		return
+	}
+
+	result, err := h.loadPackumentProxy(ctx, scoped, spec, pkg)
+	if err == nil {
+		writeProxyPackumentBody(w, req, result.body, result.contentType)
+		return
+	}
+
+	if errors.Is(err, proxy.ErrNotFound) {
+		http.Error(w, "package not found", http.StatusNotFound)
+		return
+	}
+	if errors.Is(err, proxy.ErrUpstreamMalformed) {
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream malformed")
+		return
+	}
+	if !errors.Is(err, proxy.ErrUpstreamUnavailable) {
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "proxy fetcher unavailable")
+		return
+	}
+	h.synthesizePackument(w, req, scoped, pkg, err)
+}
+
+func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
+	ctx := req.Context()
+	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "namespace authorization failed")
+		return
+	}
+
+	result, err := h.loadPackumentProxy(ctx, scoped, spec, pkg)
+	if err != nil {
+		switch {
+		case errors.Is(err, proxy.ErrNotFound):
+			http.Error(w, "package not found", http.StatusNotFound)
+		case errors.Is(err, proxy.ErrUpstreamMalformed):
+			handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream malformed")
+		case errors.Is(err, proxy.ErrUpstreamUnavailable):
+			handler.WriteError(ctx, w, http.StatusServiceUnavailable, err, "upstream unavailable")
+		default:
+			handler.WriteError(ctx, w, http.StatusInternalServerError, err, "proxy fetcher unavailable")
+		}
+		return
+	}
+
+	var p packument
+	if err := json.Unmarshal(result.body, &p); err != nil {
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream malformed")
+		return
+	}
+	if p.DistTags == nil {
+		p.DistTags = map[string]string{}
+	}
+	w.Header().Set("Content-Type", distTagsMediaType)
+	if req.Method == http.MethodHead {
+		return
+	}
+	_ = json.NewEncoder(w).Encode(p.DistTags)
+}
+
+type proxyPackumentResult struct {
+	body        []byte
+	contentType string
+}
+
+func (h *Handler) loadPackumentProxy(ctx context.Context, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) (proxyPackumentResult, error) {
 	logger := logging.FromContext(ctx)
 	ns := scoped.Namespace()
 	cacheKey := ns + "|" + pkg
+	indexKey := proxyIndexCacheKey(pkg)
 
 	if e, ok := h.proxy.l1.get(cacheKey); ok {
-		writeProxyPackumentBody(w, req, e.body, e.contentType)
-		return
+		return proxyPackumentResult{body: e.body, contentType: e.contentType}, nil
 	}
 
 	var (
@@ -191,23 +267,21 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 		cachedFound       bool
 	)
 	if h.proxy.indexCache != nil {
-		b, ct, fa, found, err := h.proxy.indexCache.Get(ctx, ns, pkg)
+		b, ct, fa, found, err := h.proxy.indexCache.Get(ctx, ns, indexKey)
 		if err != nil {
 			logger.DebugContext(ctx, "npm indexcache get failed", "error", err)
 		} else if found {
 			cachedBody, cachedContentType, cachedFetchedAt, cachedFound = b, ct, fa, true
 			if h.proxy.now().Sub(fa) < h.proxy.indexCacheTTL {
 				h.proxy.l1.put(cacheKey, l1IndexEntry{body: b, contentType: ct, fetchedAt: fa})
-				writeProxyPackumentBody(w, req, b, ct)
-				return
+				return proxyPackumentResult{body: b, contentType: ct}, nil
 			}
 		}
 	}
 
 	fetcher, err := h.proxy.fetcherFor(spec.Proxy.Upstream)
 	if err != nil {
-		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "proxy fetcher unavailable")
-		return
+		return proxyPackumentResult{}, err
 	}
 
 	resultV, err, _ := h.proxy.indexFlight.Do(cacheKey, func() (any, error) {
@@ -218,12 +292,12 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 		if ferr != nil {
 			return indexFlightResult{}, ferr
 		}
-		body, rerr := proxynpm.RewritePackument(resp.Body, ns)
+		body, rerr := proxynpm.RewritePackument(resp.Body, ns, pkg)
 		if rerr != nil {
 			return indexFlightResult{}, rerr
 		}
 		if h.proxy.indexCache != nil {
-			if perr := h.proxy.indexCache.Put(ctx, ns, pkg, body, resp.ContentType); perr != nil {
+			if perr := h.proxy.indexCache.Put(ctx, ns, indexKey, body, resp.ContentType); perr != nil {
 				logger.DebugContext(ctx, "npm indexcache put failed", "error", perr)
 			}
 		}
@@ -232,21 +306,26 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 	})
 	if err == nil {
 		r := resultV.(indexFlightResult)
-		writeProxyPackumentBody(w, req, r.body, r.contentType)
-		return
+		return proxyPackumentResult{body: r.body, contentType: r.contentType}, nil
 	}
 
 	if errors.Is(err, proxy.ErrNotFound) {
-		http.Error(w, "package not found", http.StatusNotFound)
-		return
+		return proxyPackumentResult{}, err
+	}
+	if errors.Is(err, proxy.ErrUpstreamMalformed) {
+		if cachedFound {
+			logger.WarnContext(ctx, "serving stale npm packument after malformed upstream response",
+				"namespace", ns, "package", pkg, "age", h.proxy.now().Sub(cachedFetchedAt), "error", err)
+			return proxyPackumentResult{body: cachedBody, contentType: cachedContentType}, nil
+		}
+		return proxyPackumentResult{}, err
 	}
 	if cachedFound {
 		logger.WarnContext(ctx, "serving stale npm packument after upstream error",
 			"namespace", ns, "package", pkg, "age", h.proxy.now().Sub(cachedFetchedAt), "error", err)
-		writeProxyPackumentBody(w, req, cachedBody, cachedContentType)
-		return
+		return proxyPackumentResult{body: cachedBody, contentType: cachedContentType}, nil
 	}
-	h.synthesizePackument(w, req, scoped, pkg, err)
+	return proxyPackumentResult{}, err
 }
 
 type indexFlightResult struct {
@@ -341,7 +420,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 		var rewrittenPackument []byte
 		packumentContentType := resp.PackumentContentType
 		if resp.Packument != nil {
-			if body, rerr := proxynpm.RewritePackument(resp.Packument, scoped.Namespace()); rerr == nil {
+			if body, rerr := proxynpm.RewritePackument(resp.Packument, scoped.Namespace(), pkg); rerr == nil {
 				rewrittenPackument = body
 			} else {
 				logger.DebugContext(ctx, "npm packument rewrite during tarball fill failed", "error", rerr)
@@ -364,7 +443,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 			teeRef = &tolerantWriter{w: w}
 			body = io.TeeReader(body, teeRef)
 		}
-		if _, addErr := scoped.AddFile(ctx, populated, body); addErr != nil {
+		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
@@ -381,7 +460,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 				MediaType:  "application/json",
 				Size:       int64(len(resp.Version)),
 			}
-			if _, addErr := scoped.AddFile(ctx, metaRF, bytes.NewReader(resp.Version)); addErr != nil && !errors.Is(addErr, oci.ErrAlreadyExists) {
+			if _, addErr := scoped.AddCachedFile(ctx, metaRF, bytes.NewReader(resp.Version)); addErr != nil && !errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{}, addErr
 			}
 		}
@@ -434,7 +513,7 @@ func (h *Handler) cachePackument(ctx context.Context, ns, pkg string, body []byt
 		contentType = "application/json"
 	}
 	if h.proxy.indexCache != nil {
-		if err := h.proxy.indexCache.Put(ctx, ns, pkg, body, contentType); err != nil {
+		if err := h.proxy.indexCache.Put(ctx, ns, proxyIndexCacheKey(pkg), body, contentType); err != nil {
 			logging.FromContext(ctx).DebugContext(ctx, "npm indexcache put failed", "error", err)
 		}
 	}
@@ -595,4 +674,8 @@ func pickTarballMediaType(upstream string) string {
 		return upstream
 	}
 	return "application/octet-stream"
+}
+
+func proxyIndexCacheKey(pkg string) string {
+	return packageOwningRepo(pkg)
 }

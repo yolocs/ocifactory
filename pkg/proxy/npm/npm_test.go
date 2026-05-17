@@ -2,6 +2,7 @@ package npm
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,104 @@ func TestFetcherFetchTarballUsesPackumentURL(t *testing.T) {
 	}
 }
 
+func TestFetcherFetchTarballRejectsCrossOriginTarballURL(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/left-pad" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"name": "left-pad",
+			"versions": {
+				"1.0.0": {
+					"name": "left-pad",
+					"version": "1.0.0",
+					"dist": {"tarball": "http://169.254.169.254/latest/meta-data/left-pad-1.0.0.tgz"}
+				}
+			}
+		}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	f, err := New(u)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = f.FetchTarball(t.Context(), "left-pad", "1.0.0", "left-pad-1.0.0.tgz")
+	if !errors.Is(err, proxy.ErrUpstreamMalformed) {
+		t.Fatalf("FetchTarball error=%v, want errors.Is ErrUpstreamMalformed", err)
+	}
+}
+
+func TestFetcherFetchTarballRejectsCrossOriginRedirect(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/left-pad":
+			_, _ = fmt.Fprintf(w, `{
+				"name": "left-pad",
+				"versions": {
+					"1.0.0": {
+						"name": "left-pad",
+						"version": "1.0.0",
+						"dist": {"tarball": "http://%s/left-pad/-/left-pad-1.0.0.tgz"}
+					}
+				}
+			}`, r.Host)
+		case "/left-pad/-/left-pad-1.0.0.tgz":
+			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	f, err := New(u)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = f.FetchTarball(t.Context(), "left-pad", "1.0.0", "left-pad-1.0.0.tgz")
+	if !errors.Is(err, proxy.ErrUpstreamMalformed) {
+		t.Fatalf("FetchTarball error=%v, want errors.Is ErrUpstreamMalformed", err)
+	}
+}
+
+func TestFetcherGetPackumentRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.CopyN(w, zeroReader{}, maxPackumentBytes+1)
+	}))
+	t.Cleanup(upstream.Close)
+
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	f, err := New(u)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = f.GetPackument(t.Context(), "left-pad")
+	if !errors.Is(err, proxy.ErrUpstreamMalformed) {
+		t.Fatalf("GetPackument error=%v, want errors.Is ErrUpstreamMalformed", err)
+	}
+}
+
 func TestFetcherFetchTarballClassifiesErrors(t *testing.T) {
 	t.Parallel()
 
@@ -154,4 +253,11 @@ func TestFetcherFetchTarballClassifiesErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }

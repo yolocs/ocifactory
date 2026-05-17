@@ -353,6 +353,14 @@ type ScopedRegistry struct {
 // Namespace returns the bound namespace name.
 func (s *ScopedRegistry) Namespace() string { return s.namespace }
 
+// Authorize checks whether the request context's authenticated
+// subject may perform op in the bound namespace. Format handlers use
+// this for protocol paths that don't naturally map to a concrete OCI
+// read/write operation before returning data.
+func (s *ScopedRegistry) Authorize(ctx context.Context, op auth.Op) error {
+	return s.parent.authorize(ctx, s.namespace, op)
+}
+
 // Spec returns the namespace's current [Spec], used by per-format
 // handlers to dispatch on [Spec.Mode] / read [Spec.Proxy] before
 // committing to a code path.
@@ -381,6 +389,30 @@ func (s *ScopedRegistry) AddFile(ctx context.Context, f *oci.RepoFile, body io.R
 		return nil, errors.New("RepoFile must not be nil")
 	}
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
+		return nil, err
+	}
+	scoped, err := s.parent.scopedFile(s.namespace, f)
+	if err != nil {
+		return nil, err
+	}
+	desc, err := s.parent.inner.AddFile(ctx, scoped, body)
+	if err != nil {
+		return nil, err
+	}
+	s.parent.recordPackage(ctx, s.namespace, f.OwningRepo)
+	return desc, nil
+}
+
+// AddCachedFile writes a proxy cache fill after authorizing the caller
+// for read. It is intentionally narrower than AddFile: user-facing
+// publish APIs must continue to call AddFile so namespace write policy
+// gates real artifact writes, while pull-through proxy cache misses can
+// populate OCI storage for readers without granting them publish rights.
+func (s *ScopedRegistry) AddCachedFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+	if f == nil {
+		return nil, errors.New("RepoFile must not be nil")
+	}
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
 	scoped, err := s.parent.scopedFile(s.namespace, f)

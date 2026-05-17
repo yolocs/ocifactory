@@ -74,7 +74,9 @@ curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/npm-cache \
 
 Then point npm at `https://ocifactory.your-domain/npm-cache/` and run
 normal installs. The first request fetches from upstream and writes to
-OCI; later requests serve from the cache.
+OCI using ocifactory's internal cache-fill path; callers only need
+`readers` policy access, and npm publish / dist-tag write endpoints
+remain disabled in proxy mode. Later requests serve from the cache.
 
 ## URL layout
 

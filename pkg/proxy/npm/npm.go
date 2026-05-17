@@ -22,6 +22,8 @@ import (
 
 const userAgent = "ocifactory-npm-proxy"
 
+const maxPackumentBytes = 32 << 20
+
 // PackumentResponse is the result of a successful upstream packument
 // fetch.
 type PackumentResponse struct {
@@ -123,8 +125,11 @@ func (f *Fetcher) GetPackument(ctx context.Context, pkg string) (*PackumentRespo
 		return nil, fmt.Errorf("npm proxy: packument %s: status %d: %w",
 			pkg, resp.StatusCode, proxy.ErrUpstreamUnavailable)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimited(resp.Body, maxPackumentBytes)
 	if err != nil {
+		if errors.Is(err, errPackumentTooLarge) {
+			return nil, fmt.Errorf("npm proxy: packument %s exceeds %d bytes: %w", pkg, maxPackumentBytes, proxy.ErrUpstreamMalformed)
+		}
 		return nil, fmt.Errorf("npm proxy: read packument %s: %w", pkg, proxy.ErrUpstreamUnavailable)
 	}
 	ct := resp.Header.Get("Content-Type")
@@ -165,12 +170,26 @@ func (f *Fetcher) FetchTarball(ctx context.Context, pkg, version, filename strin
 		return nil, fmt.Errorf("npm proxy: %s@%s invalid dist.tarball %q: %w",
 			pkg, version, versionDoc.Dist.Tarball, proxy.ErrUpstreamMalformed)
 	}
+	if err := f.validateUpstreamURL(tarballURL); err != nil {
+		return nil, fmt.Errorf("npm proxy: %s@%s dist.tarball %q: %v: %w",
+			pkg, version, versionDoc.Dist.Tarball, err, proxy.ErrUpstreamMalformed)
+	}
+	if versionDoc.Name != "" && versionDoc.Name != pkg {
+		return nil, fmt.Errorf("npm proxy: %s@%s version name %q does not match package: %w",
+			pkg, version, versionDoc.Name, proxy.ErrUpstreamMalformed)
+	}
+	if versionDoc.Version != "" && versionDoc.Version != version {
+		return nil, fmt.Errorf("npm proxy: %s@%s version field %q does not match key: %w",
+			pkg, version, versionDoc.Version, proxy.ErrUpstreamMalformed)
+	}
 	if got := path.Base(tarballURL.Path); got != filename {
 		return nil, fmt.Errorf("npm proxy: %s@%s tarball filename %q not in packument (got %q): %w",
 			pkg, version, filename, got, proxy.ErrNotFound)
 	}
 
-	resp, err := f.client.Get(ctx, tarballURL.String(), httpclient.GetOptions{})
+	resp, err := f.client.Get(ctx, tarballURL.String(), httpclient.GetOptions{
+		ValidateRedirect: f.validateUpstreamURL,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +235,24 @@ func (f *Fetcher) packageURL(pkg string) string {
 	return u.JoinPath(pkg).String()
 }
 
+func (f *Fetcher) validateUpstreamURL(u *url.URL) error {
+	if u == nil {
+		return errors.New("URL is nil")
+	}
+	if !strings.EqualFold(u.Scheme, f.upstream.Scheme) || !strings.EqualFold(u.Host, f.upstream.Host) {
+		return fmt.Errorf("outside configured upstream origin %s://%s", f.upstream.Scheme, f.upstream.Host)
+	}
+	prefix := strings.TrimRight(f.upstream.EscapedPath(), "/")
+	if prefix == "" {
+		return nil
+	}
+	p := u.EscapedPath()
+	if p == prefix || strings.HasPrefix(p, prefix+"/") {
+		return nil
+	}
+	return fmt.Errorf("outside configured upstream path %q", prefix)
+}
+
 type npmPackument struct {
 	Name     string                     `json:"name"`
 	Versions map[string]json.RawMessage `json:"versions"`
@@ -253,8 +290,24 @@ func decodePackument(body []byte, pkg string) (*npmPackument, error) {
 	if p.Name == "" {
 		return nil, fmt.Errorf("npm proxy: packument %s missing name: %w", pkg, proxy.ErrUpstreamMalformed)
 	}
+	if pkg != "" && p.Name != pkg {
+		return nil, fmt.Errorf("npm proxy: packument %s has name %q: %w", pkg, p.Name, proxy.ErrUpstreamMalformed)
+	}
 	if p.Versions == nil {
 		return nil, fmt.Errorf("npm proxy: packument %s missing versions: %w", pkg, proxy.ErrUpstreamMalformed)
 	}
 	return &p, nil
+}
+
+var errPackumentTooLarge = errors.New("packument too large")
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, errPackumentTooLarge
+	}
+	return body, nil
 }

@@ -13,11 +13,11 @@ import (
 // RewritePackument rewrites every versions[*].dist.tarball URL in an
 // upstream npm packument so npm clients route tarball downloads back
 // through the ocifactory namespace they queried.
-func RewritePackument(body []byte, namespace string) ([]byte, error) {
+func RewritePackument(body []byte, namespace, expectedPkg string) ([]byte, error) {
 	if namespace == "" {
 		return nil, fmt.Errorf("npm proxy: rewrite: namespace is required")
 	}
-	meta, err := decodePackument(body, "")
+	meta, err := decodePackument(body, expectedPkg)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +55,15 @@ func RewritePackument(body []byte, namespace string) ([]byte, error) {
 		}
 		pkg := meta.Name
 		if vName, ok := versionDoc["name"].(string); ok && vName != "" {
+			if vName != meta.Name {
+				return nil, fmt.Errorf("npm proxy: rewrite packument: version %q name %q does not match package %q: %w",
+					version, vName, meta.Name, proxy.ErrUpstreamMalformed)
+			}
 			pkg = vName
+		}
+		if vVersion, ok := versionDoc["version"].(string); ok && vVersion != "" && vVersion != version {
+			return nil, fmt.Errorf("npm proxy: rewrite packument: version %q has version field %q: %w",
+				version, vVersion, proxy.ErrUpstreamMalformed)
 		}
 		dist["tarball"] = namespaceTarballPath(namespace, pkg, filename)
 	}

@@ -777,6 +777,14 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		h.handleDistTagListProxy(w, req, scoped, spec, pkg)
+		return
+	}
+
 	repo := packageOwningRepo(pkg)
 
 	tags, err := scoped.ListTags(ctx, repo)

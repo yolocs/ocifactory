@@ -42,7 +42,7 @@ Design pillars (in priority order):
 | `internal/version` — build-time version stamping via `-ldflags="-X .../internal/version.Version=..."`, fallbacks to `runtime/debug.ReadBuildInfo()` for dev builds | Done. `--version` surfaces it; `/readyz` includes it in the JSON body. |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
-| Pull-through proxy / caching | Not started |
+| Pull-through proxy / caching | Python and npm done; Maven/Go/apt and cross-format hardening remain Phase 4 work. |
 | Vulnerability scanning | Not started |
 | Authorization extensibility — multiple backends (OPA / Cedar / Casbin) | Pluggable via `namespace.AuthzFactory`; only the matcher-based built-in ships in-tree. |
 | Cloud Run / Cloudflare deployment guides | Not started |
