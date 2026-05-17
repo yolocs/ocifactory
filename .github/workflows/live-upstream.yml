@@ -7,19 +7,14 @@ name: 'live-upstream'
 # the failure and decide whether it's our regression or theirs before
 # reverting.
 #
-# Runs on every PR + a daily schedule + manual dispatch. PR runs catch
-# regressions in pkg/proxy/* and pkg/handler/python/* before merge;
-# the schedule catches upstream-driven drift between PRs.
+# Runs on every PR + manual dispatch. PR runs catch regressions in
+# pkg/proxy/* and pkg/handler/python/* before merge.
 
 on:
   pull_request:
     branches:
       - 'main'
       - 'release/**/*'
-  schedule:
-    # 07:17 UTC daily. Off-the-hour to spread load away from cron
-    # peaks and stagger against the rest of the org's nightlies.
-    - cron: '17 7 * * *'
   workflow_dispatch:
 
 concurrency:
