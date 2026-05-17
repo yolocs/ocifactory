@@ -268,6 +268,14 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
 	isHead := req.Method == http.MethodHead
 	amLeader := false
+	// teeRef captures the leader's tee writer so the outer error branch
+	// can tell whether the response body has already been (partially)
+	// committed. Once any write has gone through the tee, http.Error
+	// can no longer change status/headers but WOULD append extra bytes
+	// to the body the client is reading — which silently corrupts what
+	// the client is about to hash (PEP 658 sidecars, wheels, anything
+	// with a known sha256). Suppress the error body in that case.
+	var teeRef *tolerantWriter
 	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
 		amLeader = true
 
@@ -358,7 +366,8 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			if fileMeta.Size > 0 {
 				w.Header().Set("Content-Length", strconv.FormatInt(fileMeta.Size, 10))
 			}
-			body = io.TeeReader(body, &tolerantWriter{w: w})
+			teeRef = &tolerantWriter{w: w}
+			body = io.TeeReader(body, teeRef)
 		}
 
 		// AddFile writes blob + file manifest + version anchor;
@@ -377,10 +386,18 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	})
 
 	if err != nil {
-		// Classify and surface upstream errors. If we're the leader
-		// and the tee already wrote a 200 + partial body, http.Error
-		// will fail silently — that's fine, the client sees a truncated
-		// response and the next request will retry. Followers haven't
+		// If the leader's tee already started writing the response body,
+		// the 200 + Content-Type / Content-Length are committed. Writing
+		// an error body now would append junk after the bytes the client
+		// is hashing (PEP 658 sidecars, wheels) and turn a clean truncation
+		// into a hash mismatch. Log and bail; the client sees a truncated
+		// response, the next request retries.
+		if amLeader && teeRef != nil && teeRef.used {
+			logger.WarnContext(ctx, "proxy file fetch failed after response body started; suppressing error body",
+				"error", err, "package", pkg, "version", version, "filename", filename)
+			return
+		}
+		// Classify and surface upstream errors. Followers haven't
 		// written anything to their own ResponseWriter yet.
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
@@ -432,9 +449,16 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 type tolerantWriter struct {
 	w    io.Writer
 	dead bool
+	// used flips true on the first Write attempt regardless of whether
+	// the underlying Write succeeded. Callers use it to detect that the
+	// HTTP response body has been committed (status + headers flushed,
+	// body bytes possibly buffered) so they don't append error bytes
+	// that would corrupt a content-addressable client response.
+	used bool
 }
 
 func (t *tolerantWriter) Write(p []byte) (int, error) {
+	t.used = true
 	if t.dead {
 		return len(p), nil
 	}

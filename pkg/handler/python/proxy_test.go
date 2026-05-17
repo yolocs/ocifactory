@@ -2,6 +2,7 @@ package python
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -756,6 +757,9 @@ func TestTolerantWriter(t *testing.T) {
 	if !tw.dead {
 		t.Errorf("tolerantWriter not latched dead after underlying failure")
 	}
+	if !tw.used {
+		t.Errorf("tolerantWriter.used = false after Writes attempted, want true")
+	}
 	if got, want := failing.writes, 1; got != want {
 		t.Errorf("underlying Write calls = %d, want %d (subsequent writes should be swallowed)", got, want)
 	}
@@ -813,6 +817,114 @@ func TestProxy_FileClientDisconnectStillFillsCache(t *testing.T) {
 	if _, _, _, fileCalls := fake.calls(); fileCalls != 1 {
 		t.Errorf("fetchFileCalls = %d after second request, want 1 (cache should serve)", fileCalls)
 	}
+}
+
+// TestProxy_FileAddFileFailureAfterTeeDoesNotCorruptBody locks in the
+// fix for the bug where AddFile failures (e.g. zot rejecting a manifest
+// with invalid mediaType) caused us to call http.Error AFTER the tee
+// already wrote 200 + headers + body bytes. http.Error appended its
+// public-message string to the body the client was about to hash,
+// turning a clean truncation into a silent hash mismatch — exactly what
+// pip observed on PEP 658 sidecar fetches when our `.metadata` blobs
+// had a parameterized mediaType.
+func TestProxy_FileAddFileFailureAfterTeeDoesNotCorruptBody(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeFetcher()
+	const fileURL = "https://files.pythonhosted.org/packages/abc/x-1.0.0.whl"
+	const bodyBytes = "body-bytes-exactly"
+	fake.versionMeta["x@1.0.0"] = &pypython.VersionMetadata{
+		Package: "x", Version: "1.0.0",
+		Files: []pypython.FileMetadata{{
+			Filename: "x-1.0.0.whl",
+			URL:      fileURL,
+			Size:     int64(len(bodyBytes)),
+		}},
+	}
+	fake.files[fileURL] = []byte(bodyBytes)
+
+	// Build a namespace.Registry wrapping a backend whose AddFile
+	// reads the full body (so the tee writes through) and then errors.
+	backing := oci.NewFakeRegistry()
+	wrapped := &addFileFailingBackend{
+		inner:          backing,
+		err:            errors.New("simulated manifest invalid"),
+		failRepoSuffix: "/packages/x",
+	}
+	store := namespace.NewStore(wrapped)
+	reg := namespace.NewRegistry(wrapped, store, namespace.WithPolicyCacheTTL(0))
+	if err := store.Put(t.Context(), &namespace.Namespace{Name: testNS, Spec: namespace.Spec{
+		Mode:   namespace.ModeProxy,
+		Proxy:  namespace.Proxy{Upstream: "https://pypi.org"},
+		Policy: allowAllPolicy(),
+	}}); err != nil {
+		t.Fatalf("Put namespace: %v", err)
+	}
+	authMW := auth.Middleware(auth.AlwaysAnonymous)
+	h, err := NewHandler(reg,
+		WithAuthMiddleware(authMW),
+		WithFetcherFactory(func(*url.URL) (ProxyFetcher, error) { return fake, nil }),
+		WithProxyL1IndexCacheTTL(-1),
+	)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet,
+		"/"+testNS+"/packages/x/1.0.0/x-1.0.0.whl", nil)
+	h.Mux().ServeHTTP(w, r)
+
+	// The body must be EXACTLY the upstream bytes — no error text
+	// appended. The status was already committed to 200 by the tee's
+	// first Write; we can't change it, but we MUST NOT corrupt the body.
+	if got, want := w.Body.String(), bodyBytes; got != want {
+		t.Errorf("body = %q, want %q (extra bytes from http.Error would break content-hash verification)",
+			got, want)
+	}
+}
+
+// addFileFailingBackend wraps a real backend so AddFile reads the full
+// body (so any tee gets exercised end-to-end) and then errors — but only
+// for OwningRepos whose suffix matches failRepoSuffix, so namespace-store
+// writes and other infrastructure AddFile calls still succeed.
+type addFileFailingBackend struct {
+	inner          *oci.FakeRegistry
+	err            error
+	failRepoSuffix string
+}
+
+func (b *addFileFailingBackend) AddFile(ctx context.Context, f *oci.RepoFile, ro io.Reader) (*oci.FileDescriptor, error) {
+	if b.failRepoSuffix != "" && strings.HasSuffix(f.OwningRepo, b.failRepoSuffix) {
+		if _, err := io.Copy(io.Discard, ro); err != nil {
+			return nil, err
+		}
+		return nil, b.err
+	}
+	return b.inner.AddFile(ctx, f, ro)
+}
+
+func (b *addFileFailingBackend) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
+	return b.inner.ReadFile(ctx, f)
+}
+
+func (b *addFileFailingBackend) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
+	return b.inner.BlobRedirectURL(ctx, f)
+}
+func (b *addFileFailingBackend) ListTags(ctx context.Context, repo string) ([]string, error) {
+	return b.inner.ListTags(ctx, repo)
+}
+func (b *addFileFailingBackend) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
+	return b.inner.ListFiles(ctx, repo)
+}
+func (b *addFileFailingBackend) AppendRefs(ctx context.Context, repo, canonicalTag string, refs ...string) error {
+	return b.inner.AppendRefs(ctx, repo, canonicalTag, refs...)
+}
+func (b *addFileFailingBackend) DeleteRepoFiles(ctx context.Context, repo string) error {
+	return b.inner.DeleteRepoFiles(ctx, repo)
+}
+func (b *addFileFailingBackend) DeleteTagFiles(ctx context.Context, repo, tag string) error {
+	return b.inner.DeleteTagFiles(ctx, repo, tag)
 }
 
 // failOnNthWriter errors on the failAt-th Write (1-indexed) and on

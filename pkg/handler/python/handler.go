@@ -70,7 +70,10 @@ var (
 		"py":       "text/x-python",
 		"egg":      "text/plain",
 		"egg-info": "text/plain",
-		"metadata": "text/plain; charset=utf-8",
+		// No charset parameter: this value also lands on the OCI
+		// manifest layer mediaType, whose spec pattern forbids
+		// parameters (rejected by zot with manifest-invalid).
+		"metadata": "text/plain",
 	}
 
 	// pkgNameRegExp is the regex matcher for package names.
