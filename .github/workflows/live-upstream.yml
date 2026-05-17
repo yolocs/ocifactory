@@ -1,14 +1,14 @@
 name: 'live-upstream'
 
 # Non-hermetic integration tests: they talk to real upstream
-# registries (PyPI today, npm/Maven Central later) over the public
+# registries (PyPI, npm today; Maven Central later) over the public
 # internet. Outages, rate limits, or response-shape changes on the
 # upstream side will turn this workflow red. When that happens, read
 # the failure and decide whether it's our regression or theirs before
 # reverting.
 #
 # Runs on every PR + manual dispatch. PR runs catch regressions in
-# pkg/proxy/* and pkg/handler/python/* before merge.
+# pkg/proxy/* and proxy-mode handlers before merge.
 
 on:
   pull_request:
@@ -27,10 +27,10 @@ permissions:
   contents: 'read'
 
 jobs:
-  pypi-upstream:
-    name: 'pypi-upstream'
+  upstream:
+    name: 'upstream'
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: 'actions/checkout@v4' # ratchet:exclude
 
@@ -43,13 +43,20 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: 'Run live PyPI integration tests'
-        # Distinct build tag from the hermetic `integration` suite so
-        # this job runs ONLY the live-upstream cases. ubuntu-latest
-        # ships Docker; the harness spins up zot via testcontainers.
+      - uses: 'actions/setup-node@v4' # ratchet:exclude
+        with:
+          node-version: '22'
+
+      - name: 'Run live upstream integration tests'
+        # Distinct build tags from the hermetic `integration` suite.
+        # Keep all live upstream packages in this single invocation so
+        # one PR check always exercises the full non-hermetic surface.
+        # ubuntu-latest ships Docker; the harness spins up zot via
+        # testcontainers.
         run: |
           go test -race -count=1 \
-            -tags=pypiupstream \
+            -tags=pypiupstream,npmupstream \
             -timeout=10m \
             -v \
-            ./pkg/handler/python/...
+            ./pkg/handler/python/... \
+            ./pkg/handler/npm/...

@@ -25,6 +25,7 @@ Design pillars (in priority order):
 | `pkg/proxy/python` + python proxy mode (registry hit → filter → PyPI JSON metadata → file fetch → tee to OCI; pull-through indexes with stale-OK + synthesis fallback; uploads → 405) | Done, tested. Wired into `pkg/handler/python` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/python.md`](docs/repos/python.md#proxy-mode-pull-through-pypi). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog), checksum verification, snapshot-always-overwrite | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
 | `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`), scoped + unscoped packages | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
+| `pkg/proxy/npm` + npm proxy mode (registry hit → filter → packument fetch/rewrite/cache → tarball fetch → tee to OCI; stale-OK + synthesis fallback; writes → 405) | Done, tested. Wired into `pkg/handler/npm` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md#proxy-mode-pull-through-npm). |
 | `pkg/handler` — `Server`, `Logger`, `MetricsMiddleware`, `ObservabilityHandler` (intercepts `/healthz` / `/readyz` / `/metrics` before format mux) | Done |
 | `pkg/metrics` — pluggable Recorder (Prometheus default, no-op for tests) | Done |
 | `pkg/auth` — Pluggable frontend authentication (Authenticator, AuthContext, Chain, OIDC) | Done, tested. OIDC-only — static passwords are out-of-tree by design. Configured via `OCIFACTORY_AUTHN_*` flags / env vars. |
@@ -41,13 +42,13 @@ Design pillars (in priority order):
 | `internal/version` — build-time version stamping via `-ldflags="-X .../internal/version.Version=..."`, fallbacks to `runtime/debug.ReadBuildInfo()` for dev builds | Done. `--version` surfaces it; `/readyz` includes it in the JSON body. |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
-| Pull-through proxy / caching | Not started |
+| Pull-through proxy / caching | Python and npm done; Maven/Go/apt and cross-format hardening remain Phase 4 work. |
 | Vulnerability scanning | Not started |
 | Authorization extensibility — multiple backends (OPA / Cedar / Casbin) | Pluggable via `namespace.AuthzFactory`; only the matcher-based built-in ships in-tree. |
 | Cloud Run / Cloudflare deployment guides | Not started |
 | Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
 | Rate limiting | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs the `-tags=pypiupstream` tests against real PyPI on every PR (intentionally non-hermetic; PyPI outages will turn it red). Image publish runs on the release workflow, not per-PR. |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs one combined `-tags=pypiupstream,npmupstream` job against real PyPI / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
@@ -256,6 +257,8 @@ The intent is to ship each phase production-ready before starting the next. See 
 ## GitHub workflow
 
 - **Issues are the source of truth for tasks.** Open an issue before non-trivial work; link it from the PR.
+- **Always pull latest first.** Before starting any issue, feature, fix, review follow-up, or branch/worktree creation, update the primary checkout with `git pull --ff-only` from `main`. If it cannot fast-forward cleanly, stop and resolve that state before doing task work.
+- **Delete merged worktrees.** Once a PR is merged, remove its feature worktree from the primary checkout with `git worktree remove ../ocifactory-<short-topic>` and delete the local branch with `git branch -D <short-topic>`. Do this before starting unrelated work so stale worktrees do not accumulate.
 - **One feature = one PR.** Keep PRs reviewable. Refactors should be separate PRs from feature work.
 - **PR description** should explain motivation + summary of approach + manual test steps. Link the issue with `Closes #N`.
 - **CI must be green** before merge. Pre-existing failures aren't a license to add new ones.

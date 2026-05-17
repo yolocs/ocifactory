@@ -60,6 +60,24 @@ npm publish
 npm install some-package
 ```
 
+For pull-through caching from the public npm registry, create the
+namespace in proxy mode instead of hosted mode:
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/npm-cache \
+  -H 'content-type: application/json' \
+  -d '{"mode":"proxy",
+       "proxy":{"upstream":"https://registry.npmjs.org"},
+       "policy":{"readers":[{"issuer":"https://token.actions.githubusercontent.com",
+                             "sub_match":"repo:myorg/.*"}]}}'
+```
+
+Then point npm at `https://ocifactory.your-domain/npm-cache/` and run
+normal installs. The first request fetches from upstream and writes to
+OCI using ocifactory's internal cache-fill path; callers only need
+`readers` policy access, and npm publish / dist-tag write endpoints
+remain disabled in proxy mode. Later requests serve from the cache.
+
 ## URL layout
 
 Every route lives under `/{namespace}/` so the same ocifactory
@@ -105,6 +123,7 @@ OCI backend.
 | `npm install <pkg>` | ✅ Supported | `pkg/handler/npm/integration_test.go` — `publish_then_install_unscoped` |
 | `npm install <pkg>@<version>` | ✅ Supported | Same. |
 | `npm install <pkg>@<dist-tag>` | ✅ Supported | `pkg/handler/npm/integration_test.go` — `dist_tag_add_resolves` |
+| `npm install <pkg>` through `mode: proxy` | ✅ Supported | `pkg/handler/npm/proxy_test.go` — `TestProxy_TarballMissFetchesAndCaches`; live upstream smoke in `pkg/handler/npm/npm_upstream_integration_test.go` |
 | `npm dist-tag add` | ✅ Supported | Same. |
 | `npm dist-tag ls` | ✅ Supported | Tested in `pkg/handler/npm/handler_test.go` (`TestDistTagList`). |
 | `npm dist-tag rm` | ❌ Not supported (v1) | Returns 501. |
@@ -120,6 +139,37 @@ them in the dedicated client-integration job. Locally:
 ```bash
 go test -tags=integration ./pkg/handler/npm/...
 ```
+
+## Proxy mode (pull-through npm)
+
+A namespace with `mode: proxy` and
+`proxy.upstream: https://registry.npmjs.org` acts as a pull-through
+cache. Reads use the same npm URLs as hosted mode:
+
+1. Packument (`GET /{namespace}/{pkg}`): ocifactory checks a short
+   in-process cache, then the OCI-backed proxy index cache. On a miss
+   or stale entry it fetches the upstream packument, rewrites every
+   `versions[*].dist.tarball` URL back through the namespace, stores
+   the rewritten JSON in the proxy cache, and serves it.
+2. Tarball (`GET /{namespace}/{pkg}/-/{file}.tgz`): ocifactory checks
+   the OCI package store first. On a miss it runs the namespace's
+   filter chain, fetches the upstream packument to resolve the tarball
+   URL, streams the tarball to the client while teeing it into OCI, and
+   stores the matching version metadata as `package.json`.
+3. Degraded upstream: if an upstream packument refresh fails and a
+   stale cache entry exists, ocifactory serves stale. If no packument
+   cache exists but tarballs and metadata were already cached, it
+   synthesizes a minimal packument from local OCI state. If neither is
+   available, it returns `503`.
+
+Proxy namespaces are read-through only. `npm publish`,
+`npm dist-tag add`, `npm dist-tag rm`, and unpublish routes return
+`405 Method Not Allowed`; publish into a hosted namespace when you want
+ocifactory to be the source of truth.
+
+Scoped packages round-trip through the same URL shape npm uses:
+`/@scope/name` packuments rewrite tarballs to
+`/{namespace}/@scope/name/-/name-<version>.tgz`.
 
 ## OCI storage layout
 
@@ -271,5 +321,5 @@ client-visible Host need no special configuration.
 - **No `npm whoami` / token introspection.** Returns `404`.
 - **No `npm dist-tag rm`.** Returns `501`. Re-point unwanted dist-tags
   to a known version with `npm dist-tag add <pkg>@<version> <tag>`.
-- **No pull-through caching of upstream npm.** Tracked under Phase 4
-  of [`docs/ROADMAP.md`](../ROADMAP.md).
+- **Proxy mode is read-through only.** Writes to proxy namespaces
+  return `405`; use hosted namespaces for internal publishes.

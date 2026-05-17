@@ -413,9 +413,16 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
 		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		idxCache, err := indexcache.NewCache(cfg.RegistryURL, indexcache.WithBackendAuth(bp))
+		if err != nil {
+			return fmt.Errorf("failed to create proxy index cache: %w", err)
+		}
+		negCache := indexcache.NewNegativeCache()
 		nh, err := npm.NewHandler(nsReg,
 			npm.WithMaxUploadBytes(cfg.NPMMaxUploadBytes),
 			npm.WithAuthMiddleware(authMW),
+			npm.WithProxyIndexCache(idxCache),
+			npm.WithProxyNegativeCache(negCache),
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create npm handler: %w", err)

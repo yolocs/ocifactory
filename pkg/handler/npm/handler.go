@@ -26,6 +26,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"oras.land/oras-go/v2/errdef"
 )
 
@@ -85,6 +86,7 @@ type Handler struct {
 	registry       *namespace.Registry
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
+	proxy          *proxyState
 }
 
 // Option configures optional Handler behaviour. Constructed via the
@@ -94,6 +96,12 @@ type Option func(*handlerConfig)
 type handlerConfig struct {
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
+
+	fetcherFactory       FetcherFactory
+	indexCache           *indexcache.Cache
+	negCache             *indexcache.NegativeCache
+	proxyIndexCacheTTL   time.Duration
+	proxyL1IndexCacheTTL time.Duration
 }
 
 // WithAuthMiddleware installs an authentication middleware on every
@@ -137,11 +145,13 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Handler{
+	h := &Handler{
 		registry:       registry,
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
-	}, nil
+	}
+	h.proxy = newProxyState(cfg)
+	return h, nil
 }
 
 // Mux returns the npm handler's router. Every npm route lives under
@@ -217,6 +227,15 @@ func (h *Handler) handlePing(w http.ResponseWriter, req *http.Request) {
 // the npm client from treating the registry as broken — it just
 // behaves as though the feature isn't available.
 func (h *Handler) handleUnsupported(w http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodDelete {
+		scoped := h.scopedFor(req)
+		if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+			return
+		} else if isProxy {
+			http.Error(w, "writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+	}
 	http.Error(w, "operation not supported by this registry", http.StatusNotFound)
 }
 
@@ -244,6 +263,13 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	scoped := h.scopedFor(req)
+
+	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		http.Error(w, "publishes disabled on proxy namespaces", http.StatusMethodNotAllowed)
+		return
+	}
 
 	if h.maxUploadBytes > 0 {
 		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
@@ -500,20 +526,52 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		h.handlePackumentProxy(w, req, scoped, spec, pkg)
+		return
+	}
+
+	out, status, err := h.buildPackument(ctx, req, scoped, pkg)
+	if err != nil {
+		if status == http.StatusNotFound {
+			http.Error(w, "package not found", http.StatusNotFound)
+			return
+		}
+		if status == 0 {
+			h.writeRegistryError(ctx, w, err, "failed to build packument")
+			return
+		}
+		handler.WriteError(ctx, w, status, err, "failed to build packument")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if req.Method == http.MethodHead {
+		// No body for HEAD, but a Content-Length would be a lie
+		// without serialising the whole document; skip it.
+		return
+	}
+	if err := json.NewEncoder(w).Encode(out); err != nil {
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "failed to encode packument")
+		return
+	}
+}
+
+func (h *Handler) buildPackument(ctx context.Context, req *http.Request, scoped handler.Registry, pkg string) (*packument, int, error) {
 	repo := packageOwningRepo(pkg)
 
 	files, err := scoped.ListFiles(ctx, repo)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
-			http.Error(w, "package not found", http.StatusNotFound)
-			return
+			return nil, http.StatusNotFound, err
 		}
-		h.writeRegistryError(ctx, w, err, "failed to list package files")
-		return
+		return nil, 0, err
 	}
 	if len(files) == 0 {
-		http.Error(w, "package not found", http.StatusNotFound)
-		return
+		return nil, http.StatusNotFound, errdef.ErrNotFound
 	}
 
 	// Group canonical files by version. Each (version, file) row in
@@ -567,14 +625,12 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		}
 		_, rc, err := scoped.ReadFile(ctx, metaRF)
 		if err != nil {
-			h.writeRegistryError(ctx, w, err, "failed to read version metadata")
-			return
+			return nil, 0, err
 		}
 		raw, rerr := io.ReadAll(rc)
 		_ = rc.Close()
 		if rerr != nil {
-			handler.WriteError(ctx, w, http.StatusInternalServerError, rerr, "failed to read version metadata")
-			return
+			return nil, http.StatusInternalServerError, rerr
 		}
 
 		// Rewrite dist.tarball to point at this server. Preserve
@@ -590,8 +646,7 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		// served packument by sending a weird dist shape.
 		var versionDoc map[string]any
 		if err := json.Unmarshal(raw, &versionDoc); err != nil {
-			handler.WriteError(ctx, w, http.StatusInternalServerError, err, "failed to parse stored version metadata")
-			return
+			return nil, http.StatusInternalServerError, err
 		}
 		dist, ok := versionDoc["dist"].(map[string]any)
 		if !ok {
@@ -611,15 +666,13 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		// checksum that round-trips here untouched.
 		merged, mErr := json.Marshal(versionDoc)
 		if mErr != nil {
-			handler.WriteError(ctx, w, http.StatusInternalServerError, mErr, "failed to re-marshal version metadata")
-			return
+			return nil, http.StatusInternalServerError, mErr
 		}
 		out.Versions[version] = merged
 	}
 
 	if len(out.Versions) == 0 {
-		http.Error(w, "package not found", http.StatusNotFound)
-		return
+		return nil, http.StatusNotFound, errdef.ErrNotFound
 	}
 
 	// Resolve dist-tags. Every tag that ListTags returns but
@@ -629,8 +682,7 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 	// the canonical version we already know.
 	allTags, tagErr := scoped.ListTags(ctx, repo)
 	if tagErr != nil && !errors.Is(tagErr, errdef.ErrNotFound) {
-		h.writeRegistryError(ctx, w, tagErr, "failed to list tags")
-		return
+		return nil, 0, tagErr
 	}
 	digestByVersion := map[string]string{}
 	for version, vf := range byVersion {
@@ -669,24 +721,13 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 	// way it would against npmjs.org. Lexical sorting was wrong
 	// (10.0.0 < 2.0.0 lexically) and proper semver isn't worth
 	// pulling in for a behaviour npm doesn't require.
-
-	w.Header().Set("Content-Type", "application/json")
-	if req.Method == http.MethodHead {
-		// No body for HEAD, but a Content-Length would be a lie
-		// without serialising the whole document; skip it.
-		return
-	}
-	if err := json.NewEncoder(w).Encode(out); err != nil {
-		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "failed to encode packument")
-		return
-	}
+	return &out, 0, nil
 }
 
 // handleTarballGet streams a .tgz blob back to the client. Mirrors
 // the maven / python file-get flow: try a backend redirect, fall back
 // to streaming through ocifactory.
 func (h *Handler) handleTarballGet(w http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
 	scoped := h.scopedFor(req)
 	vars := mux.Vars(req)
 	pkg := vars["package"]
@@ -713,36 +754,15 @@ func (h *Handler) handleTarballGet(w http.ResponseWriter, req *http.Request) {
 		MediaType:  "application/octet-stream",
 	}
 
-	logger := logging.FromContext(ctx)
-
-	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
-			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
-			return
-		} else if err != nil {
-			logger.DebugContext(ctx, "npm tarball redirect probe failed; streaming", "error", err)
-		}
-	}
-
-	desc, rc, err := scoped.ReadFile(ctx, f)
-	if err != nil {
-		if errors.Is(err, errdef.ErrNotFound) {
-			http.Error(w, "tarball not found", http.StatusNotFound)
-			return
-		}
-		h.writeRegistryError(ctx, w, err, "failed to read tarball")
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		h.handleTarballGetProxy(w, req, scoped, spec, f)
 		return
 	}
-	defer rc.Close()
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", desc.File.Size))
-	w.Header().Set("X-Checksum-Sha256", desc.File.Digest.String())
-	if req.Method == http.MethodHead {
-		return
-	}
-	if _, err := io.Copy(w, rc); err != nil {
-		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "failed to stream tarball")
+	if !h.tryServeTarballFromRegistry(w, req, scoped, f) {
+		http.Error(w, "tarball not found", http.StatusNotFound)
 		return
 	}
 }
@@ -757,6 +777,14 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		h.handleDistTagListProxy(w, req, scoped, spec, pkg)
+		return
+	}
+
 	repo := packageOwningRepo(pkg)
 
 	tags, err := scoped.ListTags(ctx, repo)
@@ -835,6 +863,13 @@ func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 	pkg := vars["package"]
 	tag := vars["tag"]
 
+	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		http.Error(w, "dist-tag writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
+		return
+	}
+
 	if err := validatePackageName(pkg); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -890,6 +925,13 @@ func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 // removal is more surface than the v1 issue justifies. Operators
 // re-point unwanted dist-tags to a known version instead.
 func (h *Handler) handleDistTagDelete(w http.ResponseWriter, req *http.Request) {
+	scoped := h.scopedFor(req)
+	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		http.Error(w, "dist-tag writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
+		return
+	}
 	http.Error(w, "dist-tag removal is not supported in this version", http.StatusNotImplemented)
 }
 
