@@ -10,22 +10,18 @@ import (
 // KindDenylist is the JSON discriminator for [Denylist].
 const KindDenylist = "deny"
 
-// Denylist denies any [Ref] that matches at least one entry. Two
-// parallel input shapes are supported and ORed together:
+// Denylist returns [DecisionDeny] for any [Ref] that matches at least
+// one entry, and [DecisionAbstain] otherwise — it is an explicit deny
+// override that short-circuits the chain. It never allows on its own.
+//
+// Two parallel input shapes are supported and ORed together:
 //
 //   - Patterns: terse list of package-name globs (the common case).
 //     Each pattern is the equivalent of a [Rule] with only Package set.
-//   - Rules: full (package, version) entries. Each rule's version
-//     constraint is ignored when [Ref.Version] is empty, so a
-//     denylist of `{package:log4j-core, version:2.14.*}` denies the
-//     log4j-core index AND the specific 2.14.x files; 2.17.x file
-//     requests are still allowed.
+//   - Rules: full (package, version) entries.
 //
-// An empty Denylist allows everything; it is valid but typically
-// indicates a misconfiguration, so the spec layer surfaces it
-// visually rather than rejecting it. (A no-entries Denylist is
-// caught by validate as a misconfig — operators who actually want
-// "no denies" simply omit the filter.)
+// An empty Denylist would abstain on every ref, which is useless, so
+// [Denylist.validate] rejects it at construction.
 type Denylist struct {
 	Patterns []string `json:"patterns,omitempty"`
 	Rules    []Rule   `json:"rules,omitempty"`
@@ -34,9 +30,9 @@ type Denylist struct {
 // Kind returns [KindDenylist].
 func (d *Denylist) Kind() string { return KindDenylist }
 
-// Allow returns [DecisionDeny] iff ref matches at least one entry;
-// otherwise [DecisionAllow].
-func (d *Denylist) Allow(ctx context.Context, ref Ref) (Decision, error) {
+// Decide returns [DecisionDeny] when ref matches an entry, otherwise
+// [DecisionAbstain].
+func (d *Denylist) Decide(ctx context.Context, ref Ref) (Decision, error) {
 	for _, p := range d.Patterns {
 		ok, err := matchPattern(p, ref.Package)
 		if err != nil {
@@ -55,7 +51,7 @@ func (d *Denylist) Allow(ctx context.Context, ref Ref) (Decision, error) {
 			return DecisionDeny, nil
 		}
 	}
-	return DecisionAllow, nil
+	return DecisionAbstain, nil
 }
 
 // MarshalJSON emits the kind discriminator alongside the entries so

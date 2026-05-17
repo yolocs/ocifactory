@@ -8,7 +8,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
-func TestDelay_Allow(t *testing.T) {
+func TestDelay_Decide(t *testing.T) {
 	t.Parallel()
 
 	// Pin a wall clock so test outcomes are deterministic.
@@ -56,12 +56,12 @@ func TestDelay_Allow(t *testing.T) {
 			t.Parallel()
 			d := &filter.Delay{MinAge: tc.minAge}
 			ctx := filter.WithClock(t.Context(), func() time.Time { return frozen })
-			got, err := d.Allow(ctx, filter.Ref{Package: "pkg", Version: "1.0.0", UploadTime: tc.uploadTime})
+			got, err := d.Decide(ctx, filter.Ref{Package: "pkg", Version: "1.0.0", UploadTime: tc.uploadTime})
 			if err != nil {
-				t.Fatalf("Allow: %v", err)
+				t.Fatalf("Decide: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("Allow() = %v, want %v", got, tc.want)
+				t.Errorf("Decide() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -74,16 +74,16 @@ func TestDelay_Allow(t *testing.T) {
 func TestDelay_ContextlessUsesWallClock(t *testing.T) {
 	t.Parallel()
 	d := &filter.Delay{MinAge: time.Hour}
-	got, err := d.Allow(t.Context(), filter.Ref{
+	got, err := d.Decide(t.Context(), filter.Ref{
 		Package:    "pkg",
 		Version:    "1.0.0",
 		UploadTime: time.Now().Add(-10 * 365 * 24 * time.Hour),
 	})
 	if err != nil {
-		t.Fatalf("Allow: %v", err)
+		t.Fatalf("Decide: %v", err)
 	}
 	if got != filter.DecisionAllow {
-		t.Errorf("Allow() = %v, want %v", got, filter.DecisionAllow)
+		t.Errorf("Decide() = %v, want %v", got, filter.DecisionAllow)
 	}
 }
 

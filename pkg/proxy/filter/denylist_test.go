@@ -7,7 +7,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
-func TestDenylist_Allow(t *testing.T) {
+func TestDenylist_Decide(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -20,19 +20,19 @@ func TestDenylist_Allow(t *testing.T) {
 		{
 			name:     "patterns-exact-match-denies",
 			patterns: []string{"evil"},
-			ref:      filter.Ref{Package: "evil"},
+			ref:      filter.Ref{Package: "evil", Version: "1.0.0"},
 			want:     filter.DecisionDeny,
 		},
 		{
-			name:     "patterns-no-match-allows",
+			name:     "patterns-no-match-abstains",
 			patterns: []string{"evil"},
-			ref:      filter.Ref{Package: "safe"},
-			want:     filter.DecisionAllow,
+			ref:      filter.Ref{Package: "safe", Version: "1.0.0"},
+			want:     filter.DecisionAbstain,
 		},
 		{
 			name:     "patterns-glob-match",
 			patterns: []string{"evil-*"},
-			ref:      filter.Ref{Package: "evil-package"},
+			ref:      filter.Ref{Package: "evil-package", Version: "1.0.0"},
 			want:     filter.DecisionDeny,
 		},
 		{
@@ -42,18 +42,15 @@ func TestDenylist_Allow(t *testing.T) {
 			want:  filter.DecisionDeny,
 		},
 		{
-			name:  "rule-version-mismatch-allows",
+			name:  "rule-version-mismatch-abstains",
 			rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}},
 			ref:   filter.Ref{Package: "log4j-core", Version: "2.17.1"},
-			want:  filter.DecisionAllow,
+			want:  filter.DecisionAbstain,
 		},
 		{
-			// Index-time (no version on the ref): the rule's version
-			// constraint is ignored and we fall back to package match,
-			// so the denylist denies the log4j-core index entirely.
-			// That's the symmetric "missing version = wildcard"
-			// semantic the operator chose; per-version requests are
-			// still individually checked.
+			// Direct callers can still pass an empty-Version ref. In
+			// that case the rule's version constraint is ignored and
+			// the denylist denies the whole log4j-core package.
 			name:  "rule-empty-ref-version-treats-version-as-wildcard",
 			rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}},
 			ref:   filter.Ref{Package: "log4j-core"},
@@ -67,15 +64,15 @@ func TestDenylist_Allow(t *testing.T) {
 			want:     filter.DecisionDeny,
 		},
 		{
-			name:     "first-of-many-allows",
+			name:     "first-of-many-abstains",
 			patterns: []string{"a", "b", "c"},
-			ref:      filter.Ref{Package: "d"},
-			want:     filter.DecisionAllow,
+			ref:      filter.Ref{Package: "d", Version: "1.0.0"},
+			want:     filter.DecisionAbstain,
 		},
 		{
 			name:     "later-of-many-denies",
 			patterns: []string{"a", "b", "c"},
-			ref:      filter.Ref{Package: "c"},
+			ref:      filter.Ref{Package: "c", Version: "1.0.0"},
 			want:     filter.DecisionDeny,
 		},
 		{
@@ -90,12 +87,12 @@ func TestDenylist_Allow(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			d := &filter.Denylist{Patterns: tc.patterns, Rules: tc.rules}
-			got, err := d.Allow(t.Context(), tc.ref)
+			got, err := d.Decide(t.Context(), tc.ref)
 			if err != nil {
-				t.Fatalf("Allow: %v", err)
+				t.Fatalf("Decide: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("Allow(%+v) = %v, want %v", tc.ref, got, tc.want)
+				t.Errorf("Decide(%+v) = %v, want %v", tc.ref, got, tc.want)
 			}
 		})
 	}

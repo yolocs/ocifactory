@@ -33,11 +33,11 @@ type Delay struct {
 // Kind returns [KindDelay].
 func (d *Delay) Kind() string { return KindDelay }
 
-// Allow returns [DecisionNeedsMoreData] when ref.UploadTime is zero
+// Decide returns [DecisionNeedsMoreData] when ref.UploadTime is zero
 // (the chain should re-run after upstream metadata fetch), otherwise
 // [DecisionDeny] when the version is younger than MinAge and
 // [DecisionAllow] when it has aged enough.
-func (d *Delay) Allow(ctx context.Context, ref Ref) (Decision, error) {
+func (d *Delay) Decide(ctx context.Context, ref Ref) (Decision, error) {
 	if ref.UploadTime.IsZero() {
 		return DecisionNeedsMoreData, nil
 	}

@@ -36,9 +36,10 @@ type Proxy struct {
 	Upstream string `json:"upstream,omitempty"`
 
 	// Filters is the ordered filter chain applied before any upstream
-	// call. First deny wins; [filter.DecisionNeedsMoreData] from a
-	// metadata-dependent filter is re-run after upstream metadata
-	// fetch.
+	// file download. Index requests bypass the chain. Explicit allow
+	// or deny from a filter short-circuits; abstain advances to the
+	// next filter; [filter.DecisionNeedsMoreData] is re-run after
+	// upstream metadata fetch. See [docs/proxy/filter-policy.md].
 	Filters filter.Filters `json:"filters,omitempty"`
 }
 

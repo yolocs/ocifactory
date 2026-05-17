@@ -1,15 +1,17 @@
 // Package filter is the proxy governance layer. It defines the
 // [Filter] interface a proxy namespace runs against each upstream
-// reference and the [Chain] composition that runs filters in order.
-// In-tree filters cover the v1 needs: name [Allowlist], name
-// [Denylist], and a publish-time [Delay].
+// reference and the [Filters] chain that composes them.
 //
-// Filters are run as early as their inputs allow. Name-only filters
-// run before any upstream call; metadata-dependent filters (e.g.
-// [Delay]) return [DecisionNeedsMoreData] when they don't have what
-// they need yet, and the chain caller re-runs after fetching the
-// upstream metadata. See https://github.com/yolocs/ocifactory/issues/118
-// for the design.
+// Policy in one paragraph: an [Allowlist] match returns
+// [DecisionAllow]; a [Denylist] match returns [DecisionDeny]; either
+// short-circuits the chain. A list that doesn't match returns
+// [DecisionAbstain] and the chain moves to the next filter. A
+// metadata-dependent filter like [Delay] makes the final call on
+// anything no list pre-decided. Index requests ([Ref.Version] == "")
+// bypass the chain entirely — filtering applies to file downloads
+// only.
+//
+// See [docs/proxy/filter-policy.md] for the operator-facing version.
 package filter
 
 import (
@@ -27,9 +29,7 @@ import (
 var ErrInvalidFilter = errors.New("invalid filter")
 
 // Ref identifies a package and (optionally) a specific version that
-// a proxy filter is being asked to decide on. Empty fields signal
-// "not known yet" — filters that depend on them should return
-// [DecisionNeedsMoreData] rather than denying.
+// a proxy filter is being asked to decide on.
 type Ref struct {
 	// Package is the upstream package identifier — PyPI normalized
 	// name, npm name (including any "@scope/" prefix), or Maven
@@ -37,15 +37,14 @@ type Ref struct {
 	Package string
 
 	// Version is the upstream version string when resolved. Empty
-	// when the request hasn't pinned a version yet (e.g. an index
-	// fetch). Version-constrained rules treat an empty Version as
-	// "matches any version" so an index request isn't surprised by
-	// a per-version rule firing prematurely.
+	// when the request is an index fetch rather than a file
+	// download; [Filters.Decide] bypasses the chain in that case.
 	Version string
 
 	// UploadTime is when the version was published upstream. Zero
-	// when not yet known; filters depending on it return
-	// [DecisionNeedsMoreData] in that case.
+	// when not yet known; [Delay] returns [DecisionNeedsMoreData]
+	// in that case so the caller can fetch upstream metadata and
+	// re-run.
 	UploadTime time.Time
 }
 
@@ -58,11 +57,9 @@ type Ref struct {
 //     [path.Match] glob).
 //   - Version, when set, is matched against [Ref.Version] (same
 //     semantics) — but only when [Ref.Version] is itself non-empty.
-//     An index request (Version="") makes any per-version rule fall
-//     back to its package check alone, so a rule like
-//     {Package:"log4j-core", Version:"2.14.*"} on a denylist denies
-//     the whole log4j-core index AND the specific 2.14.x files,
-//     symmetrically for allowlist.
+//     An empty [Ref.Version] (which only [Filters.Decide] skips, but
+//     direct callers can still pass) makes any per-version rule fall
+//     back to its package check alone.
 type Rule struct {
 	Package string `json:"package,omitempty"`
 	Version string `json:"version,omitempty"`
@@ -110,10 +107,7 @@ func (r Rule) validate() error {
 
 // matchPattern is the shared exact-or-glob match used by [Rule].
 // Exact match wins as a fast path so a literal pattern doesn't
-// depend on [path.Match]'s glob interpretation (which would surprise
-// nobody for normal names but means a literal glob char in a name
-// is hard to express — operators who actually need a literal glob
-// char can escape it via [path.Match]'s `\`).
+// depend on [path.Match]'s glob interpretation.
 func matchPattern(pattern, name string) (bool, error) {
 	if pattern == name {
 		return true, nil
@@ -121,24 +115,29 @@ func matchPattern(pattern, name string) (bool, error) {
 	return path.Match(pattern, name)
 }
 
-// Decision is the outcome of a single [Filter.Allow] call.
+// Decision is the outcome of a single [Filter.Decide] call.
 type Decision int
 
 const (
-	// DecisionAllow lets the [Ref] pass this filter. The chain
-	// continues to the next filter; a chain that ends with every
-	// filter returning DecisionAllow allows the request overall.
+	// DecisionAllow is an explicit allow. [Filters.Decide]
+	// short-circuits and the request is passed through.
 	DecisionAllow Decision = iota
 
-	// DecisionDeny rejects the [Ref]. The chain short-circuits and
-	// the caller surfaces a 404 (with a deny log + counter at the
-	// caller layer).
+	// DecisionDeny is an explicit deny. [Filters.Decide]
+	// short-circuits and the deciding filter is returned to the
+	// caller for the deny reason.
 	DecisionDeny
+
+	// DecisionAbstain means the filter has no opinion on this ref.
+	// [Filters.Decide] advances to the next filter. When every
+	// filter in the chain abstains the chain returns
+	// [DecisionAllow].
+	DecisionAbstain
 
 	// DecisionNeedsMoreData signals the filter could not evaluate
 	// with the data on the [Ref] (e.g. [Delay] without an
-	// UploadTime). The chain skips this filter for now and the
-	// caller re-runs the chain after fetching upstream metadata.
+	// UploadTime). [Filters.Decide] returns it so the caller can
+	// fetch upstream metadata and re-run.
 	DecisionNeedsMoreData
 )
 
@@ -149,6 +148,8 @@ func (d Decision) String() string {
 		return "allow"
 	case DecisionDeny:
 		return "deny"
+	case DecisionAbstain:
+		return "abstain"
 	case DecisionNeedsMoreData:
 		return "needs-more-data"
 	default:
@@ -162,68 +163,58 @@ func (d Decision) String() string {
 // value is shared across every request that hits a namespace and is
 // expected to be free of per-call mutable state.
 type Filter interface {
-	// Allow decides whether ref should pass this filter. Returning
-	// a non-nil error is reserved for genuinely unexpected failures
-	// (a Filter that wants to deny on a normal condition returns
-	// DecisionDeny with a nil error); the chain treats a non-nil
-	// error as fatal and propagates it.
-	Allow(ctx context.Context, ref Ref) (Decision, error)
+	// Decide returns one of [DecisionAllow], [DecisionDeny],
+	// [DecisionAbstain], or [DecisionNeedsMoreData]. A non-nil
+	// error is reserved for genuinely unexpected failures; a
+	// filter denying on a normal condition returns DecisionDeny
+	// with a nil error.
+	Decide(ctx context.Context, ref Ref) (Decision, error)
 }
 
 // Kinded is the optional extension implemented by every in-tree
 // filter. It exposes the JSON discriminator value so callers
-// (metrics, structured logs) can label denies by filter kind without
-// reflecting on the concrete type.
+// (metrics, structured logs, deny-reason strings) can label by
+// filter kind without reflecting on the concrete type.
 type Kinded interface {
 	Kind() string
 }
 
-// Chain composes filters in order. First [DecisionDeny] wins;
-// [DecisionNeedsMoreData] from one filter does not short-circuit but
-// is "remembered" so the chain's overall return reflects it when no
-// other filter denies.
-type Chain []Filter
-
-// Allow runs the chain.
+// Filters is a serialisable ordered chain. The first filter to
+// return [DecisionAllow], [DecisionDeny], or [DecisionNeedsMoreData]
+// wins; [DecisionAbstain] advances. An empty chain or one whose
+// every filter abstained returns [DecisionAllow] overall.
 //
-// The returned Filter is the deciding filter on DecisionDeny (so
-// callers can label metrics / structured logs by it) and nil
-// otherwise. On DecisionNeedsMoreData the returned Filter is the
-// first filter that asked for more data — useful in tests but not
-// load-bearing for callers, which simply re-run the chain after
-// enriching the ref.
-func (c Chain) Allow(ctx context.Context, ref Ref) (Decision, Filter, error) {
-	var pendingFilter Filter
-	for _, f := range c {
-		d, err := f.Allow(ctx, ref)
+// Index requests ([Ref.Version] == "") bypass the chain — filtering
+// applies to file downloads only.
+type Filters []Filter
+
+// Decide runs the chain.
+//
+// The returned Filter is the deciding filter for any non-Abstain
+// outcome (so callers can log it / label metrics / format a deny
+// reason via [Kinded.Kind]) and nil otherwise. Index requests
+// (empty [Ref.Version]) return [DecisionAllow] with a nil Filter
+// without invoking any filter.
+func (fs Filters) Decide(ctx context.Context, ref Ref) (Decision, Filter, error) {
+	if ref.Version == "" {
+		return DecisionAllow, nil, nil
+	}
+	for _, f := range fs {
+		d, err := f.Decide(ctx, ref)
 		if err != nil {
 			return DecisionDeny, f, err
 		}
 		switch d {
-		case DecisionAllow:
-			// keep going
-		case DecisionDeny:
-			return DecisionDeny, f, nil
-		case DecisionNeedsMoreData:
-			if pendingFilter == nil {
-				pendingFilter = f
-			}
+		case DecisionAllow, DecisionDeny, DecisionNeedsMoreData:
+			return d, f, nil
+		case DecisionAbstain:
+			continue
 		default:
 			return DecisionDeny, f, fmt.Errorf("filter %T returned unknown decision %d", f, d)
 		}
 	}
-	if pendingFilter != nil {
-		return DecisionNeedsMoreData, pendingFilter, nil
-	}
 	return DecisionAllow, nil, nil
 }
-
-// Filters is a serialisable ordered chain. It exists as a named
-// slice (not a bare []Filter) so JSON unmarshaling can dispatch each
-// element to a concrete filter implementation by kind — Go's default
-// encoder can't pick a concrete type for an interface field on its
-// own.
-type Filters []Filter
 
 // MarshalJSON encodes fs as a JSON array. Each element delegates to
 // its concrete filter's MarshalJSON, which embeds the kind

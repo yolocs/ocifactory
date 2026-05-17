@@ -12,7 +12,7 @@ import (
 )
 
 // stubFilter is a Filter that returns a fixed decision and counts
-// how many times Allow has been invoked, so chain tests can pin
+// how many times Decide has been invoked, so chain tests can pin
 // ordering and short-circuit behavior.
 type stubFilter struct {
 	name     string
@@ -21,22 +21,22 @@ type stubFilter struct {
 	calls    int
 }
 
-func (s *stubFilter) Allow(ctx context.Context, ref filter.Ref) (filter.Decision, error) {
+func (s *stubFilter) Decide(ctx context.Context, ref filter.Ref) (filter.Decision, error) {
 	s.calls++
 	return s.decision, s.err
 }
 
 func (s *stubFilter) Kind() string { return s.name }
 
-// chainPath returns the chain.Allow tuple in a comparable shape.
+// chainPath returns the Filters.Decide tuple in a comparable shape.
 type chainPath struct {
 	Decision filter.Decision
 	Matched  string // "" if no filter matched
 }
 
-func runChain(t *testing.T, c filter.Chain, ref filter.Ref) (chainPath, error) {
+func runChain(t *testing.T, fs filter.Filters, ref filter.Ref) (chainPath, error) {
 	t.Helper()
-	d, f, err := c.Allow(t.Context(), ref)
+	d, f, err := fs.Decide(t.Context(), ref)
 	out := chainPath{Decision: d}
 	if f != nil {
 		if k, ok := f.(filter.Kinded); ok {
@@ -46,41 +46,56 @@ func runChain(t *testing.T, c filter.Chain, ref filter.Ref) (chainPath, error) {
 	return out, err
 }
 
-// TestChain_Allow covers the core composition semantics: an empty
-// chain allows; a chain of allows allows; the first deny wins and
-// short-circuits; NeedsMoreData is "remembered" without
-// short-circuiting; and an error short-circuits with the filter
-// returned.
-func TestChain_Allow(t *testing.T) {
+// TestFilters_Decide covers the chain composition semantics:
+//   - Empty chain allows.
+//   - All-abstain chain allows.
+//   - First explicit Allow or Deny short-circuits.
+//   - Abstain advances; NeedsMoreData short-circuits.
+//   - An error short-circuits with the deciding filter returned.
+func TestFilters_Decide(t *testing.T) {
 	t.Parallel()
+
+	// Every test case targets a file download (ref.Version set);
+	// index requests are covered by TestFilters_DecideSkipsIndex.
+	ref := filter.Ref{Package: "pkg", Version: "1.0.0"}
 
 	tests := []struct {
 		name      string
-		chain     filter.Chain
+		chain     filter.Filters
 		want      chainPath
 		wantErr   bool
-		wantCalls []int // expected call count per filter, by index
+		wantCalls []int
 	}{
 		{
 			name:      "empty-chain-allows",
-			chain:     filter.Chain{},
+			chain:     filter.Filters{},
 			want:      chainPath{Decision: filter.DecisionAllow},
 			wantCalls: nil,
 		},
 		{
-			name: "all-allow",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionAllow},
-				&stubFilter{name: "b", decision: filter.DecisionAllow},
-				&stubFilter{name: "c", decision: filter.DecisionAllow},
+			name: "all-abstain-allows",
+			chain: filter.Filters{
+				&stubFilter{name: "a", decision: filter.DecisionAbstain},
+				&stubFilter{name: "b", decision: filter.DecisionAbstain},
+				&stubFilter{name: "c", decision: filter.DecisionAbstain},
 			},
 			want:      chainPath{Decision: filter.DecisionAllow},
 			wantCalls: []int{1, 1, 1},
 		},
 		{
-			name: "first-deny-wins",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionAllow},
+			name: "first-allow-short-circuits",
+			chain: filter.Filters{
+				&stubFilter{name: "a", decision: filter.DecisionAbstain},
+				&stubFilter{name: "b", decision: filter.DecisionAllow},
+				&stubFilter{name: "c", decision: filter.DecisionDeny},
+			},
+			want:      chainPath{Decision: filter.DecisionAllow, Matched: "b"},
+			wantCalls: []int{1, 1, 0},
+		},
+		{
+			name: "first-deny-short-circuits",
+			chain: filter.Filters{
+				&stubFilter{name: "a", decision: filter.DecisionAbstain},
 				&stubFilter{name: "b", decision: filter.DecisionDeny},
 				&stubFilter{name: "c", decision: filter.DecisionAllow},
 			},
@@ -88,55 +103,19 @@ func TestChain_Allow(t *testing.T) {
 			wantCalls: []int{1, 1, 0},
 		},
 		{
-			// First deny is the one returned, even when a later
-			// filter would also deny. Pinning this so observability
-			// labels stay stable (one deny per request).
-			name: "two-denies-first-wins",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionDeny},
-				&stubFilter{name: "b", decision: filter.DecisionDeny},
-			},
-			want:      chainPath{Decision: filter.DecisionDeny, Matched: "a"},
-			wantCalls: []int{1, 0},
-		},
-		{
-			name: "needs-more-data-does-not-short-circuit",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionAllow},
+			name: "abstain-then-needs-more-data",
+			chain: filter.Filters{
+				&stubFilter{name: "a", decision: filter.DecisionAbstain},
 				&stubFilter{name: "b", decision: filter.DecisionNeedsMoreData},
 				&stubFilter{name: "c", decision: filter.DecisionAllow},
 			},
 			want:      chainPath{Decision: filter.DecisionNeedsMoreData, Matched: "b"},
-			wantCalls: []int{1, 1, 1},
-		},
-		{
-			// Deny later in the chain takes precedence over an earlier
-			// NeedsMoreData. The chain caller's contract is: if Deny,
-			// reject; if NeedsMoreData, fetch metadata and re-run; if
-			// Allow, proceed. A deny-after-needs-more-data must not
-			// leak through as NeedsMoreData.
-			name: "deny-trumps-needs-more-data",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionNeedsMoreData},
-				&stubFilter{name: "b", decision: filter.DecisionDeny},
-			},
-			want:      chainPath{Decision: filter.DecisionDeny, Matched: "b"},
-			wantCalls: []int{1, 1},
-		},
-		{
-			name: "first-needs-more-data-is-returned",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionAllow},
-				&stubFilter{name: "b", decision: filter.DecisionNeedsMoreData},
-				&stubFilter{name: "c", decision: filter.DecisionNeedsMoreData},
-			},
-			want:      chainPath{Decision: filter.DecisionNeedsMoreData, Matched: "b"},
-			wantCalls: []int{1, 1, 1},
+			wantCalls: []int{1, 1, 0},
 		},
 		{
 			name: "error-short-circuits",
-			chain: filter.Chain{
-				&stubFilter{name: "a", decision: filter.DecisionAllow},
+			chain: filter.Filters{
+				&stubFilter{name: "a", decision: filter.DecisionAbstain},
 				&stubFilter{name: "b", decision: filter.DecisionDeny, err: errors.New("boom")},
 				&stubFilter{name: "c", decision: filter.DecisionAllow},
 			},
@@ -149,12 +128,12 @@ func TestChain_Allow(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := runChain(t, tc.chain, filter.Ref{Package: "pkg"})
+			got, err := runChain(t, tc.chain, ref)
 			if (err != nil) != tc.wantErr {
-				t.Errorf("Allow() err = %v, wantErr=%v", err, tc.wantErr)
+				t.Errorf("Decide() err = %v, wantErr=%v", err, tc.wantErr)
 			}
 			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("Chain.Allow mismatch (-want +got):\n%s", diff)
+				t.Errorf("Filters.Decide mismatch (-want +got):\n%s", diff)
 			}
 			for i, want := range tc.wantCalls {
 				got := tc.chain[i].(*stubFilter).calls
@@ -166,82 +145,124 @@ func TestChain_Allow(t *testing.T) {
 	}
 }
 
-// TestChain_NeedsMoreDataReRun pins the documented re-run semantics:
-// callers re-invoke the chain after enriching the ref, and a filter
-// that previously returned NeedsMoreData now sees enough data to
-// decide.
-func TestChain_NeedsMoreDataReRun(t *testing.T) {
+// TestFilters_DecideSkipsIndex pins the load-bearing property that
+// filtering applies to file downloads only. An index-style request
+// (empty Ref.Version) returns DecisionAllow without invoking any
+// filter, even one that would deny by package name.
+func TestFilters_DecideSkipsIndex(t *testing.T) {
+	t.Parallel()
+
+	denyAll := &stubFilter{name: "deny-everything", decision: filter.DecisionDeny}
+	fs := filter.Filters{denyAll}
+
+	d, f, err := fs.Decide(t.Context(), filter.Ref{Package: "evil"})
+	if err != nil {
+		t.Fatalf("Decide err: %v", err)
+	}
+	if d != filter.DecisionAllow {
+		t.Errorf("Decision = %v, want Allow", d)
+	}
+	if f != nil {
+		t.Errorf("Filter = %T, want nil", f)
+	}
+	if denyAll.calls != 0 {
+		t.Errorf("filter calls = %d, want 0 (chain bypassed for index)", denyAll.calls)
+	}
+}
+
+// TestFilters_AllowlistOverridesDelay pins the headline policy
+// example: an allowlisted package bypasses delay even when the
+// version is younger than MinAge.
+func TestFilters_AllowlistOverridesDelay(t *testing.T) {
 	t.Parallel()
 
 	frozen := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
-	chain := filter.Chain{
+	fs := filter.Filters{
 		&filter.Allowlist{Patterns: []string{"requests"}},
 		&filter.Delay{MinAge: 24 * time.Hour},
 	}
 	ctx := filter.WithClock(t.Context(), func() time.Time { return frozen })
+	ref := filter.Ref{Package: "requests", Version: "2.31.0", UploadTime: frozen.Add(-time.Hour)}
 
-	// Pass 1: no upload time yet.
-	ref := filter.Ref{Package: "requests", Version: "2.31.0"}
-	d, f, err := chain.Allow(ctx, ref)
+	d, f, err := fs.Decide(ctx, ref)
 	if err != nil {
-		t.Fatalf("pass 1 err: %v", err)
-	}
-	if d != filter.DecisionNeedsMoreData {
-		t.Fatalf("pass 1 decision = %v, want NeedsMoreData", d)
-	}
-	if k, _ := f.(filter.Kinded); k == nil || k.Kind() != filter.KindDelay {
-		t.Errorf("pass 1 pending filter = %T, want *Delay", f)
-	}
-
-	// Pass 2: upload time fresh — still under threshold, expect deny.
-	ref.UploadTime = frozen.Add(-1 * time.Hour)
-	d, f, err = chain.Allow(ctx, ref)
-	if err != nil {
-		t.Fatalf("pass 2 err: %v", err)
-	}
-	if d != filter.DecisionDeny {
-		t.Fatalf("pass 2 decision = %v, want Deny", d)
-	}
-	if k, _ := f.(filter.Kinded); k == nil || k.Kind() != filter.KindDelay {
-		t.Errorf("pass 2 deny filter = %T, want *Delay", f)
-	}
-
-	// Pass 3: upload time aged out — expect allow.
-	ref.UploadTime = frozen.Add(-30 * 24 * time.Hour)
-	d, f, err = chain.Allow(ctx, ref)
-	if err != nil {
-		t.Fatalf("pass 3 err: %v", err)
+		t.Fatalf("Decide err: %v", err)
 	}
 	if d != filter.DecisionAllow {
-		t.Fatalf("pass 3 decision = %v, want Allow", d)
+		t.Errorf("Decision = %v, want Allow", d)
 	}
-	if f != nil {
-		t.Errorf("pass 3 matched filter = %T, want nil", f)
+	if k, _ := f.(filter.Kinded); k == nil || k.Kind() != filter.KindAllowlist {
+		t.Errorf("deciding filter = %T, want *Allowlist", f)
 	}
 }
 
-// TestChain_DenylistShortCircuitsBeforeDelay pins that name-only
-// filters can deny before any metadata-dependent filter would have
-// asked for more data — the load-bearing property that lets a proxy
-// reject by name without ever calling upstream.
-func TestChain_DenylistShortCircuitsBeforeDelay(t *testing.T) {
+// TestFilters_DelayHandlesAbstainedRef pins the typical chain:
+// allow-listed names bypass, deny-listed names short-circuit, and
+// everything else falls through to delay.
+func TestFilters_DelayHandlesAbstainedRef(t *testing.T) {
 	t.Parallel()
 
-	delay := &filter.Delay{MinAge: 24 * time.Hour}
-	chain := filter.Chain{
-		&filter.Denylist{Patterns: []string{"evil"}},
-		delay,
+	frozen := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	fs := filter.Filters{
+		&filter.Allowlist{Patterns: []string{"@myorg/*"}},
+		&filter.Denylist{Patterns: []string{"evil-*"}},
+		&filter.Delay{MinAge: 24 * time.Hour},
+	}
+	ctx := filter.WithClock(t.Context(), func() time.Time { return frozen })
+
+	tests := []struct {
+		name     string
+		ref      filter.Ref
+		wantDec  filter.Decision
+		wantKind string
+		wantErr  bool
+	}{
+		{
+			name:     "allowlisted-bypasses-delay",
+			ref:      filter.Ref{Package: "@myorg/sdk", Version: "1.0.0", UploadTime: frozen.Add(-time.Hour)},
+			wantDec:  filter.DecisionAllow,
+			wantKind: filter.KindAllowlist,
+		},
+		{
+			name:     "denylisted-short-circuits",
+			ref:      filter.Ref{Package: "evil-pkg", Version: "1.0.0", UploadTime: frozen.Add(-30 * 24 * time.Hour)},
+			wantDec:  filter.DecisionDeny,
+			wantKind: filter.KindDenylist,
+		},
+		{
+			name:     "fresh-version-denied-by-delay",
+			ref:      filter.Ref{Package: "neutral", Version: "1.0.0", UploadTime: frozen.Add(-time.Hour)},
+			wantDec:  filter.DecisionDeny,
+			wantKind: filter.KindDelay,
+		},
+		{
+			name:     "aged-version-allowed-by-delay",
+			ref:      filter.Ref{Package: "neutral", Version: "1.0.0", UploadTime: frozen.Add(-30 * 24 * time.Hour)},
+			wantDec:  filter.DecisionAllow,
+			wantKind: filter.KindDelay,
+		},
+		{
+			name:     "missing-upload-time-needs-more-data",
+			ref:      filter.Ref{Package: "neutral", Version: "1.0.0"},
+			wantDec:  filter.DecisionNeedsMoreData,
+			wantKind: filter.KindDelay,
+		},
 	}
 
-	d, f, err := chain.Allow(t.Context(), filter.Ref{Package: "evil"})
-	if err != nil {
-		t.Fatalf("Allow err: %v", err)
-	}
-	if d != filter.DecisionDeny {
-		t.Errorf("Decision = %v, want Deny", d)
-	}
-	if k, _ := f.(filter.Kinded); k == nil || k.Kind() != filter.KindDenylist {
-		t.Errorf("matched filter = %T, want *Denylist", f)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d, f, err := fs.Decide(ctx, tc.ref)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Decide err = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if d != tc.wantDec {
+				t.Errorf("Decision = %v, want %v", d, tc.wantDec)
+			}
+			if k, _ := f.(filter.Kinded); k == nil || k.Kind() != tc.wantKind {
+				t.Errorf("deciding filter = %T, want kind %q", f, tc.wantKind)
+			}
+		})
 	}
 }
 
@@ -258,6 +279,7 @@ func TestDecision_String(t *testing.T) {
 	}{
 		{filter.DecisionAllow, "allow"},
 		{filter.DecisionDeny, "deny"},
+		{filter.DecisionAbstain, "abstain"},
 		{filter.DecisionNeedsMoreData, "needs-more-data"},
 		{filter.Decision(99), "decision(99)"},
 	}

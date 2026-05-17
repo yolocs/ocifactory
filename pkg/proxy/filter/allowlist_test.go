@@ -7,7 +7,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
-func TestAllowlist_Allow(t *testing.T) {
+func TestAllowlist_Decide(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -20,19 +20,19 @@ func TestAllowlist_Allow(t *testing.T) {
 		{
 			name:     "patterns-exact-match",
 			patterns: []string{"requests"},
-			ref:      filter.Ref{Package: "requests"},
+			ref:      filter.Ref{Package: "requests", Version: "2.31.0"},
 			want:     filter.DecisionAllow,
 		},
 		{
-			name:     "patterns-exact-miss",
+			name:     "patterns-exact-miss-abstains",
 			patterns: []string{"requests"},
-			ref:      filter.Ref{Package: "urllib3"},
-			want:     filter.DecisionDeny,
+			ref:      filter.Ref{Package: "urllib3", Version: "2.0.0"},
+			want:     filter.DecisionAbstain,
 		},
 		{
 			name:     "patterns-glob-suffix",
 			patterns: []string{"@myorg/*"},
-			ref:      filter.Ref{Package: "@myorg/sdk"},
+			ref:      filter.Ref{Package: "@myorg/sdk", Version: "1.0.0"},
 			want:     filter.DecisionAllow,
 		},
 		{
@@ -41,13 +41,13 @@ func TestAllowlist_Allow(t *testing.T) {
 			// single-segment match for npm scoped packages.
 			name:     "patterns-glob-does-not-cross-slash",
 			patterns: []string{"@myorg/*"},
-			ref:      filter.Ref{Package: "@myorg/sub/sdk"},
-			want:     filter.DecisionDeny,
+			ref:      filter.Ref{Package: "@myorg/sub/sdk", Version: "1.0.0"},
+			want:     filter.DecisionAbstain,
 		},
 		{
 			name:     "patterns-any-of-multiple",
 			patterns: []string{"foo", "bar", "baz*"},
-			ref:      filter.Ref{Package: "baz-extras"},
+			ref:      filter.Ref{Package: "baz-extras", Version: "1.0.0"},
 			want:     filter.DecisionAllow,
 		},
 		{
@@ -63,17 +63,15 @@ func TestAllowlist_Allow(t *testing.T) {
 			want:  filter.DecisionAllow,
 		},
 		{
-			name:  "rule-version-mismatch-denies",
+			name:  "rule-version-mismatch-abstains",
 			rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}},
 			ref:   filter.Ref{Package: "requests", Version: "2.30.5"},
-			want:  filter.DecisionDeny,
+			want:  filter.DecisionAbstain,
 		},
 		{
-			// Index-time (no version on the ref): the rule's version
-			// constraint is ignored and we fall back to package match,
-			// so the allowlist lets the index through. File-level
-			// requests are still subject to the version constraint
-			// (see "rule-version-mismatch-denies" above).
+			// Direct callers can still pass an empty-Version ref. In
+			// that case the rule's version constraint is ignored and
+			// the rule falls back to its package check alone.
 			name:  "rule-empty-ref-version-treats-version-as-wildcard",
 			rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}},
 			ref:   filter.Ref{Package: "requests"},
@@ -108,12 +106,12 @@ func TestAllowlist_Allow(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			a := &filter.Allowlist{Patterns: tc.patterns, Rules: tc.rules}
-			got, err := a.Allow(t.Context(), tc.ref)
+			got, err := a.Decide(t.Context(), tc.ref)
 			if err != nil {
-				t.Fatalf("Allow: %v", err)
+				t.Fatalf("Decide: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("Allow(%+v) = %v, want %v", tc.ref, got, tc.want)
+				t.Errorf("Decide(%+v) = %v, want %v", tc.ref, got, tc.want)
 			}
 		})
 	}

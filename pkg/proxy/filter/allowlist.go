@@ -10,20 +10,19 @@ import (
 // KindAllowlist is the JSON discriminator for [Allowlist].
 const KindAllowlist = "allow"
 
-// Allowlist denies any [Ref] that doesn't match at least one entry.
+// Allowlist returns [DecisionAllow] for any [Ref] that matches at
+// least one entry, and [DecisionAbstain] otherwise — it is an
+// explicit allow override that lets a request bypass any later filter
+// in the chain (notably [Delay]). It never denies on its own.
+//
 // Two parallel input shapes are supported and ORed together:
 //
 //   - Patterns: terse list of package-name globs (the common case).
 //     Each pattern is the equivalent of a [Rule] with only Package set.
-//   - Rules: full (package, version) entries. Each rule's version
-//     constraint is ignored when [Ref.Version] is empty, so an
-//     allowlist of `{package:requests, version:2.31.*}` allows the
-//     requests index through and only restricts per-version file
-//     requests.
+//   - Rules: full (package, version) entries.
 //
-// An Allowlist with no entries denies everything; that's a useful
-// "off switch" for a proxy namespace but also an easy footgun, so
-// [Allowlist.validate] rejects it.
+// An empty Allowlist would abstain on every ref, which is useless,
+// so [Allowlist.validate] rejects it at construction.
 type Allowlist struct {
 	Patterns []string `json:"patterns,omitempty"`
 	Rules    []Rule   `json:"rules,omitempty"`
@@ -32,9 +31,9 @@ type Allowlist struct {
 // Kind returns [KindAllowlist].
 func (a *Allowlist) Kind() string { return KindAllowlist }
 
-// Allow returns [DecisionAllow] iff ref matches at least one entry;
-// otherwise [DecisionDeny].
-func (a *Allowlist) Allow(ctx context.Context, ref Ref) (Decision, error) {
+// Decide returns [DecisionAllow] when ref matches an entry, otherwise
+// [DecisionAbstain].
+func (a *Allowlist) Decide(ctx context.Context, ref Ref) (Decision, error) {
 	for _, p := range a.Patterns {
 		ok, err := matchPattern(p, ref.Package)
 		if err != nil {
@@ -53,7 +52,7 @@ func (a *Allowlist) Allow(ctx context.Context, ref Ref) (Decision, error) {
 			return DecisionAllow, nil
 		}
 	}
-	return DecisionDeny, nil
+	return DecisionAbstain, nil
 }
 
 // MarshalJSON emits the kind discriminator alongside the entries so

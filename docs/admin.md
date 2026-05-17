@@ -111,11 +111,10 @@ Names must satisfy:
   Required when `mode` is `"proxy"`; must parse as an absolute
   `http`/`https` URL. A `proxy` block on a hosted namespace is
   rejected at validation.
-- `proxy.filters` is the ordered filter chain applied before any
-  upstream call (allowlist / denylist / publish-time delay). The
-  concrete shape lands in a follow-up issue; today ocifactory accepts
-  and roundtrips arbitrary filter JSON so an operator's spec written
-  for a newer ocifactory survives older binaries.
+- `proxy.filters` is the ordered filter chain applied to upstream
+  file downloads (allow / deny / publish-time delay). Index requests
+  bypass the chain. See [`docs/proxy/filter-policy.md`](proxy/filter-policy.md)
+  for the policy semantics and config shapes.
 - `format` is reserved for future format-specific knobs; ocifactory
   preserves it across roundtrips so a newer ocifactory's keys aren't
   silently dropped by an older one.
