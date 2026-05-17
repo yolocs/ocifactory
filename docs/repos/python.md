@@ -261,6 +261,80 @@ the matching namespace via the admin API. The on-manifest shape (file
 manifests + version anchors + alias manifests) is unchanged across
 this migration — only the repo path moved.
 
+## Proxy mode (pull-through PyPI)
+
+Set the namespace's `mode` to `"proxy"` and supply a `proxy.upstream`
+URL when creating it via the admin API:
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "mode": "proxy",
+    "proxy": {
+      "upstream": "https://pypi.org",
+      "filters": [
+        {"kind": "denylist", "rules": [{"package": "evil-*"}]}
+      ]
+    },
+    "policy": {
+      "readers": [{"issuer": "..."}],
+      "writers": [{"issuer": "..."}]
+    }
+  }' \
+  http://admin.ocifactory.internal/admin/v1/namespaces/pypi-cache
+```
+
+Point `pip` at the namespace exactly like a hosted one:
+
+```ini
+# ~/.pip/pip.conf
+[global]
+index-url = https://ocifactory.example.com/pypi-cache/simple/
+```
+
+What changes on the wire:
+
+- **`/simple/<pkg>/`** (per-package index): served from an in-process
+  L1 cache (10 s TTL by default) → an OCI-backed pull-through cache
+  under `<ns>/ocifactory-proxy-cache/index/<pkg>` (60 s TTL) → upstream
+  PyPI. Absolute `files.pythonhosted.org` URLs in the response are
+  rewritten to `/<ns>/packages/<pkg>/<version>/<filename>` so file
+  downloads route back through ocifactory.
+- **`/simple/`** (top-level): same caching shape. No URL rewriting
+  needed (anchors are package-relative).
+- **`/packages/<pkg>/<version>/<filename>`**: registry hit → done.
+  Miss → cheap filter chain (name allowlist/denylist) → PyPI JSON
+  metadata fetch → metadata-dependent filters (publish-time delay)
+  → upstream file fetch → tee through `AddFile` into OCI while
+  streaming to the client. The second request for the same file
+  serves entirely from the OCI cache.
+- **Uploads (`POST /`)** return `405 Method Not Allowed`. Twine
+  cannot publish into a proxy namespace.
+
+Degraded operation:
+
+- Upstream returns 5xx on an index request and the OCI cache has a
+  stale entry → serve stale, log a warning.
+- Upstream returns 5xx and no cache entry exists → synthesize a
+  minimal index from local `ListFiles("packages/"+pkg)`, so previously
+  cached files remain installable.
+- Upstream and local synthesis both empty → 503 Service Unavailable.
+- Upstream returns 404 on a file → 404 to the client. A short in-memory
+  negative cache (60 s default) suppresses repeat probes for the same
+  bad URL.
+
+Concurrent first-misses for the same `(pkg, version, filename)` collapse
+onto one upstream fetch via singleflight, so a thundering herd of
+`pip install requests` at deploy time pays one upstream RTT per file
+per process — not N.
+
+The filter chain (issue [#110](https://github.com/yolocs/ocifactory/issues/110))
+runs allowlist / denylist filters before any upstream call and the
+publish-time `delay` filter after PyPI metadata fetch. A denied file
+returns 404; a denied index entry is filtered out of the response. See
+[`docs/proxy/filter-policy.md`](../proxy/filter-policy.md).
+
 ## Limitations
 
 - **No PEP 658 `data-dist-info-metadata`.** `pip` falls back to
@@ -274,6 +348,6 @@ this migration — only the repo path moved.
   get the PEP 691 response.
 - **No yank API.** A bad release has to be pulled by deleting the
   `packages/<pkg>:<version>` tag in your OCI backend.
-- **No pull-through caching of upstream PyPI.** Tracked under Phase 4
-  of [`docs/ROADMAP.md`](../ROADMAP.md).
+- **No PEP 658 `data-dist-info-metadata` synthesis** on hosted namespaces. Proxy
+  namespaces preserve the upstream attribute when PyPI sets it.
 - **No XML-RPC mirror endpoints.** Deprecated upstream; not implemented.
