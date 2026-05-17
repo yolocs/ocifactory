@@ -75,15 +75,16 @@ const (
 )
 
 // cacheRepoSegment is the path segment between the namespace name and
-// the package name. The leading underscore makes cache repos visually
-// distinct from real `<namespace>/packages/...` storage when an
-// operator lists the OCI registry. The segment does not conform to
-// OCI distribution v2's repository name regex (each component must
-// start with `[a-z0-9]`); the issue spec calls for the literal value
-// and unit tests use an in-memory backend that ignores the
-// constraint. Production wiring against a strict registry will need
-// to either loosen the regex or rename this prefix.
-const cacheRepoSegment = "_proxy_cache/index"
+// the package name. The `ocifactory-` prefix matches the in-tree
+// convention for registry-internal repos (compare
+// [pkg/namespace.indexRepoSegment] = "ocifactory-namespaces" and
+// [pkg/namespace.Registry] / "ocifactory-packages"), keeping cache
+// repos visually distinct from real `<namespace>/packages/...`
+// storage when an operator lists the OCI registry. The literal here
+// is a single OCI distribution name component followed by
+// "/index" — each segment satisfies the `[a-z0-9]+...` regex
+// oras-go's `remote.NewRepository` validates.
+const cacheRepoSegment = "ocifactory-proxy-cache/index"
 
 // layerMediaType is the MediaType applied to the layer descriptor in
 // the cache manifest. The original upstream Content-Type is kept in
@@ -178,9 +179,16 @@ func NewCache(baseURL *url.URL, opts ...Option) (*Cache, error) {
 
 // Get returns the cached body for (ns, pkg) along with its
 // upstream Content-Type and the wall-clock time it was fetched.
-// A miss returns (nil, "", zero-time, false, nil) — no error. Any
-// other failure (manifest fetch, malformed annotation) is returned
-// wrapped.
+// A cache miss returns (nil, "", zero-time, false, nil) — no
+// error, and intentionally distinct from [proxy.ErrNotFound], which
+// callers reserve for "upstream told us this package doesn't
+// exist". Any other failure (manifest fetch, malformed annotation,
+// dangling tag) is returned wrapped.
+//
+// pkg may contain '/' (npm scoped packages, Maven groupId paths);
+// the caller is responsible for normalising the value (rejecting
+// "..", absolute paths, etc.) so a maliciously-crafted pkg cannot
+// traverse out of the namespace's cache prefix.
 func (c *Cache) Get(ctx context.Context, ns, pkg string) ([]byte, string, time.Time, bool, error) {
 	target, err := c.newTargetFunc(ctx, c.repoPath(ns, pkg))
 	if err != nil {

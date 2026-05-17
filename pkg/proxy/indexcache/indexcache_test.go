@@ -1,15 +1,20 @@
 package indexcache
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content"
 	"oras.land/oras-go/v2/content/memory"
 )
 
@@ -147,8 +152,12 @@ func TestCache_PutGetRoundtrip(t *testing.T) {
 
 	wantBody := []byte("<html><body>simple-index</body></html>")
 	wantContentType := "text/html; charset=utf-8"
+	// The cache stamps Cache.now() (pinned by newTestCache) onto
+	// FetchedAtAnnotation; capturing it here lets the assertion
+	// below compare exactly. Tolerance against the real wall clock
+	// is covered by TestCache_FetchedAtWallClock.
+	wantFetchedAt := c.now()
 
-	before := c.now()
 	if err := c.Put(ctx, "default", "requests", wantBody, wantContentType); err != nil {
 		t.Fatalf("Put() error = %v", err)
 	}
@@ -166,11 +175,8 @@ func TestCache_PutGetRoundtrip(t *testing.T) {
 	if gotContentType != wantContentType {
 		t.Errorf("Get() contentType = %q, want %q", gotContentType, wantContentType)
 	}
-	// fetchedAt is stamped by Cache.now at Put time; with the pinned
-	// clock the test compares exactly. Tolerance check covered by
-	// TestCache_FetchedAtWallClock.
-	if !gotFetchedAt.Equal(before) {
-		t.Errorf("Get() fetchedAt = %v, want %v", gotFetchedAt, before)
+	if !gotFetchedAt.Equal(wantFetchedAt) {
+		t.Errorf("Get() fetchedAt = %v, want %v", gotFetchedAt, wantFetchedAt)
 	}
 }
 
@@ -370,19 +376,19 @@ func TestCache_RepoPath(t *testing.T) {
 			name: "simple ns and pkg",
 			ns:   "default",
 			pkg:  "requests",
-			want: "default/_proxy_cache/index/requests",
+			want: "default/ocifactory-proxy-cache/index/requests",
 		},
 		{
 			name: "scoped npm package",
 			ns:   "default",
 			pkg:  "@scope/name",
-			want: "default/_proxy_cache/index/@scope/name",
+			want: "default/ocifactory-proxy-cache/index/@scope/name",
 		},
 		{
 			name: "maven groupId path",
 			ns:   "internal",
 			pkg:  "com/google/guava/guava",
-			want: "internal/_proxy_cache/index/com/google/guava/guava",
+			want: "internal/ocifactory-proxy-cache/index/com/google/guava/guava",
 		},
 	}
 	for _, tc := range tests {
@@ -432,5 +438,125 @@ func TestCache_PutTargetOpenError(t *testing.T) {
 	}
 	if !errors.Is(err, sentinel) {
 		t.Errorf("Put() error = %v, want wrap of %v", err, sentinel)
+	}
+}
+
+// TestCache_GetMalformedManifest pre-populates the in-memory target
+// with a manifest tagged `current` whose contents violate one of the
+// Get-side invariants (wrong artifactType, wrong layer count, missing
+// or bad fetched-at annotation) and checks Get surfaces it as an
+// error rather than silently returning bad data. These states can't
+// arise via Put, but a future bug or an operator scribbling on the
+// cache repo with `oras` would produce them.
+func TestCache_GetMalformedManifest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		mutate         func(m *ocispec.Manifest)
+		wantErrSubstr  string
+		wantFoundFalse bool
+	}{
+		{
+			name: "wrong artifactType",
+			mutate: func(m *ocispec.Manifest) {
+				m.ArtifactType = "application/vnd.somebody.else"
+			},
+			wantErrSubstr: "unexpected artifactType",
+		},
+		{
+			name: "two layers",
+			mutate: func(m *ocispec.Manifest) {
+				m.Layers = append(m.Layers, m.Layers[0])
+			},
+			wantErrSubstr: "manifest has 2 layers",
+		},
+		{
+			name: "missing fetched-at annotation",
+			mutate: func(m *ocispec.Manifest) {
+				delete(m.Annotations, FetchedAtAnnotation)
+			},
+			wantErrSubstr: "missing proxy.cache.fetched-at",
+		},
+		{
+			name: "malformed fetched-at annotation",
+			mutate: func(m *ocispec.Manifest) {
+				m.Annotations[FetchedAtAnnotation] = "not a timestamp"
+			},
+			wantErrSubstr: "parse proxy.cache.fetched-at",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+
+			store := memory.New()
+			c, err := NewCache(&url.URL{Scheme: "https", Host: "example.com"})
+			if err != nil {
+				t.Fatalf("NewCache() error = %v", err)
+			}
+			c.newTargetFunc = func(_ context.Context, _ string) (oras.Target, error) {
+				return store, nil
+			}
+
+			seedMalformedManifest(t, store, tc.mutate)
+
+			_, _, _, found, err := c.Get(ctx, "default", "pkg")
+			if err == nil {
+				t.Fatalf("Get() error = nil, want %q", tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("Get() error = %q, want substring %q", err, tc.wantErrSubstr)
+			}
+			if found {
+				t.Errorf("Get() found = true, want false on malformed manifest")
+			}
+		})
+	}
+}
+
+// seedMalformedManifest writes a well-formed cache manifest into
+// store, then lets the caller mutate it before pushing + tagging. The
+// well-formed baseline keeps every test focused on the one field it
+// is breaking.
+func seedMalformedManifest(t *testing.T, store *memory.Store, mutate func(*ocispec.Manifest)) {
+	t.Helper()
+	ctx := t.Context()
+
+	body := []byte("payload")
+	layerDesc := content.NewDescriptorFromBytes(layerMediaType, body)
+	if err := store.Push(ctx, layerDesc, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed: push body: %v", err)
+	}
+
+	emptyDesc := ocispec.DescriptorEmptyJSON
+	if err := store.Push(ctx, emptyDesc, bytes.NewReader(emptyDesc.Data)); err != nil {
+		t.Fatalf("seed: push config: %v", err)
+	}
+
+	manifest := ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: ArtifactType,
+		Config:       emptyDesc,
+		Layers:       []ocispec.Descriptor{layerDesc},
+		Annotations: map[string]string{
+			FetchedAtAnnotation:   time.Now().UTC().Format(time.RFC3339Nano),
+			ContentTypeAnnotation: "text/plain",
+		},
+	}
+	mutate(&manifest)
+
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("seed: marshal manifest: %v", err)
+	}
+	manifestDesc := content.NewDescriptorFromBytes(ocispec.MediaTypeImageManifest, manifestBytes)
+	if err := store.Push(ctx, manifestDesc, bytes.NewReader(manifestBytes)); err != nil {
+		t.Fatalf("seed: push manifest: %v", err)
+	}
+	if err := store.Tag(ctx, manifestDesc, CacheTag); err != nil {
+		t.Fatalf("seed: tag manifest: %v", err)
 	}
 }
