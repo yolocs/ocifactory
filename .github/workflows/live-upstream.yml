@@ -26,6 +26,11 @@ concurrency:
   group: '${{ github.workflow }}-${{ github.head_ref || github.ref }}'
   cancel-in-progress: true
 
+# Least-privilege: this workflow only needs to clone the repo to run
+# tests. No release uploads, no PR writes, no package publishing.
+permissions:
+  contents: 'read'
+
 jobs:
   pypi-upstream:
     name: 'pypi-upstream'
