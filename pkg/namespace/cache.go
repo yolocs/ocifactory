@@ -12,8 +12,16 @@ import (
 // cache. notFound carries a negative result from [Store.Get] so a
 // burst of requests against a missing namespace doesn't repeatedly
 // hit the metadata backend.
+//
+// spec is the raw [Spec] body the authorizer was compiled from. It is
+// held alongside the authorizer so format handlers can dispatch on
+// [Spec.Mode] / read [Spec.Proxy] without paying a second
+// [Store.Get]; spec and authorizer always reflect the same point-in-time
+// document. The cache value is treated as immutable — callers receive
+// the pointer for free read access and must not mutate it.
 type cachedPolicy struct {
 	authorizer auth.Authorizer
+	spec       *Spec
 	notFound   bool
 }
 

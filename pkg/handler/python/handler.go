@@ -20,6 +20,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"github.com/yolocs/ocifactory/pkg/renderer"
 	"oras.land/oras-go/v2/errdef"
 )
@@ -69,7 +70,10 @@ var (
 		"py":       "text/x-python",
 		"egg":      "text/plain",
 		"egg-info": "text/plain",
-		"metadata": "text/plain; charset=utf-8",
+		// No charset parameter: this value also lands on the OCI
+		// manifest layer mediaType, whose spec pattern forbids
+		// parameters (rejected by zot with manifest-invalid).
+		"metadata": "text/plain",
 	}
 
 	// pkgNameRegExp is the regex matcher for package names.
@@ -95,6 +99,7 @@ type Handler struct {
 	indexCache     *simpleIndexCache
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
+	proxy          *proxyState
 }
 
 // Option configures optional Handler behaviour.
@@ -104,6 +109,16 @@ type handlerConfig struct {
 	simpleIndexCacheTTL time.Duration
 	authMW              func(http.Handler) http.Handler
 	maxUploadBytes      int64
+
+	// Proxy plumbing. Populated by the WithProxy* options. The
+	// fetcherFactory is consulted only when a request lands on a
+	// namespace with mode: proxy; hosted-only deployments leave
+	// these zero and pay nothing.
+	fetcherFactory       FetcherFactory
+	indexCache           *indexcache.Cache
+	negCache             *indexcache.NegativeCache
+	proxyIndexCacheTTL   time.Duration
+	proxyL1IndexCacheTTL time.Duration
 }
 
 // WithSimpleIndexCacheTTL sets the per-package simple-index cache TTL.
@@ -122,6 +137,43 @@ func WithMaxUploadBytes(n int64) Option {
 	return func(c *handlerConfig) {
 		c.maxUploadBytes = n
 	}
+}
+
+// WithFetcherFactory installs a custom PyPI proxy fetcher factory. The
+// default ([DefaultFetcherFactory]) builds a [pypython.Fetcher] with
+// package defaults. Tests use this to inject a fake fetcher; out-of-tree
+// implementations are not a supported extension point.
+func WithFetcherFactory(f FetcherFactory) Option {
+	return func(c *handlerConfig) { c.fetcherFactory = f }
+}
+
+// WithProxyIndexCache wires the OCI-backed pull-through index cache
+// used by proxy namespaces. When nil (the default), proxy index
+// requests skip the OCI cache and only use the in-process L1 — fine
+// for tests, undersized for production.
+func WithProxyIndexCache(c *indexcache.Cache) Option {
+	return func(cfg *handlerConfig) { cfg.indexCache = c }
+}
+
+// WithProxyNegativeCache wires the in-memory negative cache used by
+// the proxy file path. When nil, repeat 404s pay full upstream RTT.
+func WithProxyNegativeCache(c *indexcache.NegativeCache) Option {
+	return func(cfg *handlerConfig) { cfg.negCache = c }
+}
+
+// WithProxyIndexCacheTTL overrides [DefaultIndexCacheTTL]. A
+// non-positive value falls back to the default. Affects only the
+// freshness check against the OCI index cache; the L1 in-process
+// cache has its own TTL.
+func WithProxyIndexCacheTTL(d time.Duration) Option {
+	return func(c *handlerConfig) { c.proxyIndexCacheTTL = d }
+}
+
+// WithProxyL1IndexCacheTTL overrides [DefaultL1IndexCacheTTL]. A
+// non-positive value disables the L1 cache entirely, so every proxy
+// index request pays at least one OCI manifest fetch.
+func WithProxyL1IndexCacheTTL(d time.Duration) Option {
+	return func(c *handlerConfig) { c.proxyL1IndexCacheTTL = d }
 }
 
 // WithAuthMiddleware installs an authentication middleware on
@@ -160,13 +212,15 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}
-	return &Handler{
+	h := &Handler{
 		registry:       registry,
 		renderer:       r,
 		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
-	}, nil
+	}
+	h.proxy = newProxyState(cfg)
+	return h, nil
 }
 
 // Mux returns a new ServeMux that handles the Python handler's routes.
@@ -226,6 +280,14 @@ func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
 // them.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 	scoped := h.scopedFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	if !ok {
+		return
+	}
+	if isProxy {
+		h.handleSimpleIndexProxy(w, req, scoped, spec)
+		return
+	}
 	tags, err := scoped.ListTags(req.Context(), "index")
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		if handler.WriteNamespaceError(w, err) {
@@ -272,6 +334,18 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	scoped := h.scopedFor(req)
+
+	// Upload onto a proxy namespace is not meaningful — proxy
+	// caches fill on read, not via twine. Reject early with 405 so
+	// clients fail fast instead of confusing the multipart walker
+	// with an authentication or storage failure.
+	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+		return
+	}
 
 	if h.maxUploadBytes > 0 {
 		req.Body = http.MaxBytesReader(w, req.Body, h.maxUploadBytes)
@@ -552,7 +626,16 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 		MediaType:  detectMediaType(filename),
 	}
 
-	h.handleGet(w, req, h.scopedFor(req), f)
+	scoped := h.scopedFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	if !ok {
+		return
+	}
+	if isProxy {
+		h.handleFileGetProxy(w, req, scoped, spec, f)
+		return
+	}
+	h.handleGet(w, req, scoped, f)
 }
 
 func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
@@ -564,6 +647,16 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	}
 	pkg = normalize(pkg)
 
+	scoped := h.scopedFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	if !ok {
+		return
+	}
+	if isProxy {
+		h.handlePackageIndexProxy(w, req, scoped, spec, pkg)
+		return
+	}
+
 	ns := vars["namespace"]
 	// Cache key includes the namespace so a package present in ns1
 	// doesn't get served out of cache for an identically-named
@@ -572,7 +665,7 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	files, ok := h.indexCache.get(cacheKey)
 	if !ok {
 		var err error
-		files, err = h.resolvePackageFiles(req.Context(), h.scopedFor(req), pkg)
+		files, err = h.resolvePackageFiles(req.Context(), scoped, pkg)
 		if err != nil {
 			if handler.WriteNamespaceError(w, err) {
 				return

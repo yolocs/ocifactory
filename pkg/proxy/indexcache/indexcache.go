@@ -146,6 +146,54 @@ func WithBackendAuth(p backend.Provider) Option {
 	}
 }
 
+// TargetFactory opens an [oras.Target] for the given repo path. The
+// path is already namespace- and prefix-qualified by [Cache.repoPath].
+// Implementations may construct a real remote target or an in-memory
+// one — used by tests in other packages that need a working [Cache]
+// without standing up a real OCI backend.
+type TargetFactory func(ctx context.Context, repoPath string) (oras.Target, error)
+
+// NewCacheWithTargets constructs a [Cache] that opens targets via fn
+// instead of the package's default remote-target factory. This is the
+// extension point tests in other packages use to wire an in-memory
+// backend; production code calls [NewCache] and gets the remote
+// factory automatically.
+//
+// The supplied factory must return a target safe for concurrent
+// [Get] / [Put] calls; the package-supplied in-memory factory
+// satisfies this. The clock used to stamp
+// [FetchedAtAnnotation] defaults to [time.Now] in UTC and can be
+// overridden via [WithClock] when callers need deterministic values.
+func NewCacheWithTargets(fn TargetFactory, opts ...Option) (*Cache, error) {
+	if fn == nil {
+		return nil, errors.New("indexcache: target factory is required")
+	}
+	c := &Cache{
+		now: func() time.Time { return time.Now().UTC() },
+	}
+	for _, o := range opts {
+		if err := o(c); err != nil {
+			return nil, err
+		}
+	}
+	c.newTargetFunc = fn
+	return c, nil
+}
+
+// WithClock overrides the wall clock the cache stamps onto
+// [FetchedAtAnnotation]. Tests use it for deterministic timestamps;
+// production passes nothing and the default ([time.Now] UTC)
+// applies.
+func WithClock(now func() time.Time) Option {
+	return func(c *Cache) error {
+		if now == nil {
+			return errors.New("indexcache: clock function must not be nil")
+		}
+		c.now = now
+		return nil
+	}
+}
+
 // NewCache constructs a [Cache] that reads and writes against
 // baseURL. baseURL is the OCI registry's HTTPS endpoint plus any
 // shared path prefix (matching [pkg/oci.NewRegistry]); an

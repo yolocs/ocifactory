@@ -25,6 +25,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/metrics"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 )
 
 // envPrefix is the namespace every OCIFACTORY_* env var sits under.
@@ -433,10 +434,22 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
 		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		// Proxy plumbing: shared across every namespace served by
+		// this process. Hosted-only deployments still construct
+		// these (cheap — no I/O on construction); a proxy namespace
+		// admin-Put'd at runtime starts using them on its next
+		// request without restart.
+		idxCache, err := indexcache.NewCache(cfg.RegistryURL, indexcache.WithBackendAuth(bp))
+		if err != nil {
+			return fmt.Errorf("failed to create proxy index cache: %w", err)
+		}
+		negCache := indexcache.NewNegativeCache()
 		ph, err := python.NewHandler(nsReg,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),
+			python.WithProxyIndexCache(idxCache),
+			python.WithProxyNegativeCache(negCache),
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create python handler: %w", err)

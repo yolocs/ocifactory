@@ -22,6 +22,7 @@ Design pillars (in priority order):
 | `pkg/oci` — deterministic `_f_<sha256>` file tags so file reads are one round-trip | Done |
 | `pkg/oci` — blob-download redirect to backend presigned URLs (GAR/ECR/ACR/GHCR/Docker Hub) | Done |
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download, per-package simple-index cache | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
+| `pkg/proxy/python` + python proxy mode (registry hit → filter → PyPI JSON metadata → file fetch → tee to OCI; pull-through indexes with stale-OK + synthesis fallback; uploads → 405) | Done, tested. Wired into `pkg/handler/python` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/python.md`](docs/repos/python.md#proxy-mode-pull-through-pypi). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog), checksum verification, snapshot-always-overwrite | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
 | `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`), scoped + unscoped packages | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
 | `pkg/handler` — `Server`, `Logger`, `MetricsMiddleware`, `ObservabilityHandler` (intercepts `/healthz` / `/readyz` / `/metrics` before format mux) | Done |
@@ -46,7 +47,7 @@ Design pillars (in priority order):
 | Cloud Run / Cloudflare deployment guides | Not started |
 | Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
 | Rate limiting | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). Image publish runs on the release workflow, not per-PR. |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs the `-tags=pypiupstream` tests against real PyPI on every PR (intentionally non-hermetic; PyPI outages will turn it red). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
