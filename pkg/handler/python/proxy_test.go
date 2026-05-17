@@ -680,6 +680,116 @@ func TestProxy_FileFlight_ConcurrentMissDeduped(t *testing.T) {
 	}
 }
 
+// TestTolerantWriter verifies that a client write failure latches the
+// writer into "dead" mode without surfacing the error back to the
+// reader. This is the contract io.TeeReader relies on inside the
+// proxy file path: AddFile keeps draining upstream after the client
+// goes away.
+func TestTolerantWriter(t *testing.T) {
+	t.Parallel()
+
+	failing := &failOnNthWriter{failAt: 1}
+	tw := &tolerantWriter{w: failing}
+
+	for i, chunk := range [][]byte{[]byte("aa"), []byte("bb"), []byte("cc")} {
+		n, err := tw.Write(chunk)
+		if err != nil {
+			t.Errorf("Write[%d] err = %v, want nil", i, err)
+		}
+		if n != len(chunk) {
+			t.Errorf("Write[%d] n = %d, want %d", i, n, len(chunk))
+		}
+	}
+	if !tw.dead {
+		t.Errorf("tolerantWriter not latched dead after underlying failure")
+	}
+	if got, want := failing.writes, 1; got != want {
+		t.Errorf("underlying Write calls = %d, want %d (subsequent writes should be swallowed)", got, want)
+	}
+}
+
+// TestProxy_FileClientDisconnectStillFillsCache simulates a client that
+// gives up partway through the response (httptest.NewRecorder wrapped
+// in a writer that errors immediately). The OCI cache fill must still
+// complete so the next request hits the cache.
+func TestProxy_FileClientDisconnectStillFillsCache(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeFetcher()
+	const fileURL = "https://files.pythonhosted.org/packages/abc/x-1.0.0.whl"
+	fake.versionMeta["x@1.0.0"] = &pypython.VersionMetadata{
+		Package: "x", Version: "1.0.0",
+		Files: []pypython.FileMetadata{{
+			Filename: "x-1.0.0.whl",
+			URL:      fileURL,
+			Size:     int64(len("body-bytes")),
+		}},
+	}
+	fake.files[fileURL] = []byte("body-bytes")
+
+	h, _, backing := newProxyTestHandler(t, fake, namespace.Spec{})
+
+	// First request with a writer that fails every Write, simulating
+	// an immediate client disconnect.
+	dead := &deadClientRecorder{ResponseRecorder: httptest.NewRecorder()}
+	r := httptest.NewRequest(http.MethodGet,
+		"/"+testNS+"/packages/x/1.0.0/x-1.0.0.whl", nil)
+	h.Mux().ServeHTTP(dead, r)
+
+	// The cache fill must have completed regardless of the client
+	// write status.
+	files, err := backing.ListFiles(t.Context(), testNS+"/packages/x")
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("backing has %d files after disconnect, want 1", len(files))
+	}
+
+	// Second request with a normal writer reads the cached file and
+	// must not hit upstream again.
+	w2 := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w2, httptest.NewRequest(http.MethodGet,
+		"/"+testNS+"/packages/x/1.0.0/x-1.0.0.whl", nil))
+	if got, want := w2.Code, http.StatusOK; got != want {
+		t.Fatalf("second request status = %d, want %d (body=%s)", got, want, w2.Body.String())
+	}
+	if got, want := w2.Body.String(), "body-bytes"; got != want {
+		t.Errorf("second request body = %q, want %q", got, want)
+	}
+	if _, _, _, fileCalls := fake.calls(); fileCalls != 1 {
+		t.Errorf("fetchFileCalls = %d after second request, want 1 (cache should serve)", fileCalls)
+	}
+}
+
+// failOnNthWriter errors on the failAt-th Write (1-indexed) and on
+// every Write thereafter. It records the total number of Write calls
+// it received so callers can assert "no further calls after failure".
+type failOnNthWriter struct {
+	failAt int
+	writes int
+}
+
+func (f *failOnNthWriter) Write(p []byte) (int, error) {
+	f.writes++
+	if f.writes >= f.failAt {
+		return 0, io.ErrClosedPipe
+	}
+	return len(p), nil
+}
+
+// deadClientRecorder is an http.ResponseWriter whose Write always
+// fails, simulating a TCP-level client disconnect after headers but
+// before body. It still records headers / status via the embedded
+// httptest.ResponseRecorder so tests can inspect them.
+type deadClientRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (d *deadClientRecorder) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
+
 // newOCIIndexCache builds an indexcache.Cache backed by in-memory
 // per-repo stores so tests exercise the real Put/Get code path
 // without standing up a registry server.

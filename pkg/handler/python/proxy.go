@@ -1,7 +1,6 @@
 package python
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -254,10 +253,23 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	// DecisionNeedsMoreData: we'll re-run after metadata. Allow /
 	// abstain both fall through.
 
-	// Singleflight so concurrent cold-miss requests for the same
-	// file pay one upstream fetch + one AddFile across the process.
+	limit := h.maxUploadBytes
+	if limit <= 0 {
+		limit = DefaultMaxUploadBytes
+	}
+
+	// Singleflight so concurrent cold-miss requests for the same file
+	// pay one upstream fetch + one AddFile across the process. The
+	// leader streams upstream → AddFile (which writes the blob to OCI)
+	// and simultaneously tees the bytes onto its own ResponseWriter.
+	// Followers observe a "streamed" outcome and re-read the now-cached
+	// file from OCI to serve their own clients.
 	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
+	isHead := req.Method == http.MethodHead
+	amLeader := false
 	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
+		amLeader = true
+
 		// Re-check the registry inside the singleflight — a peer
 		// may have populated the cache while we were waiting.
 		if hit, hitErr := h.peekRegistry(ctx, scoped, f); hitErr == nil && hit {
@@ -284,9 +296,12 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{filterDeny: true, filterName: filterKind(denyFilter)}, nil
 		}
 
-		// File fetch + tee. We do the AddFile here while the
-		// singleflight leader holds the in-flight key so peers
-		// observe cache state after the write.
+		// Refuse upfront when upstream metadata claims a body bigger
+		// than the cap so we don't pay for the upstream fetch.
+		if fileMeta.Size > 0 && fileMeta.Size > limit {
+			return fileFlightResult{}, fmt.Errorf("upstream metadata size %d exceeds %d-byte cap", fileMeta.Size, limit)
+		}
+
 		fileResp, ferr := fetcher.FetchFile(ctx, fileMeta.URL)
 		if ferr != nil {
 			return fileFlightResult{}, ferr
@@ -300,43 +315,52 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			MediaType:  pickMediaType(filename, fileResp.ContentType),
 			Size:       fileMeta.Size,
 		}
-		var buf bytes.Buffer
-		// We buffer to memory before writing AddFile + serving the
-		// client to keep the implementation simple. The serve.go
-		// upload cap (--python-max-upload-bytes) doesn't apply to
-		// proxy fetches; cap upstream-body size at the same default
-		// so a malicious upstream can't fill memory.
-		limit := h.maxUploadBytes
-		if limit <= 0 {
-			limit = DefaultMaxUploadBytes
-		}
-		bodyLimit := io.LimitReader(fileResp.Body, limit+1)
-		n, copyErr := io.Copy(&buf, bodyLimit)
-		if copyErr != nil {
-			return fileFlightResult{}, fmt.Errorf("upstream read: %w", copyErr)
-		}
-		if n > limit {
-			return fileFlightResult{}, fmt.Errorf("upstream body exceeded %d-byte cap", limit)
-		}
-		if populated.Size == 0 {
-			populated.Size = n
+
+		// Defense in depth even when fileMeta.Size is 0 / lying:
+		// LimitReader truncates the body at limit+1 so an AddFile that
+		// somehow accepted an unbounded body still can't burn unbounded
+		// memory or disk. AddFile will surface the truncation as a
+		// digest / size mismatch.
+		var body io.Reader = io.LimitReader(fileResp.Body, limit+1)
+
+		// Leader-only tee: set client response headers eagerly and
+		// pipe AddFile's read through a tolerant writer onto our own
+		// ResponseWriter. If our client disconnects mid-stream the
+		// writer swallows the error so AddFile keeps draining upstream
+		// — that's the whole point of the cache fill, and finishing it
+		// makes the byte we paid upstream serve every follower for
+		// free. For HEAD we don't tee; AddFile still drains upstream
+		// to populate the cache, and tryServeFromRegistry serves the
+		// HEAD response after the flight returns.
+		if !isHead {
+			w.Header().Set("Content-Type", populated.MediaType)
+			if fileMeta.Size > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(fileMeta.Size, 10))
+			}
+			body = io.TeeReader(body, &tolerantWriter{w: w})
 		}
 
 		// AddFile writes blob + file manifest + version anchor;
 		// authorizes for write on the bound namespace policy. An
-		// already-exists error means a concurrent cold-miss raced
-		// us before singleflight could; treat it as a cache hit.
-		if _, addErr := scoped.AddFile(ctx, populated, bytes.NewReader(buf.Bytes())); addErr != nil {
+		// already-exists error means a concurrent cold-miss raced us
+		// before singleflight could; probeExistingFile reports it
+		// before reading the body, so no client bytes were written and
+		// the follower path can serve from the cache the peer wrote.
+		if _, addErr := scoped.AddFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
-				return fileFlightResult{cached: true, body: buf.Bytes(), contentType: populated.MediaType, size: n}, nil
+				return fileFlightResult{cached: true}, nil
 			}
 			return fileFlightResult{}, addErr
 		}
-		return fileFlightResult{body: buf.Bytes(), contentType: populated.MediaType, size: n}, nil
+		return fileFlightResult{streamed: true}, nil
 	})
 
 	if err != nil {
-		// Classify and surface upstream errors.
+		// Classify and surface upstream errors. If we're the leader
+		// and the tee already wrote a 200 + partial body, http.Error
+		// will fail silently — that's fine, the client sees a truncated
+		// response and the next request will retry. Followers haven't
+		// written anything to their own ResponseWriter yet.
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
 			if h.proxy.negCache != nil {
@@ -362,42 +386,61 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		http.Error(w, "filter denied", http.StatusNotFound)
 		return
 	}
-	if result.cached {
-		// A peer populated the cache while we were waiting. Re-read
-		// and serve normally so the client sees the standard
-		// Content-Type / Content-Length headers we set on hits.
-		if h.tryServeFromRegistry(w, req, scoped, f) {
-			return
-		}
-		// If the re-read fails (e.g. the peer's AddFile failed
-		// after our singleflight returned its "cached" result),
-		// fall through to writing the buffered body we already
-		// have. This is best-effort cleanup of a rare race.
-	}
-
-	w.Header().Set("Content-Type", result.contentType)
-	w.Header().Set("Content-Length", strconv.FormatInt(result.size, 10))
-	if req.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
+	if result.streamed && amLeader && !isHead {
+		// Bytes were written via the tee during AddFile. Nothing left
+		// to do on the leader's GET response.
 		return
 	}
-	if _, werr := w.Write(result.body); werr != nil {
-		logger.DebugContext(ctx, "write response after proxy fetch", "error", werr)
+	// Either we're a follower waiting on the leader, the leader on a
+	// HEAD that needs the headers written, or we hit ErrAlreadyExists
+	// mid-flight. All three serve the canonical headers + body from
+	// the cache the leader just populated.
+	if h.tryServeFromRegistry(w, req, scoped, f) {
+		return
 	}
+	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
+}
+
+// tolerantWriter wraps an io.Writer (the proxy leader's
+// http.ResponseWriter) so a client-side write failure stops further
+// writes but doesn't surface as an error to the upstream-side reader.
+// This is what lets AddFile finish populating the OCI cache after the
+// client disconnects mid-stream: subsequent tee Reads keep flowing to
+// AddFile without io.TeeReader propagating the dead client back to the
+// upstream copy.
+type tolerantWriter struct {
+	w    io.Writer
+	dead bool
+}
+
+func (t *tolerantWriter) Write(p []byte) (int, error) {
+	if t.dead {
+		return len(p), nil
+	}
+	if _, err := t.w.Write(p); err != nil {
+		t.dead = true
+	}
+	return len(p), nil
 }
 
 // fileFlightResult is the singleflight return value for proxy file
-// fetches. body is non-nil when we performed the fetch; cached==true
-// means a peer (re)populated the registry while we waited, and the
-// caller should re-read from the registry to serve the canonical
-// hit-path response.
+// fetches. Exactly one of streamed / cached / filterDeny is true on
+// success; an error result returns the zero value.
+//
+//   - streamed: the leader called AddFile, which drained upstream into
+//     the OCI cache (and, for GET, simultaneously teed bytes onto its
+//     own client response). Followers serve from the cache.
+//   - cached: a peer populated the cache while this caller was waiting
+//     (either the re-probe inside the flight hit, or AddFile returned
+//     ErrAlreadyExists before reading any body). Everyone serves from
+//     cache.
+//   - filterDeny: the metadata-dependent filter chain rejected this
+//     version after the upstream metadata call. Everyone returns 404.
 type fileFlightResult struct {
-	body        []byte
-	contentType string
-	size        int64
-	cached      bool
-	filterDeny  bool
-	filterName  string
+	streamed   bool
+	cached     bool
+	filterDeny bool
+	filterName string
 }
 
 // peekRegistry probes the registry for a file without consuming the
