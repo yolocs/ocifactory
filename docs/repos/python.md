@@ -274,7 +274,7 @@ curl -X PUT \
     "proxy": {
       "upstream": "https://pypi.org",
       "filters": [
-        {"kind": "denylist", "rules": [{"package": "evil-*"}]}
+        {"kind": "deny", "rules": [{"package": "evil-*"}]}
       ]
     },
     "policy": {
