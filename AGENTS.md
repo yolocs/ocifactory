@@ -271,7 +271,13 @@ The human is the product owner / reviewer; the agent does most of the implementa
    - **Human files it directly** and sends the agent the issue link, or
    - **Human and agent discuss first** (chat about scope, design, edge cases). Once aligned, the agent drafts the issue and creates it via `gh issue create` for the human's approval, then proceeds. Confirm scope with the human before opening the issue if anything is ambiguous.
 2. **Agent runs the full implementation cycle** without further prompting:
-   1. Create a feature branch named `<short-topic>` (e.g. `npm-publish`, `go-proxy-list`) from up-to-date `main`.
+   1. **Create a dedicated git worktree** for the change. Every feature, fix, or refactor lands in its own worktree on its own branch — never reuse an existing checkout, and never stack unrelated work on the same branch. Branch name is `<short-topic>` (e.g. `npm-publish`, `go-proxy-list`); worktree path is `../ocifactory-<short-topic>` (sibling of the primary checkout). Create both in one shot from an up-to-date `main`:
+      ```bash
+      git fetch origin main
+      git worktree add -b <short-topic> ../ocifactory-<short-topic> origin/main
+      cd ../ocifactory-<short-topic>
+      ```
+      Do all subsequent work — edits, commits, `go test`, `gh pr create`, CI-fix pushes — from inside that worktree. When the PR is merged (or abandoned), clean up with `git worktree remove ../ocifactory-<short-topic>` and `git branch -D <short-topic>` from the primary checkout. Rationale: keeps the main checkout free for parallel reviews / hotfixes, makes "which change am I touching?" unambiguous, and prevents accidental cross-contamination between in-flight branches.
    2. Implement the feature with tests, commit in logical chunks.
    3. Open a PR with body that references the issue (`Closes #N`), summarizes motivation + approach, and lists manual test steps.
    4. **Monitor CI** (`gh pr checks --watch`). Fix failures and push until green.
