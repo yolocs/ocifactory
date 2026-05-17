@@ -141,43 +141,43 @@ func TestAllowlist_Construction(t *testing.T) {
 	}{
 		{
 			name: "valid-exact",
-			body: `{"kind":"allowlist","patterns":["foo"]}`,
+			body: `{"kind":"allow","patterns":["foo"]}`,
 		},
 		{
 			name: "valid-glob",
-			body: `{"kind":"allowlist","patterns":["foo*","@scope/*"]}`,
+			body: `{"kind":"allow","patterns":["foo*","@scope/*"]}`,
 		},
 		{
 			name: "valid-rules",
-			body: `{"kind":"allowlist","rules":[{"package":"requests","version":"2.31.*"}]}`,
+			body: `{"kind":"allow","rules":[{"package":"requests","version":"2.31.*"}]}`,
 		},
 		{
 			name: "valid-mixed",
-			body: `{"kind":"allowlist","patterns":["foo"],"rules":[{"package":"bar","version":"1.*"}]}`,
+			body: `{"kind":"allow","patterns":["foo"],"rules":[{"package":"bar","version":"1.*"}]}`,
 		},
 		{
 			name:    "empty-everything",
-			body:    `{"kind":"allowlist"}`,
+			body:    `{"kind":"allow"}`,
 			wantErr: true,
 		},
 		{
 			name:    "empty-patterns-and-rules",
-			body:    `{"kind":"allowlist","patterns":[],"rules":[]}`,
+			body:    `{"kind":"allow","patterns":[],"rules":[]}`,
 			wantErr: true,
 		},
 		{
 			name:    "malformed-pattern-glob",
-			body:    `{"kind":"allowlist","patterns":["[unbalanced"]}`,
+			body:    `{"kind":"allow","patterns":["[unbalanced"]}`,
 			wantErr: true,
 		},
 		{
 			name:    "rule-with-no-fields",
-			body:    `{"kind":"allowlist","rules":[{}]}`,
+			body:    `{"kind":"allow","rules":[{}]}`,
 			wantErr: true,
 		},
 		{
 			name:    "rule-with-malformed-version-glob",
-			body:    `{"kind":"allowlist","rules":[{"package":"foo","version":"[bad"}]}`,
+			body:    `{"kind":"allow","rules":[{"package":"foo","version":"[bad"}]}`,
 			wantErr: true,
 		},
 	}

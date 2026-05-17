@@ -8,7 +8,7 @@ import (
 )
 
 // KindDenylist is the JSON discriminator for [Denylist].
-const KindDenylist = "denylist"
+const KindDenylist = "deny"
 
 // Denylist denies any [Ref] that matches at least one entry. Two
 // parallel input shapes are supported and ORed together:

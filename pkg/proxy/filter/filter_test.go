@@ -296,12 +296,12 @@ func TestFilters_JSONRoundtrip(t *testing.T) {
 		{
 			name: "allowlist-patterns",
 			in:   filter.Filters{&filter.Allowlist{Patterns: []string{"foo", "bar*"}}},
-			want: `[{"kind":"allowlist","patterns":["foo","bar*"]}]`,
+			want: `[{"kind":"allow","patterns":["foo","bar*"]}]`,
 		},
 		{
 			name: "allowlist-rules",
 			in:   filter.Filters{&filter.Allowlist{Rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}}}},
-			want: `[{"kind":"allowlist","rules":[{"package":"requests","version":"2.31.*"}]}]`,
+			want: `[{"kind":"allow","rules":[{"package":"requests","version":"2.31.*"}]}]`,
 		},
 		{
 			name: "allowlist-mixed",
@@ -309,17 +309,17 @@ func TestFilters_JSONRoundtrip(t *testing.T) {
 				Patterns: []string{"safe"},
 				Rules:    []filter.Rule{{Package: "requests", Version: "2.31.*"}},
 			}},
-			want: `[{"kind":"allowlist","patterns":["safe"],"rules":[{"package":"requests","version":"2.31.*"}]}]`,
+			want: `[{"kind":"allow","patterns":["safe"],"rules":[{"package":"requests","version":"2.31.*"}]}]`,
 		},
 		{
 			name: "denylist-patterns",
 			in:   filter.Filters{&filter.Denylist{Patterns: []string{"evil"}}},
-			want: `[{"kind":"denylist","patterns":["evil"]}]`,
+			want: `[{"kind":"deny","patterns":["evil"]}]`,
 		},
 		{
 			name: "denylist-rules-version-pin",
 			in:   filter.Filters{&filter.Denylist{Rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}}}},
-			want: `[{"kind":"denylist","rules":[{"package":"log4j-core","version":"2.14.*"}]}]`,
+			want: `[{"kind":"deny","rules":[{"package":"log4j-core","version":"2.14.*"}]}]`,
 		},
 		{
 			name: "delay-hours",
@@ -338,7 +338,7 @@ func TestFilters_JSONRoundtrip(t *testing.T) {
 				&filter.Denylist{Rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}}},
 				&filter.Delay{MinAge: 24 * time.Hour},
 			},
-			want: `[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]`,
+			want: `[{"kind":"allow","patterns":["@myorg/*"]},{"kind":"deny","rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]`,
 		},
 	}
 
@@ -375,7 +375,7 @@ func TestFilters_UnmarshalErrors(t *testing.T) {
 	}{
 		{
 			name:    "not-an-array",
-			body:    `{"kind":"allowlist"}`,
+			body:    `{"kind":"allow"}`,
 			wantErr: nil, // json error, not ErrInvalidFilter
 		},
 		{
@@ -390,12 +390,12 @@ func TestFilters_UnmarshalErrors(t *testing.T) {
 		},
 		{
 			name:    "invalid-body",
-			body:    `[{"kind":"allowlist","patterns":[]}]`,
+			body:    `[{"kind":"allow","patterns":[]}]`,
 			wantErr: filter.ErrInvalidFilter,
 		},
 		{
 			name:    "invalid-rule-empty",
-			body:    `[{"kind":"denylist","rules":[{}]}]`,
+			body:    `[{"kind":"deny","rules":[{}]}]`,
 			wantErr: filter.ErrInvalidFilter,
 		},
 		{

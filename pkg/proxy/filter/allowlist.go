@@ -8,7 +8,7 @@ import (
 )
 
 // KindAllowlist is the JSON discriminator for [Allowlist].
-const KindAllowlist = "allowlist"
+const KindAllowlist = "allow"
 
 // Allowlist denies any [Ref] that doesn't match at least one entry.
 // Two parallel input shapes are supported and ORed together:

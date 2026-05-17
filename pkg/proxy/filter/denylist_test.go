@@ -119,29 +119,29 @@ func TestDenylist_Construction(t *testing.T) {
 	}{
 		{
 			name: "valid-patterns",
-			body: `{"kind":"denylist","patterns":["evil","evil-*"]}`,
+			body: `{"kind":"deny","patterns":["evil","evil-*"]}`,
 		},
 		{
 			name: "valid-rules",
-			body: `{"kind":"denylist","rules":[{"package":"log4j-core","version":"2.14.*"}]}`,
+			body: `{"kind":"deny","rules":[{"package":"log4j-core","version":"2.14.*"}]}`,
 		},
 		{
 			name: "valid-mixed",
-			body: `{"kind":"denylist","patterns":["evil"],"rules":[{"package":"log4j-core","version":"2.14.*"}]}`,
+			body: `{"kind":"deny","patterns":["evil"],"rules":[{"package":"log4j-core","version":"2.14.*"}]}`,
 		},
 		{
 			name:    "empty-everything",
-			body:    `{"kind":"denylist"}`,
+			body:    `{"kind":"deny"}`,
 			wantErr: true,
 		},
 		{
 			name:    "malformed-pattern",
-			body:    `{"kind":"denylist","patterns":["[bad"]}`,
+			body:    `{"kind":"deny","patterns":["[bad"]}`,
 			wantErr: true,
 		},
 		{
 			name:    "rule-empty",
-			body:    `{"kind":"denylist","rules":[{}]}`,
+			body:    `{"kind":"deny","rules":[{}]}`,
 			wantErr: true,
 		},
 	}

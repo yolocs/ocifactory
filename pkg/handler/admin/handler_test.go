@@ -130,7 +130,7 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			name:       "put proxy with future filter fields",
 			method:     http.MethodPut,
 			path:       "/admin/v1/namespaces/futureproxy",
-			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"kind":"allowlist","patterns":["foo"],"future_field":true}]}}`,
+			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"kind":"allow","patterns":["foo"],"future_field":true}]}}`,
 			wantStatus: http.StatusCreated,
 			wantBody: &namespace.Namespace{
 				Name: "futureproxy",

@@ -136,7 +136,7 @@ func TestSpec_JSONRoundtrip(t *testing.T) {
 					},
 				},
 			},
-			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","patterns":["evil-*"],"rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]}}`,
+			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"kind":"allow","patterns":["@myorg/*"]},{"kind":"deny","patterns":["evil-*"],"rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]}}`,
 		},
 	}
 
