@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -323,6 +325,57 @@ func TestProxy_FileMissFetchAndCache(t *testing.T) {
 	}
 	if len(files) != 1 {
 		t.Errorf("backing has %d files, want 1", len(files))
+	}
+}
+
+// TestProxy_FileMetadataSidecar exercises the PEP 658 path: when pip
+// asks for `<wheel>.metadata` (because the upstream simple index
+// advertised `data-core-metadata`), the proxy synthesizes the upstream
+// URL from the matching wheel entry instead of 404'ing because PyPI's
+// JSON `urls` list never enumerates `.metadata` files.
+func TestProxy_FileMetadataSidecar(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeFetcher()
+	const wheelURL = "https://files.pythonhosted.org/packages/abc/six-1.16.0-py2.py3-none-any.whl"
+	fake.versionMeta["six@1.16.0"] = &pypython.VersionMetadata{
+		Package: "six",
+		Version: "1.16.0",
+		Files: []pypython.FileMetadata{{
+			Filename:   "six-1.16.0-py2.py3-none-any.whl",
+			URL:        wheelURL,
+			SHA256:     "wheelhash",
+			Size:       11,
+			UploadTime: time.Date(2021, 5, 5, 0, 0, 0, 0, time.UTC),
+		}},
+		UploadTime: time.Date(2021, 5, 5, 0, 0, 0, 0, time.UTC),
+	}
+	fake.files[wheelURL+".metadata"] = []byte("Metadata-Version: 2.1\nName: six\n")
+
+	h, _, backing := newProxyTestHandler(t, fake, namespace.Spec{})
+
+	path := "/" + testNS + "/packages/six/1.16.0/six-1.16.0-py2.py3-none-any.whl.metadata"
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, r)
+	if got, want := w.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d (body=%s)", got, want, w.Body.String())
+	}
+	if body := w.Body.String(); body != "Metadata-Version: 2.1\nName: six\n" {
+		t.Errorf("body = %q", body)
+	}
+
+	files, err := backing.ListFiles(t.Context(), testNS+"/packages/six")
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	var names []string
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	want := []string{"six-1.16.0-py2.py3-none-any.whl.metadata"}
+	if diff := cmp.Diff(want, names); diff != "" {
+		t.Errorf("cached files (-want +got):\n%s", diff)
 	}
 }
 

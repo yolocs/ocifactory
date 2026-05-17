@@ -170,7 +170,12 @@ func newPusherFor(t *testing.T, fr *fakeRegistry, repo string, chunkSize int) *s
 		Registry:   base.Host,
 		Repository: repo,
 	}
-	p := newStreamPusher(http.DefaultClient, ref, true /* plainHTTP */)
+	// httptest.Server.Close calls CloseIdleConnections on
+	// http.DefaultTransport, which would race parallel sibling tests
+	// sharing http.DefaultClient. Give each pusher its own transport.
+	client := &http.Client{Transport: &http.Transport{}}
+	t.Cleanup(func() { client.Transport.(*http.Transport).CloseIdleConnections() })
+	p := newStreamPusher(client, ref, true /* plainHTTP */)
 	if chunkSize > 0 {
 		p.chunkSize = chunkSize
 	}

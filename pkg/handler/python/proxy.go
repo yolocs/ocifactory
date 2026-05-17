@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -281,6 +282,26 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{}, ferr
 		}
 		fileMeta, ok := meta.FindFile(filename)
+		if !ok && strings.HasSuffix(filename, ".metadata") {
+			// PEP 658 sidecar. PyPI's JSON `urls` list doesn't enumerate
+			// `.metadata` files separately, but advertises them via the
+			// per-file `core-metadata` field and serves them at
+			// `<wheel-url>.metadata`. The rewriter passes the
+			// `data-core-metadata` / `data-dist-info-metadata` attributes
+			// through to pip, so pip then requests the sidecar by appending
+			// `.metadata` to the wheel filename. Resolve by stripping
+			// `.metadata`, finding the underlying wheel, and synthesizing
+			// the upstream URL.
+			base := strings.TrimSuffix(filename, ".metadata")
+			if baseMeta, baseOK := meta.FindFile(base); baseOK {
+				fileMeta = pypython.FileMetadata{
+					Filename:   filename,
+					URL:        baseMeta.URL + ".metadata",
+					UploadTime: baseMeta.UploadTime,
+				}
+				ok = true
+			}
+		}
 		if !ok {
 			return fileFlightResult{}, fmt.Errorf("python proxy: file %q not in metadata for %s %s: %w",
 				filename, pkg, version, proxy.ErrNotFound)
