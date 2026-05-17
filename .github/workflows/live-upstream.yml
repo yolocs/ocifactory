@@ -1,0 +1,50 @@
+name: 'live-upstream'
+
+# Non-hermetic integration tests: they talk to real upstream
+# registries (PyPI today, npm/Maven Central later) over the public
+# internet. Outages, rate limits, or response-shape changes on the
+# upstream side will turn this workflow red. Don't gate PR merges on
+# it — read the failure, decide whether it's our regression or theirs.
+#
+# Triggered on a daily schedule + manual dispatch only; never on
+# pull_request or push so a noisy upstream day can't block the
+# regular CI surface.
+
+on:
+  schedule:
+    # 07:17 UTC daily. Off-the-hour to spread load away from cron
+    # peaks and stagger against the rest of the org's nightlies.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }}'
+  cancel-in-progress: false
+
+jobs:
+  pypi-upstream:
+    name: 'pypi-upstream'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 15
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+
+      - uses: 'actions/setup-go@v5' # ratchet:exclude
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - uses: 'actions/setup-python@v5' # ratchet:exclude
+        with:
+          python-version: '3.x'
+
+      - name: 'Run live PyPI integration tests'
+        # Distinct build tag from the hermetic `integration` suite so
+        # this job runs ONLY the live-upstream cases. ubuntu-latest
+        # ships Docker; the harness spins up zot via testcontainers.
+        run: |
+          go test -race -count=1 \
+            -tags=pypiupstream \
+            -timeout=10m \
+            -v \
+            ./pkg/handler/python/...
