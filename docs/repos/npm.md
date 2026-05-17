@@ -121,7 +121,7 @@ OCI backend.
 | `npm install <pkg>` | ✅ Supported | `pkg/handler/npm/integration_test.go` — `publish_then_install_unscoped` |
 | `npm install <pkg>@<version>` | ✅ Supported | Same. |
 | `npm install <pkg>@<dist-tag>` | ✅ Supported | `pkg/handler/npm/integration_test.go` — `dist_tag_add_resolves` |
-| `npm install <pkg>` through `mode: proxy` | ✅ Supported | `pkg/handler/npm/proxy_test.go` — `TestProxy_TarballMissFetchesAndCaches` |
+| `npm install <pkg>` through `mode: proxy` | ✅ Supported | `pkg/handler/npm/proxy_test.go` — `TestProxy_TarballMissFetchesAndCaches`; live upstream smoke in `pkg/handler/npm/npm_upstream_integration_test.go` |
 | `npm dist-tag add` | ✅ Supported | Same. |
 | `npm dist-tag ls` | ✅ Supported | Tested in `pkg/handler/npm/handler_test.go` (`TestDistTagList`). |
 | `npm dist-tag rm` | ❌ Not supported (v1) | Returns 501. |

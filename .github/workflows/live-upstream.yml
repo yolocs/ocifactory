@@ -1,14 +1,14 @@
 name: 'live-upstream'
 
 # Non-hermetic integration tests: they talk to real upstream
-# registries (PyPI today, npm/Maven Central later) over the public
+# registries (PyPI, npm today; Maven Central later) over the public
 # internet. Outages, rate limits, or response-shape changes on the
 # upstream side will turn this workflow red. When that happens, read
 # the failure and decide whether it's our regression or theirs before
 # reverting.
 #
 # Runs on every PR + manual dispatch. PR runs catch regressions in
-# pkg/proxy/* and pkg/handler/python/* before merge.
+# pkg/proxy/* and proxy-mode handlers before merge.
 
 on:
   pull_request:
@@ -53,3 +53,30 @@ jobs:
             -timeout=10m \
             -v \
             ./pkg/handler/python/...
+
+  npm-upstream:
+    name: 'npm-upstream'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 15
+    steps:
+      - uses: 'actions/checkout@v4' # ratchet:exclude
+
+      - uses: 'actions/setup-go@v5' # ratchet:exclude
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - uses: 'actions/setup-node@v4' # ratchet:exclude
+        with:
+          node-version: '22'
+
+      - name: 'Run live npm integration tests'
+        # Distinct build tag from the hermetic `integration` suite so
+        # this job enables only the live-upstream cases. ubuntu-latest
+        # ships Docker; the harness spins up zot via testcontainers.
+        run: |
+          go test -race -count=1 \
+            -tags=npmupstream \
+            -timeout=10m \
+            -v \
+            ./pkg/handler/npm/...

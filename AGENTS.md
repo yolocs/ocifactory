@@ -48,7 +48,7 @@ Design pillars (in priority order):
 | Cloud Run / Cloudflare deployment guides | Not started |
 | Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
 | Rate limiting | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs the `-tags=pypiupstream` tests against real PyPI on every PR (intentionally non-hermetic; PyPI outages will turn it red). Image publish runs on the release workflow, not per-PR. |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs the `-tags=pypiupstream` and `-tags=npmupstream` tests against real PyPI / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
