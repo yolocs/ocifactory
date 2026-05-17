@@ -10,24 +10,32 @@ import (
 // KindDenylist is the JSON discriminator for [Denylist].
 const KindDenylist = "denylist"
 
-// Denylist denies any package whose name matches one of Patterns.
-// Patterns are matched against [Ref.Package] in order; the first
-// match denies. Pattern semantics are identical to [Allowlist] (exact
-// or shell-style glob via [path.Match]).
+// Denylist denies any [Ref] that matches at least one entry. Two
+// parallel input shapes are supported and ORed together:
+//
+//   - Patterns: terse list of package-name globs (the common case).
+//     Each pattern is the equivalent of a [Rule] with only Package set.
+//   - Rules: full (package, version) entries. Each rule's version
+//     constraint is ignored when [Ref.Version] is empty, so a
+//     denylist of `{package:log4j-core, version:2.14.*}` denies the
+//     log4j-core index AND the specific 2.14.x files; 2.17.x file
+//     requests are still allowed.
 //
 // An empty Denylist allows everything; it is valid but typically
 // indicates a misconfiguration, so the spec layer surfaces it
-// visually rather than rejecting it.
+// visually rather than rejecting it. (A no-entries Denylist is
+// caught by validate as a misconfig — operators who actually want
+// "no denies" simply omit the filter.)
 type Denylist struct {
-	// Patterns is the set of denied package names / globs.
-	Patterns []string `json:"patterns"`
+	Patterns []string `json:"patterns,omitempty"`
+	Rules    []Rule   `json:"rules,omitempty"`
 }
 
 // Kind returns [KindDenylist].
 func (d *Denylist) Kind() string { return KindDenylist }
 
-// Allow returns [DecisionDeny] iff [Ref.Package] matches at least
-// one pattern; otherwise [DecisionAllow].
+// Allow returns [DecisionDeny] iff ref matches at least one entry;
+// otherwise [DecisionAllow].
 func (d *Denylist) Allow(ctx context.Context, ref Ref) (Decision, error) {
 	for _, p := range d.Patterns {
 		ok, err := matchPattern(p, ref.Package)
@@ -38,40 +46,42 @@ func (d *Denylist) Allow(ctx context.Context, ref Ref) (Decision, error) {
 			return DecisionDeny, nil
 		}
 	}
+	for i, r := range d.Rules {
+		ok, err := r.matches(ref)
+		if err != nil {
+			return DecisionDeny, fmt.Errorf("denylist: rules[%d]: %w", i, err)
+		}
+		if ok {
+			return DecisionDeny, nil
+		}
+	}
 	return DecisionAllow, nil
 }
 
-// MarshalJSON emits the kind discriminator alongside the pattern
-// list so [Filters] can roundtrip a heterogeneous chain.
+// MarshalJSON emits the kind discriminator alongside the entries so
+// [Filters] can roundtrip a heterogeneous chain.
 func (d *Denylist) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Kind     string   `json:"kind"`
-		Patterns []string `json:"patterns"`
-	}{KindDenylist, d.Patterns})
+		Patterns []string `json:"patterns,omitempty"`
+		Rules    []Rule   `json:"rules,omitempty"`
+	}{KindDenylist, d.Patterns, d.Rules})
 }
 
 // validate runs at construction time (in [UnmarshalFilter]).
 func (d *Denylist) validate() error {
-	if len(d.Patterns) == 0 {
-		return fmt.Errorf("%w: denylist must have at least one pattern", ErrInvalidFilter)
+	if len(d.Patterns) == 0 && len(d.Rules) == 0 {
+		return fmt.Errorf("%w: denylist must have at least one pattern or rule", ErrInvalidFilter)
 	}
 	for _, p := range d.Patterns {
 		if _, err := path.Match(p, ""); err != nil {
 			return fmt.Errorf("%w: denylist pattern %q: %v", ErrInvalidFilter, p, err)
 		}
 	}
-	return nil
-}
-
-// matchPattern is the shared exact-or-glob match used by Allowlist
-// and Denylist. Exact match wins as a fast path so a literal
-// pattern doesn't depend on [path.Match]'s glob interpretation
-// (which would surprise nobody for normal names but means a literal
-// "*" in a name is hard to express — operators who actually need a
-// literal glob char can escape it via [path.Match]'s `\`).
-func matchPattern(pattern, name string) (bool, error) {
-	if pattern == name {
-		return true, nil
+	for i, r := range d.Rules {
+		if err := r.validate(); err != nil {
+			return fmt.Errorf("denylist rules[%d]: %w", i, err)
+		}
 	}
-	return path.Match(pattern, name)
+	return nil
 }

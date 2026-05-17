@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"time"
 )
 
@@ -37,13 +38,87 @@ type Ref struct {
 
 	// Version is the upstream version string when resolved. Empty
 	// when the request hasn't pinned a version yet (e.g. an index
-	// fetch).
+	// fetch). Version-constrained rules treat an empty Version as
+	// "matches any version" so an index request isn't surprised by
+	// a per-version rule firing prematurely.
 	Version string
 
 	// UploadTime is when the version was published upstream. Zero
 	// when not yet known; filters depending on it return
 	// [DecisionNeedsMoreData] in that case.
 	UploadTime time.Time
+}
+
+// Rule is one entry in an [Allowlist] or [Denylist]. Both fields are
+// optional individually but at least one must be set — an empty rule
+// matches every ref, which is almost certainly a misconfiguration.
+//
+// Matching rules:
+//   - Package, when set, is matched against [Ref.Package] (exact or
+//     [path.Match] glob).
+//   - Version, when set, is matched against [Ref.Version] (same
+//     semantics) — but only when [Ref.Version] is itself non-empty.
+//     An index request (Version="") makes any per-version rule fall
+//     back to its package check alone, so a rule like
+//     {Package:"log4j-core", Version:"2.14.*"} on a denylist denies
+//     the whole log4j-core index AND the specific 2.14.x files,
+//     symmetrically for allowlist.
+type Rule struct {
+	Package string `json:"package,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// matches reports whether ref triggers this rule.
+func (r Rule) matches(ref Ref) (bool, error) {
+	if r.Package != "" {
+		ok, err := matchPattern(r.Package, ref.Package)
+		if err != nil {
+			return false, fmt.Errorf("package pattern %q: %w", r.Package, err)
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	if r.Version != "" && ref.Version != "" {
+		ok, err := matchPattern(r.Version, ref.Version)
+		if err != nil {
+			return false, fmt.Errorf("version pattern %q: %w", r.Version, err)
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r Rule) validate() error {
+	if r.Package == "" && r.Version == "" {
+		return fmt.Errorf("%w: rule must populate at least one of package or version", ErrInvalidFilter)
+	}
+	if r.Package != "" {
+		if _, err := path.Match(r.Package, ""); err != nil {
+			return fmt.Errorf("%w: rule package %q: %v", ErrInvalidFilter, r.Package, err)
+		}
+	}
+	if r.Version != "" {
+		if _, err := path.Match(r.Version, ""); err != nil {
+			return fmt.Errorf("%w: rule version %q: %v", ErrInvalidFilter, r.Version, err)
+		}
+	}
+	return nil
+}
+
+// matchPattern is the shared exact-or-glob match used by [Rule].
+// Exact match wins as a fast path so a literal pattern doesn't
+// depend on [path.Match]'s glob interpretation (which would surprise
+// nobody for normal names but means a literal glob char in a name
+// is hard to express — operators who actually need a literal glob
+// char can escape it via [path.Match]'s `\`).
+func matchPattern(pattern, name string) (bool, error) {
+	if pattern == name {
+		return true, nil
+	}
+	return path.Match(pattern, name)
 }
 
 // Decision is the outcome of a single [Filter.Allow] call.

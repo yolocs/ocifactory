@@ -128,12 +128,15 @@ func TestSpec_JSONRoundtrip(t *testing.T) {
 					Upstream: "https://registry.npmjs.org",
 					Filters: filter.Filters{
 						&filter.Allowlist{Patterns: []string{"@myorg/*"}},
-						&filter.Denylist{Patterns: []string{"evil-*"}},
+						&filter.Denylist{
+							Patterns: []string{"evil-*"},
+							Rules:    []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}},
+						},
 						&filter.Delay{MinAge: 24 * time.Hour},
 					},
 				},
 			},
-			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","patterns":["evil-*"]},{"kind":"delay","min_age":"24h0m0s"}]}}`,
+			want: `{"mode":"proxy","proxy":{"upstream":"https://registry.npmjs.org","filters":[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","patterns":["evil-*"],"rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]}}`,
 		},
 	}
 

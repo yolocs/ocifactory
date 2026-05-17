@@ -13,60 +13,107 @@ func TestAllowlist_Allow(t *testing.T) {
 	tests := []struct {
 		name     string
 		patterns []string
-		pkg      string
+		rules    []filter.Rule
+		ref      filter.Ref
 		want     filter.Decision
 	}{
 		{
-			name:     "exact-match",
+			name:     "patterns-exact-match",
 			patterns: []string{"requests"},
-			pkg:      "requests",
+			ref:      filter.Ref{Package: "requests"},
 			want:     filter.DecisionAllow,
 		},
 		{
-			name:     "exact-miss",
+			name:     "patterns-exact-miss",
 			patterns: []string{"requests"},
-			pkg:      "urllib3",
+			ref:      filter.Ref{Package: "urllib3"},
 			want:     filter.DecisionDeny,
 		},
 		{
-			name:     "glob-suffix",
+			name:     "patterns-glob-suffix",
 			patterns: []string{"@myorg/*"},
-			pkg:      "@myorg/sdk",
+			ref:      filter.Ref{Package: "@myorg/sdk"},
 			want:     filter.DecisionAllow,
 		},
 		{
-			name: "glob-does-not-cross-slash",
 			// path.Match's `*` does not span `/`, so `@myorg/*` matches
 			// `@myorg/sdk` but not `@myorg/sub/sdk`. That's the intuitive
 			// single-segment match for npm scoped packages.
+			name:     "patterns-glob-does-not-cross-slash",
 			patterns: []string{"@myorg/*"},
-			pkg:      "@myorg/sub/sdk",
+			ref:      filter.Ref{Package: "@myorg/sub/sdk"},
 			want:     filter.DecisionDeny,
 		},
 		{
-			name:     "any-of-multiple",
+			name:     "patterns-any-of-multiple",
 			patterns: []string{"foo", "bar", "baz*"},
-			pkg:      "baz-extras",
+			ref:      filter.Ref{Package: "baz-extras"},
 			want:     filter.DecisionAllow,
 		},
 		{
-			name:     "no-pattern-matches-empty-name",
+			name:  "rule-package-only-matches",
+			rules: []filter.Rule{{Package: "requests"}},
+			ref:   filter.Ref{Package: "requests", Version: "2.31.0"},
+			want:  filter.DecisionAllow,
+		},
+		{
+			name:  "rule-package-and-version-both-match",
+			rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}},
+			ref:   filter.Ref{Package: "requests", Version: "2.31.0"},
+			want:  filter.DecisionAllow,
+		},
+		{
+			name:  "rule-version-mismatch-denies",
+			rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}},
+			ref:   filter.Ref{Package: "requests", Version: "2.30.5"},
+			want:  filter.DecisionDeny,
+		},
+		{
+			// Index-time (no version on the ref): the rule's version
+			// constraint is ignored and we fall back to package match,
+			// so the allowlist lets the index through. File-level
+			// requests are still subject to the version constraint
+			// (see "rule-version-mismatch-denies" above).
+			name:  "rule-empty-ref-version-treats-version-as-wildcard",
+			rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}},
+			ref:   filter.Ref{Package: "requests"},
+			want:  filter.DecisionAllow,
+		},
+		{
+			name:  "rule-package-glob-and-version",
+			rules: []filter.Rule{{Package: "@myorg/*", Version: "1.*"}},
+			ref:   filter.Ref{Package: "@myorg/sdk", Version: "1.4.0"},
+			want:  filter.DecisionAllow,
+		},
+		{
+			name:     "patterns-and-rules-or",
 			patterns: []string{"requests"},
-			pkg:      "",
-			want:     filter.DecisionDeny,
+			rules:    []filter.Rule{{Package: "log4j-core", Version: "2.17.*"}},
+			ref:      filter.Ref{Package: "log4j-core", Version: "2.17.1"},
+			want:     filter.DecisionAllow,
+		},
+		{
+			name: "rule-version-only-matches-any-package-at-version",
+			// Edge case: a rule with only Version set matches any
+			// package at that version. Rarely useful but a defined
+			// semantic — the operator can express "only allow 1.0.0
+			// across the board" with one rule.
+			rules: []filter.Rule{{Version: "1.0.0"}},
+			ref:   filter.Ref{Package: "anything", Version: "1.0.0"},
+			want:  filter.DecisionAllow,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			a := &filter.Allowlist{Patterns: tc.patterns}
-			got, err := a.Allow(t.Context(), filter.Ref{Package: tc.pkg})
+			a := &filter.Allowlist{Patterns: tc.patterns, Rules: tc.rules}
+			got, err := a.Allow(t.Context(), tc.ref)
 			if err != nil {
 				t.Fatalf("Allow: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("Allow(%q) = %v, want %v", tc.pkg, got, tc.want)
+				t.Errorf("Allow(%+v) = %v, want %v", tc.ref, got, tc.want)
 			}
 		})
 	}
@@ -101,18 +148,36 @@ func TestAllowlist_Construction(t *testing.T) {
 			body: `{"kind":"allowlist","patterns":["foo*","@scope/*"]}`,
 		},
 		{
-			name:    "empty-patterns",
-			body:    `{"kind":"allowlist","patterns":[]}`,
-			wantErr: true,
+			name: "valid-rules",
+			body: `{"kind":"allowlist","rules":[{"package":"requests","version":"2.31.*"}]}`,
 		},
 		{
-			name:    "missing-patterns",
+			name: "valid-mixed",
+			body: `{"kind":"allowlist","patterns":["foo"],"rules":[{"package":"bar","version":"1.*"}]}`,
+		},
+		{
+			name:    "empty-everything",
 			body:    `{"kind":"allowlist"}`,
 			wantErr: true,
 		},
 		{
-			name:    "malformed-glob",
+			name:    "empty-patterns-and-rules",
+			body:    `{"kind":"allowlist","patterns":[],"rules":[]}`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed-pattern-glob",
 			body:    `{"kind":"allowlist","patterns":["[unbalanced"]}`,
+			wantErr: true,
+		},
+		{
+			name:    "rule-with-no-fields",
+			body:    `{"kind":"allowlist","rules":[{}]}`,
+			wantErr: true,
+		},
+		{
+			name:    "rule-with-malformed-version-glob",
+			body:    `{"kind":"allowlist","rules":[{"package":"foo","version":"[bad"}]}`,
 			wantErr: true,
 		},
 	}

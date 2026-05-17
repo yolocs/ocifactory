@@ -294,14 +294,32 @@ func TestFilters_JSONRoundtrip(t *testing.T) {
 			want: `[]`,
 		},
 		{
-			name: "allowlist",
+			name: "allowlist-patterns",
 			in:   filter.Filters{&filter.Allowlist{Patterns: []string{"foo", "bar*"}}},
 			want: `[{"kind":"allowlist","patterns":["foo","bar*"]}]`,
 		},
 		{
-			name: "denylist",
+			name: "allowlist-rules",
+			in:   filter.Filters{&filter.Allowlist{Rules: []filter.Rule{{Package: "requests", Version: "2.31.*"}}}},
+			want: `[{"kind":"allowlist","rules":[{"package":"requests","version":"2.31.*"}]}]`,
+		},
+		{
+			name: "allowlist-mixed",
+			in: filter.Filters{&filter.Allowlist{
+				Patterns: []string{"safe"},
+				Rules:    []filter.Rule{{Package: "requests", Version: "2.31.*"}},
+			}},
+			want: `[{"kind":"allowlist","patterns":["safe"],"rules":[{"package":"requests","version":"2.31.*"}]}]`,
+		},
+		{
+			name: "denylist-patterns",
 			in:   filter.Filters{&filter.Denylist{Patterns: []string{"evil"}}},
 			want: `[{"kind":"denylist","patterns":["evil"]}]`,
+		},
+		{
+			name: "denylist-rules-version-pin",
+			in:   filter.Filters{&filter.Denylist{Rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}}}},
+			want: `[{"kind":"denylist","rules":[{"package":"log4j-core","version":"2.14.*"}]}]`,
 		},
 		{
 			name: "delay-hours",
@@ -317,10 +335,10 @@ func TestFilters_JSONRoundtrip(t *testing.T) {
 			name: "mixed-chain",
 			in: filter.Filters{
 				&filter.Allowlist{Patterns: []string{"@myorg/*"}},
-				&filter.Denylist{Patterns: []string{"evil-*"}},
+				&filter.Denylist{Rules: []filter.Rule{{Package: "log4j-core", Version: "2.14.*"}}},
 				&filter.Delay{MinAge: 24 * time.Hour},
 			},
-			want: `[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","patterns":["evil-*"]},{"kind":"delay","min_age":"24h0m0s"}]`,
+			want: `[{"kind":"allowlist","patterns":["@myorg/*"]},{"kind":"denylist","rules":[{"package":"log4j-core","version":"2.14.*"}]},{"kind":"delay","min_age":"24h0m0s"}]`,
 		},
 	}
 
@@ -376,6 +394,11 @@ func TestFilters_UnmarshalErrors(t *testing.T) {
 			wantErr: filter.ErrInvalidFilter,
 		},
 		{
+			name:    "invalid-rule-empty",
+			body:    `[{"kind":"denylist","rules":[{}]}]`,
+			wantErr: filter.ErrInvalidFilter,
+		},
+		{
 			name:    "malformed",
 			body:    `[`,
 			wantErr: nil,
@@ -428,6 +451,13 @@ func TestFilters_Validate(t *testing.T) {
 			fs: filter.Filters{
 				&filter.Allowlist{Patterns: []string{"foo"}},
 				&filter.Delay{MinAge: 0},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid-empty-rule",
+			fs: filter.Filters{
+				&filter.Denylist{Rules: []filter.Rule{{}}},
 			},
 			wantErr: true,
 		},
