@@ -27,10 +27,10 @@ permissions:
   contents: 'read'
 
 jobs:
-  pypi-upstream:
-    name: 'pypi-upstream'
+  upstream:
+    name: 'upstream'
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: 'actions/checkout@v4' # ratchet:exclude
 
@@ -43,40 +43,20 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: 'Run live PyPI integration tests'
-        # Distinct build tag from the hermetic `integration` suite so
-        # this job runs ONLY the live-upstream cases. ubuntu-latest
-        # ships Docker; the harness spins up zot via testcontainers.
-        run: |
-          go test -race -count=1 \
-            -tags=pypiupstream \
-            -timeout=10m \
-            -v \
-            ./pkg/handler/python/...
-
-  npm-upstream:
-    name: 'npm-upstream'
-    runs-on: 'ubuntu-latest'
-    timeout-minutes: 15
-    steps:
-      - uses: 'actions/checkout@v4' # ratchet:exclude
-
-      - uses: 'actions/setup-go@v5' # ratchet:exclude
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-
       - uses: 'actions/setup-node@v4' # ratchet:exclude
         with:
           node-version: '22'
 
-      - name: 'Run live npm integration tests'
-        # Distinct build tag from the hermetic `integration` suite so
-        # this job enables only the live-upstream cases. ubuntu-latest
-        # ships Docker; the harness spins up zot via testcontainers.
+      - name: 'Run live upstream integration tests'
+        # Distinct build tags from the hermetic `integration` suite.
+        # Keep all live upstream packages in this single invocation so
+        # one PR check always exercises the full non-hermetic surface.
+        # ubuntu-latest ships Docker; the harness spins up zot via
+        # testcontainers.
         run: |
           go test -race -count=1 \
-            -tags=npmupstream \
+            -tags=pypiupstream,npmupstream \
             -timeout=10m \
             -v \
+            ./pkg/handler/python/... \
             ./pkg/handler/npm/...
