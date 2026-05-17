@@ -230,22 +230,25 @@ func (r *Registry) authorize(ctx context.Context, namespace string, op auth.Op) 
 	return az.Authorize(ctx, ac, op)
 }
 
-func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Authorizer, error) {
+// specFor is the cache-aware single-namespace lookup that
+// [Registry.authorizerFor] and [ScopedRegistry.Spec] funnel through.
+// On a hit it returns the cached entry without any I/O; on a miss it
+// resolves through the shared singleflight so concurrent callers
+// observe one [Store.Get] + authorizer compile.
+//
+// A namespace that doesn't exist returns an error wrapping
+// [ErrNotFound] with notFound=true on the cached entry — callers that
+// only need the spec must inspect the notFound flag rather than the
+// returned error so they can produce the expected 404 mapping without
+// re-running the load.
+func (r *Registry) specFor(ctx context.Context, namespace string) (cachedPolicy, error) {
 	if v, ok := r.cache.get(namespace); ok {
 		if v.notFound {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, namespace)
+			return v, fmt.Errorf("%w: %s", ErrNotFound, namespace)
 		}
-		return v.authorizer, nil
+		return v, nil
 	}
-
-	// singleflight collapses concurrent misses for the same namespace
-	// onto one Store.Get + factory(...) compile. The closure return
-	// value is the cachedPolicy we then cache locally; the follower
-	// goroutines all observe the same value via singleflight.
 	v, err, _ := r.flight.Do(namespace, func() (any, error) {
-		// Re-check the cache inside the singleflight: another
-		// goroutine may have populated it between our first miss
-		// and our turn at the leader spot.
 		if v, ok := r.cache.get(namespace); ok {
 			return v, nil
 		}
@@ -260,22 +263,27 @@ func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Au
 		}
 		az, ferr := r.factory(ns.Spec.Policy)
 		if ferr != nil {
-			// Compile errors signal misconfiguration the operator
-			// must fix (e.g. an admin Put that bypassed validation).
-			// Don't cache — repeat requests should keep surfacing
-			// the error until the spec is corrected.
 			return cachedPolicy{}, fmt.Errorf("compile authorizer for %q: %w", namespace, ferr)
 		}
-		entry := cachedPolicy{authorizer: az}
+		specCopy := ns.Spec
+		entry := cachedPolicy{authorizer: az, spec: &specCopy}
 		r.cache.put(namespace, entry)
 		return entry, nil
 	})
 	if err != nil {
-		return nil, err
+		return cachedPolicy{}, err
 	}
 	cp := v.(cachedPolicy)
 	if cp.notFound {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, namespace)
+		return cp, fmt.Errorf("%w: %s", ErrNotFound, namespace)
+	}
+	return cp, nil
+}
+
+func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Authorizer, error) {
+	cp, err := r.specFor(ctx, namespace)
+	if err != nil {
+		return nil, err
 	}
 	return cp.authorizer, nil
 }
@@ -344,6 +352,25 @@ type ScopedRegistry struct {
 
 // Namespace returns the bound namespace name.
 func (s *ScopedRegistry) Namespace() string { return s.namespace }
+
+// Spec returns the namespace's current [Spec], used by per-format
+// handlers to dispatch on [Spec.Mode] / read [Spec.Proxy] before
+// committing to a code path.
+//
+// The returned pointer references the cached entry; callers must not
+// mutate the value. An unknown namespace returns an error wrapping
+// [ErrNotFound] so [handler.WriteNamespaceError] maps it to 404.
+//
+// Spec does not authorize: the namespace's compiled authorizer still
+// runs on downstream [AddFile] / [ReadFile] / [ListFiles] / etc., so
+// the dispatch primitive does not become an auth bypass.
+func (s *ScopedRegistry) Spec(ctx context.Context) (*Spec, error) {
+	cp, err := s.parent.specFor(ctx, s.namespace)
+	if err != nil {
+		return nil, err
+	}
+	return cp.spec, nil
+}
 
 // AddFile authorizes the bound namespace for write, prefixes
 // f.OwningRepo with the namespace, forwards to the inner registry,
