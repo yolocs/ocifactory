@@ -56,6 +56,10 @@ func TestNpmIntegration_LiveRegistryProxy(t *testing.T) {
 		version = "7.0.0"
 	)
 	registry := h.OcifactoryURL.String() + "/npm-cache/"
+	registryURL, err := url.Parse(registry)
+	if err != nil {
+		t.Fatalf("parse registry URL: %v", err)
+	}
 
 	t.Run("packument_rewrites_tarball_urls", func(t *testing.T) {
 		t.Parallel()
@@ -86,6 +90,13 @@ func TestNpmIntegration_LiveRegistryProxy(t *testing.T) {
 		}
 		if strings.Contains(tarball, "registry.npmjs.org") {
 			t.Errorf("dist.tarball leaked unrewritten upstream URL: %q", tarball)
+		}
+		parsed, err := url.Parse(tarball)
+		if err != nil {
+			t.Fatalf("parse dist.tarball URL: %v", err)
+		}
+		if !parsed.IsAbs() || parsed.Scheme != registryURL.Scheme || parsed.Host != registryURL.Host {
+			t.Errorf("dist.tarball = %q, want absolute URL on %s://%s", tarball, registryURL.Scheme, registryURL.Host)
 		}
 	})
 

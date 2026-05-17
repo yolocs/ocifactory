@@ -175,7 +175,7 @@ func TestProxy_PackumentFetchRewritesAndCaches(t *testing.T) {
 		t.Fatalf("status=%d, want 200 (body=%s)", rec.Code, rec.Body.String())
 	}
 	gotTarball := packumentTarball(t, rec.Body.Bytes(), "1.0.0")
-	wantTarball := "/" + testNS + "/@scope/pkg/-/pkg-1.0.0.tgz"
+	wantTarball := "http://example.com/" + testNS + "/@scope/pkg/-/pkg-1.0.0.tgz"
 	if gotTarball != wantTarball {
 		t.Errorf("dist.tarball=%q, want %q", gotTarball, wantTarball)
 	}

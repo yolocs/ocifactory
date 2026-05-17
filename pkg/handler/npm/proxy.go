@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,7 +180,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 	cacheKey := ns + "|" + pkg
 
 	if e, ok := h.proxy.l1.get(cacheKey); ok {
-		writeProxyBody(w, req, e.body, e.contentType)
+		writeProxyPackumentBody(w, req, e.body, e.contentType)
 		return
 	}
 
@@ -197,7 +198,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 			cachedBody, cachedContentType, cachedFetchedAt, cachedFound = b, ct, fa, true
 			if h.proxy.now().Sub(fa) < h.proxy.indexCacheTTL {
 				h.proxy.l1.put(cacheKey, l1IndexEntry{body: b, contentType: ct, fetchedAt: fa})
-				writeProxyBody(w, req, b, ct)
+				writeProxyPackumentBody(w, req, b, ct)
 				return
 			}
 		}
@@ -231,7 +232,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 	})
 	if err == nil {
 		r := resultV.(indexFlightResult)
-		writeProxyBody(w, req, r.body, r.contentType)
+		writeProxyPackumentBody(w, req, r.body, r.contentType)
 		return
 	}
 
@@ -242,7 +243,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 	if cachedFound {
 		logger.WarnContext(ctx, "serving stale npm packument after upstream error",
 			"namespace", ns, "package", pkg, "age", h.proxy.now().Sub(cachedFetchedAt), "error", err)
-		writeProxyBody(w, req, cachedBody, cachedContentType)
+		writeProxyPackumentBody(w, req, cachedBody, cachedContentType)
 		return
 	}
 	h.synthesizePackument(w, req, scoped, pkg, err)
@@ -519,6 +520,55 @@ func writeProxyBody(w http.ResponseWriter, req *http.Request, body []byte, conte
 		return
 	}
 	_, _ = w.Write(body)
+}
+
+func writeProxyPackumentBody(w http.ResponseWriter, req *http.Request, body []byte, contentType string) {
+	rewritten, err := absolutizePackumentTarballPaths(body, req)
+	if err != nil {
+		logging.FromContext(req.Context()).DebugContext(req.Context(), "npm proxy response rewrite failed", "error", err)
+		writeProxyBody(w, req, body, contentType)
+		return
+	}
+	writeProxyBody(w, req, rewritten, contentType)
+}
+
+func absolutizePackumentTarballPaths(body []byte, req *http.Request) ([]byte, error) {
+	if req.Host == "" {
+		return body, nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	versions, ok := doc["versions"].(map[string]any)
+	if !ok {
+		return body, nil
+	}
+	base := url.URL{Scheme: detectScheme(req), Host: req.Host}
+	for _, rawVersion := range versions {
+		versionDoc, ok := rawVersion.(map[string]any)
+		if !ok {
+			continue
+		}
+		dist, ok := versionDoc["dist"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rawTarball, ok := dist["tarball"].(string)
+		if !ok || !strings.HasPrefix(rawTarball, "/") {
+			continue
+		}
+		rel, err := url.Parse(rawTarball)
+		if err != nil || rel.IsAbs() || rel.Host != "" {
+			continue
+		}
+		dist["tarball"] = base.ResolveReference(rel).String()
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func negativeKey(ns, pkg, version, filename string) string {
