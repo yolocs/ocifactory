@@ -257,6 +257,8 @@ The intent is to ship each phase production-ready before starting the next. See 
 ## GitHub workflow
 
 - **Issues are the source of truth for tasks.** Open an issue before non-trivial work; link it from the PR.
+- **Always pull latest first.** Before starting any issue, feature, fix, review follow-up, or branch/worktree creation, update the primary checkout with `git pull --ff-only` from `main`. If it cannot fast-forward cleanly, stop and resolve that state before doing task work.
+- **Delete merged worktrees.** Once a PR is merged, remove its feature worktree from the primary checkout with `git worktree remove ../ocifactory-<short-topic>` and delete the local branch with `git branch -D <short-topic>`. Do this before starting unrelated work so stale worktrees do not accumulate.
 - **One feature = one PR.** Keep PRs reviewable. Refactors should be separate PRs from feature work.
 - **PR description** should explain motivation + summary of approach + manual test steps. Link the issue with `Closes #N`.
 - **CI must be green** before merge. Pre-existing failures aren't a license to add new ones.
