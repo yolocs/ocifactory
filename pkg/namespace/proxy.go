@@ -1,10 +1,11 @@
 package namespace
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+
+	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
 // ModeHosted is the default namespace mode. A hosted namespace stores
@@ -35,19 +36,17 @@ type Proxy struct {
 	Upstream string `json:"upstream,omitempty"`
 
 	// Filters is the ordered filter chain applied before any upstream
-	// call. First deny wins.
-	//
-	// The concrete element shape will land in #110; for now Filter is
-	// an opaque JSON value so older binaries roundtrip future filter
-	// content unchanged.
-	Filters []Filter `json:"filters,omitempty"`
+	// file download. Index requests bypass the chain. Explicit allow
+	// or deny from a filter short-circuits; abstain advances to the
+	// next filter; [filter.DecisionNeedsMoreData] is re-run after
+	// upstream metadata fetch. See [docs/proxy/filter-policy.md].
+	Filters filter.Filters `json:"filters,omitempty"`
 }
 
-// Filter is one element of the proxy filter chain. The concrete shape
-// is defined in #110; until then it is a passthrough JSON value so
-// older binaries can roundtrip future filter content without dropping
-// it on a read/write cycle.
-type Filter = json.RawMessage
+// Filter is one element of the proxy filter chain. Concrete shapes
+// live in [pkg/proxy/filter]; the type alias keeps the
+// namespace-package call sites readable.
+type Filter = filter.Filter
 
 // Validate returns nil iff p is consistent with mode: when mode is
 // [ModeProxy], Upstream must be a parseable absolute URL; when mode is
@@ -79,6 +78,9 @@ func (p *Proxy) Validate(mode string) error {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("%w: upstream %q scheme must be http or https", ErrInvalidProxy, p.Upstream)
+	}
+	if err := p.Filters.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidProxy, err)
 	}
 	return nil
 }

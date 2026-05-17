@@ -13,6 +13,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/handler/admin"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/proxy/filter"
 )
 
 func TestHandler_NamespaceCRUD(t *testing.T) {
@@ -119,17 +120,17 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			wantBody:   map[string]string{"error": "invalid proxy: proxy block must be empty on mode \"hosted\""},
 		},
 		{
-			// Filter is an opaque json.RawMessage today (concrete shape
-			// lands in #110), so unknown keys inside a filter object
-			// must NOT trip the DisallowUnknownFields top-level guard —
-			// otherwise an older binary would reject a body written by
-			// a newer binary that added typed filter fields. Pin that
-			// property here so a future refactor can't silently break
-			// the forward-compat contract.
+			// Filters dispatch on the "kind" discriminator and use a
+			// non-strict decoder for the per-kind body, so unknown
+			// keys *within* a known filter kind must NOT trip the
+			// top-level DisallowUnknownFields guard. That preserves
+			// forward-compat for filter fields added in a later
+			// version while still rejecting unknown kinds (covered by
+			// "put proxy with unknown filter kind" below).
 			name:       "put proxy with future filter fields",
 			method:     http.MethodPut,
 			path:       "/admin/v1/namespaces/futureproxy",
-			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"future_filter_field":true,"nested":{"k":"v"}}]}}`,
+			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"kind":"allow","patterns":["foo"],"future_field":true}]}}`,
 			wantStatus: http.StatusCreated,
 			wantBody: &namespace.Namespace{
 				Name: "futureproxy",
@@ -138,12 +139,20 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 					Mode:          namespace.ModeProxy,
 					Proxy: namespace.Proxy{
 						Upstream: "https://pypi.org",
-						Filters: []namespace.Filter{
-							[]byte(`{"future_filter_field":true,"nested":{"k":"v"}}`),
+						Filters: filter.Filters{
+							&filter.Allowlist{Patterns: []string{"foo"}},
 						},
 					},
 				},
 			},
+		},
+		{
+			name:       "put proxy with unknown filter kind",
+			method:     http.MethodPut,
+			path:       "/admin/v1/namespaces/badfilter",
+			rawBody:    `{"mode":"proxy","proxy":{"upstream":"https://pypi.org","filters":[{"kind":"nope"}]}}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody:   map[string]string{"error": `invalid JSON body: filters[0]: invalid filter: unknown kind "nope"`},
 		},
 		{
 			name:       "put malformed json",
