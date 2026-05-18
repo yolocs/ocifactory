@@ -168,7 +168,7 @@ func assertMavenArtifactCached(t *testing.T, zotURL *url.URL, backendRepo, names
 		t.Fatalf("oci.NewRegistry: %v", err)
 	}
 	f := &oci.RepoFile{
-		OwningRepo: namespaceName + "/" + strings.ReplaceAll(groupID, ".", "/") + "/" + artifactID,
+		OwningRepo: namespaceName + "/packages/" + strings.ReplaceAll(groupID, ".", "/") + "/" + artifactID,
 		OwningTag:  version,
 		Name:       artifactID + "-" + version + ".jar",
 		MediaType:  "application/java-archive",
