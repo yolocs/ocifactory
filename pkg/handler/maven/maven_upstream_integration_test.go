@@ -136,6 +136,8 @@ func seedMavenProxyNamespace(t *testing.T, zotURL *url.URL, backendRepo, name, u
 
 func runLiveMavenGet(t *testing.T, repoURL, localRepo, coordinate string) {
 	t.Helper()
+	warmLiveMavenDependencyPlugin(t, localRepo)
+
 	settings := liveMavenSettings(t, repoURL, localRepo)
 	cmd := exec.Command("mvn",
 		"-B",
@@ -150,6 +152,20 @@ func runLiveMavenGet(t *testing.T, repoURL, localRepo, coordinate string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("mvn dependency:get %s: %v\n%s", coordinate, err, out)
+	}
+}
+
+func warmLiveMavenDependencyPlugin(t *testing.T, localRepo string) {
+	t.Helper()
+	cmd := exec.Command("mvn",
+		"-B",
+		"-Dmaven.repo.local="+localRepo,
+		"org.apache.maven.plugins:maven-dependency-plugin:3.6.1:help",
+	)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("warm maven dependency plugin: %v\n%s", err, out)
 	}
 }
 
