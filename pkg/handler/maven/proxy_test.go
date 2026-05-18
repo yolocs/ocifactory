@@ -138,7 +138,7 @@ func TestProxy_FileMissFetchesAndCaches(t *testing.T) {
 		ContentType:   "application/java-archive",
 		ContentLength: int64(len(body)),
 	}
-	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{})
+	h, _, backing := newProxyTestHandler(t, fetcher, namespace.Spec{})
 
 	req := httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/1.2.0/demo-1.2.0.jar"), nil)
 	rec := httptest.NewRecorder()
@@ -148,6 +148,16 @@ func TestProxy_FileMissFetchesAndCaches(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != body {
 		t.Errorf("body=%q, want %q", got, body)
+	}
+	files, err := backing.ListFiles(t.Context(), testNS+"/com/example/demo")
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("cached files = %d, want 1", len(files))
+	}
+	if got, want := files[0].Name, "demo-1.2.0.jar"; got != want {
+		t.Errorf("cached file name = %q, want %q", got, want)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/1.2.0/demo-1.2.0.jar"), nil)

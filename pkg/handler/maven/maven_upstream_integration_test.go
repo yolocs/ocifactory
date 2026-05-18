@@ -13,6 +13,7 @@ package maven_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,6 +26,7 @@ import (
 	mavenhandler "github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"oras.land/oras-go/v2/errdef"
 )
 
 // TestMavenIntegration_LiveCentralProxy proves Maven proxy mode works
@@ -173,7 +175,22 @@ func assertMavenArtifactCached(t *testing.T, zotURL *url.URL, backendRepo, names
 	}
 	desc, rc, err := inner.ReadFile(t.Context(), f)
 	if err != nil {
-		t.Fatalf("read cached artifact from OCI: %v", err)
+		// The proxy fill returns after AddCachedFile completes, but
+		// this assertion uses a separate OCI client against live zot.
+		// Give zot's referrer lookup a short window to observe the
+		// freshly pushed file manifest before declaring the cache
+		// fill broken.
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && errors.Is(err, errdef.ErrNotFound) {
+			time.Sleep(100 * time.Millisecond)
+			desc, rc, err = inner.ReadFile(t.Context(), f)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("read cached artifact from OCI: %v", err)
+		}
 	}
 	defer rc.Close()
 	if desc.File.Size == 0 {
