@@ -133,15 +133,26 @@ func (h *Handler) Mux() http.Handler {
 	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(readMethods...).Name("read")
 	nsr.HandleFunc("/archetype-catalog.xml", h.handleArchetypeCatalog).Methods(writeMethods...).Name("write")
 
-	// 2. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
+	// 2. Metadata checksum sidecars. These must be registered before
+	// the metadata and generic artifact routes so maven-metadata.xml.sha1
+	// is owned by the metadata object, not by a fake artifact version.
+	for _, ext := range []string{"md5", "sha1", "sha256", "sha512"} {
+		filename := "maven-metadata.xml." + ext
+		nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/"+filename, h.handleSnapshotMetadataSidecar).Methods(readMethods...).Name("read")
+		nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/"+filename, h.handleSnapshotMetadataSidecar).Methods(writeMethods...).Name("write")
+		nsr.HandleFunc("/{repoParts:.+}/"+filename, h.handleArtifactMetadataSidecar).Methods(readMethods...).Name("read")
+		nsr.HandleFunc("/{repoParts:.+}/"+filename, h.handleArtifactMetadataSidecar).Methods(writeMethods...).Name("write")
+	}
+
+	// 3. Snapshot Metadata (e.g., group/artifact/1.0-SNAPSHOT/maven-metadata.xml)
 	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(readMethods...).Name("read")
 	nsr.HandleFunc("/{repoParts:.+}/{versionSnapshot:.+-SNAPSHOT}/maven-metadata.xml", h.handleSnapshotMetadata).Methods(writeMethods...).Name("write")
 
-	// 3. Artifact Metadata (release; must be registered after snapshot).
+	// 4. Artifact Metadata (release; must be registered after snapshot).
 	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(readMethods...).Name("read")
 	nsr.HandleFunc("/{repoParts:.+}/maven-metadata.xml", h.handleArtifactMetadata).Methods(writeMethods...).Name("write")
 
-	// 4. Regular Artifact Files. Most general; must be last.
+	// 5. Regular Artifact Files. Most general; must be last.
 	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(readMethods...).Name("read")
 	nsr.HandleFunc("/{repoParts:.+}/{version:.+}/{filename:.+}", h.handleRegularArtifact).Methods(writeMethods...).Name("write")
 
@@ -216,6 +227,42 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 	}
 }
 
+func (h *Handler) handleSnapshotMetadataSidecar(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	repoParts := vars["repoParts"]
+	versionSnapshot := vars["versionSnapshot"]
+	filename := path.Base(req.URL.Path)
+
+	if err := validatePath(repoParts, versionSnapshot, filename); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	scoped := h.scopedFor(req)
+	f := &oci.RepoFile{
+		OwningRepo:     repoParts,
+		OwningTag:      versionSnapshot + "-metadata",
+		Name:           filename,
+		MediaType:      detectMediaType(filename),
+		AllowOverwrite: true,
+	}
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost {
+			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleMetadataSidecarProxy(w, req, scoped, spec, f, repoParts+"/"+versionSnapshot)
+		return
+	}
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, scoped, f)
+	} else {
+		h.handleGet(w, req, scoped, f)
+	}
+}
+
 // handleArtifactMetadata handles requests for non-snapshot maven-metadata.xml files.
 func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
@@ -246,6 +293,40 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
+		h.handleGet(w, req, scoped, f)
+	}
+}
+
+func (h *Handler) handleArtifactMetadataSidecar(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	repoParts := vars["repoParts"]
+	filename := path.Base(req.URL.Path)
+
+	if err := validatePath(repoParts, "", filename); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	scoped := h.scopedFor(req)
+	f := &oci.RepoFile{
+		OwningRepo: repoParts,
+		OwningTag:  "metadata",
+		Name:       filename,
+		MediaType:  detectMediaType(filename),
+	}
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost {
+			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleMetadataSidecarProxy(w, req, scoped, spec, f, repoParts)
+		return
+	}
+	if req.Method == http.MethodPut || req.Method == http.MethodPost {
+		h.handlePut(w, req, scoped, f)
+	} else {
 		h.handleGet(w, req, scoped, f)
 	}
 }

@@ -180,7 +180,7 @@ jobs:
           fi
 
   # client-integration runs the per-format real-client tests: pip /
-  # twine / mvn driving an ocifactory subprocess against a zot
+  # twine / mvn / npm driving an ocifactory subprocess against a zot
   # registry started by testcontainers-go.
   #
   # The shared go-test job above runs the same tests but skips them

@@ -158,12 +158,17 @@ What changes on the wire:
 - **Writes** (`PUT` / `POST`) return `405 Method Not Allowed` on proxy
   namespaces. Publish to a hosted namespace when ocifactory should be
   the source of truth.
+- **Archetype catalogs** (`/archetype-catalog.xml`) are not pulled
+  through from upstream in proxy mode yet. Reads only check the local
+  OCI cache, and writes return `405 Method Not Allowed`.
 
 Degraded operation is intentionally simpler than PyPI/npm: upstream
-metadata errors return `503 Service Unavailable`, and file fetch errors
-return `404` for upstream not found or `502 Bad Gateway` for malformed /
-unavailable upstream responses. There is a short in-memory negative
-cache for repeated file 404s, but no stale metadata fallback in v1.
+metadata returns `404 Not Found` when upstream has no metadata, `502 Bad
+Gateway` when the metadata is malformed, and `503 Service Unavailable`
+when upstream cannot be reached. File fetch errors return `404` for
+upstream not found or `502 Bad Gateway` for malformed, unavailable, or
+oversized upstream responses. There is a short in-memory negative cache
+for repeated file 404s, but no stale metadata fallback in v1.
 
 Filters use Maven package refs in `groupId:artifactId` form:
 
@@ -183,7 +188,10 @@ The filter chain is the same one documented in
 [`docs/proxy/filter-policy.md`](../proxy/filter-policy.md): name
 allowlist / denylist filters run before any upstream call, and the
 publish-time `delay` filter runs after `maven-metadata.xml` is fetched
-using `<versioning><lastUpdated>` as Maven's upload-time proxy.
+using artifact-level `<versioning><lastUpdated>` as Maven's upload-time
+proxy. Maven metadata does not carry per-version upload times; if
+`<lastUpdated>` is missing or unparsable, ocifactory fails closed and
+does not fetch the artifact.
 
 ## URL layout
 

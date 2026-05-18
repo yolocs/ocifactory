@@ -136,7 +136,7 @@ func seedMavenProxyNamespace(t *testing.T, zotURL *url.URL, backendRepo, name, u
 
 func runLiveMavenGet(t *testing.T, repoURL, localRepo, coordinate string) {
 	t.Helper()
-	settings := liveMavenSettings(t, localRepo)
+	settings := liveMavenSettings(t, repoURL, localRepo)
 	cmd := exec.Command("mvn",
 		"-B",
 		"-s", settings,
@@ -153,13 +153,20 @@ func runLiveMavenGet(t *testing.T, repoURL, localRepo, coordinate string) {
 	}
 }
 
-func liveMavenSettings(t *testing.T, localRepo string) string {
+func liveMavenSettings(t *testing.T, repoURL, localRepo string) string {
 	t.Helper()
 	settings := fmt.Sprintf(`<settings>
   <localRepository>%s</localRepository>
   <interactiveMode>false</interactiveMode>
+  <mirrors>
+    <mirror>
+      <id>ocifactory-all</id>
+      <url>%s</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
 </settings>
-`, localRepo)
+`, localRepo, repoURL)
 	path := filepath.Join(t.TempDir(), "settings.xml")
 	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
 		t.Fatalf("write settings.xml: %v", err)

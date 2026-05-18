@@ -25,12 +25,15 @@ import (
 	proxymaven "github.com/yolocs/ocifactory/pkg/proxy/maven"
 )
 
+var errProxyBodyTooLarge = errors.New("maven proxy body exceeds size cap")
+
 // ProxyFetcher is the subset of [*pkg/proxy/maven.Fetcher] methods
 // the handler depends on. It exists so tests can inject a fake upstream
 // boundary; it is not an out-of-tree extension surface.
 type ProxyFetcher interface {
 	GetMetadata(ctx context.Context, repoPath string) (*proxymaven.MetadataResponse, error)
 	FetchFile(ctx context.Context, repoPath, version, filename string) (*proxymaven.FileResponse, error)
+	FetchPath(ctx context.Context, repoPath, filename string) (*proxymaven.FileResponse, error)
 }
 
 // FetcherFactory builds a [ProxyFetcher] for a namespace upstream URL.
@@ -128,6 +131,76 @@ func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, 
 	writeProxyBytes(w, req, resp.Body, resp.ContentType)
 }
 
+func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile, repoPath string) {
+	ctx := req.Context()
+
+	if h.tryServeFromRegistry(w, req, scoped, f) {
+		return
+	}
+	fetcher, err := h.proxy.fetcherFor(spec.Proxy.Upstream)
+	if err != nil {
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "proxy fetcher unavailable")
+		return
+	}
+
+	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + f.OwningTag + "|" + f.Name
+	isHead := req.Method == http.MethodHead
+	amLeader := false
+	var teeRef *tolerantWriter
+	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
+		amLeader = true
+		if hit, hitErr := h.peekRegistry(ctx, scoped, f); hitErr == nil && hit {
+			return fileFlightResult{cached: true}, nil
+		}
+		fileResp, ferr := fetcher.FetchPath(ctx, repoPath, f.Name)
+		if ferr != nil {
+			return fileFlightResult{}, ferr
+		}
+		defer fileResp.Body.Close()
+
+		populated := &oci.RepoFile{
+			OwningRepo:     f.OwningRepo,
+			OwningTag:      f.OwningTag,
+			Name:           f.Name,
+			MediaType:      pickMediaType(f.Name, fileResp.ContentType),
+			Size:           fileResp.ContentLength,
+			AllowOverwrite: f.AllowOverwrite,
+		}
+		body, err := h.limitedProxyBody(fileResp.Body, fileResp.ContentLength)
+		if err != nil {
+			return fileFlightResult{}, err
+		}
+		if !isHead {
+			w.Header().Set("Content-Type", populated.MediaType)
+			if fileResp.ContentLength > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(fileResp.ContentLength, 10))
+			}
+			teeRef = &tolerantWriter{w: w}
+			body = io.TeeReader(body, teeRef)
+		}
+		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
+			if errors.Is(addErr, oci.ErrAlreadyExists) {
+				return fileFlightResult{cached: true}, nil
+			}
+			return fileFlightResult{}, addErr
+		}
+		return fileFlightResult{streamed: true}, nil
+	})
+	if err != nil {
+		h.writeProxyFileError(w, req, err, amLeader, teeRef, packageRef(f.OwningRepo), f.OwningTag, f.Name)
+		return
+	}
+
+	result := resultV.(fileFlightResult)
+	if result.streamed && amLeader && !isHead {
+		return
+	}
+	if h.tryServeFromRegistry(w, req, scoped, f) {
+		return
+	}
+	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
+}
+
 func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
@@ -188,6 +261,8 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{}, fmt.Errorf("filter error: %w (kind=%s)", derr, filterKind(denyFilter))
 		} else if decision == filter.DecisionDeny {
 			return fileFlightResult{filterDeny: true, filterName: filterKind(denyFilter)}, nil
+		} else if decision == filter.DecisionNeedsMoreData {
+			return fileFlightResult{filterDeny: true, filterName: filterKind(denyFilter)}, nil
 		}
 
 		fileResp, ferr := fetcher.FetchFile(ctx, f.OwningRepo, version, filename)
@@ -195,6 +270,10 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{}, ferr
 		}
 		defer fileResp.Body.Close()
+		body, berr := h.limitedProxyBody(fileResp.Body, fileResp.ContentLength)
+		if berr != nil {
+			return fileFlightResult{}, berr
+		}
 
 		populated := &oci.RepoFile{
 			OwningRepo: f.OwningRepo,
@@ -208,7 +287,6 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			// backend overwrites globally.
 			AllowOverwrite: false,
 		}
-		var body io.Reader = fileResp.Body
 		if !isHead {
 			w.Header().Set("Content-Type", populated.MediaType)
 			if fileResp.ContentLength > 0 {
@@ -241,6 +319,8 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream malformed")
 		case errors.Is(err, proxy.ErrUpstreamUnavailable):
 			handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream unavailable")
+		case errors.Is(err, errProxyBodyTooLarge):
+			handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream body too large")
 		default:
 			if handler.WriteNamespaceError(w, err) {
 				return
@@ -287,6 +367,64 @@ type fileFlightResult struct {
 	cached     bool
 	filterDeny bool
 	filterName string
+}
+
+func (h *Handler) limitedProxyBody(r io.Reader, contentLength int64) (io.Reader, error) {
+	limit := h.maxUploadBytes
+	if limit <= 0 {
+		limit = DefaultMaxUploadBytes
+	}
+	if contentLength > limit {
+		return nil, fmt.Errorf("upstream content length %d exceeds %d-byte cap: %w", contentLength, limit, errProxyBodyTooLarge)
+	}
+	return &proxyLimitReader{r: r, remaining: limit}, nil
+}
+
+type proxyLimitReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (r *proxyLimitReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		var one [1]byte
+		n, err := r.r.Read(one[:])
+		if n > 0 {
+			return 0, errProxyBodyTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+func (h *Handler) writeProxyFileError(w http.ResponseWriter, req *http.Request, err error, amLeader bool, teeRef *tolerantWriter, pkg, version, filename string) {
+	ctx := req.Context()
+	logger := logging.FromContext(ctx)
+	if amLeader && teeRef != nil && teeRef.used {
+		logger.WarnContext(ctx, "maven proxy file fetch failed after response body started; suppressing error body",
+			"error", err, "package", pkg, "version", version, "filename", filename)
+		return
+	}
+	switch {
+	case errors.Is(err, proxy.ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, proxy.ErrUpstreamMalformed):
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream malformed")
+	case errors.Is(err, proxy.ErrUpstreamUnavailable):
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream unavailable")
+	case errors.Is(err, errProxyBodyTooLarge):
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "upstream body too large")
+	default:
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		handler.WriteError(ctx, w, http.StatusBadGateway, err, "proxy file fetch failed")
+	}
 }
 
 func (h *Handler) peekRegistry(ctx context.Context, scoped *namespace.ScopedRegistry, f *oci.RepoFile) (bool, error) {

@@ -69,6 +69,21 @@ func (f *fakeProxyFetcher) FetchFile(_ context.Context, repoPath, version, filen
 	return nil, fmt.Errorf("fake: no file for %q: %w", key, proxy.ErrNotFound)
 }
 
+func (f *fakeProxyFetcher) FetchPath(_ context.Context, repoPath, filename string) (*proxymaven.FileResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetchFileCalls++
+	key := repoPath + "/" + filename
+	if err, ok := f.fileErr[key]; ok {
+		return nil, err
+	}
+	if r, ok := f.files[key]; ok {
+		cp := *r
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("fake: no file for %q: %w", key, proxy.ErrNotFound)
+}
+
 func (f *fakeProxyFetcher) calls() (metadata, files int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -219,6 +234,59 @@ func TestProxy_MetadataPassthrough(t *testing.T) {
 	}
 }
 
+func TestProxy_MetadataChecksumSidecarFetchesAndCaches(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	const checksum = "0123456789abcdef"
+	fetcher.files["com/example/demo/maven-metadata.xml.sha1"] = &proxymaven.FileResponse{
+		Body:          io.NopCloser(strings.NewReader(checksum)),
+		ContentType:   "text/plain",
+		ContentLength: int64(len(checksum)),
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/maven-metadata.xml.sha1"), nil)
+		rec := httptest.NewRecorder()
+		h.Mux().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status=%d, want 200 (body=%s)", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != checksum {
+			t.Errorf("request %d: body=%q, want %q", i+1, got, checksum)
+		}
+	}
+
+	_, gotFileCalls := fetcher.calls()
+	if gotFileCalls != 1 {
+		t.Errorf("FetchPath calls=%d, want 1 cache fill", gotFileCalls)
+	}
+}
+
+func TestProxy_SnapshotMetadataChecksumSidecarFetchesFromSnapshotPath(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	const checksum = "fedcba9876543210"
+	fetcher.files["com/example/demo/1.0-SNAPSHOT/maven-metadata.xml.sha1"] = &proxymaven.FileResponse{
+		Body:          io.NopCloser(strings.NewReader(checksum)),
+		ContentType:   "text/plain",
+		ContentLength: int64(len(checksum)),
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{})
+
+	req := httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/1.0-SNAPSHOT/maven-metadata.xml.sha1"), nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != checksum {
+		t.Errorf("body=%q, want %q", got, checksum)
+	}
+}
+
 func TestProxy_UploadsReturn405(t *testing.T) {
 	t.Parallel()
 
@@ -262,6 +330,51 @@ func TestProxy_FilterDenySkipsUpstream(t *testing.T) {
 	}
 	if gotMetadata, gotFiles := fetcher.calls(); gotMetadata != 0 || gotFiles != 0 {
 		t.Errorf("upstream calls metadata=%d files=%d, want 0/0", gotMetadata, gotFiles)
+	}
+}
+
+func TestProxy_DelayFilterFailsClosedWithoutLastUpdated(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	fetcher.metadata["com/example/demo"] = &proxymaven.MetadataResponse{Versions: []string{"1.2.0"}}
+	fetcher.files["com/example/demo/1.2.0/demo-1.2.0.jar"] = &proxymaven.FileResponse{
+		Body:          io.NopCloser(strings.NewReader("jar")),
+		ContentType:   "application/java-archive",
+		ContentLength: 3,
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{Proxy: namespace.Proxy{
+		Filters: filter.Filters{&filter.Delay{MinAge: time.Hour}},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/1.2.0/demo-1.2.0.jar"), nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if gotMetadata, gotFiles := fetcher.calls(); gotMetadata != 1 || gotFiles != 0 {
+		t.Errorf("upstream calls metadata=%d files=%d, want 1/0", gotMetadata, gotFiles)
+	}
+}
+
+func TestProxy_FileExceedingSizeCapIsRejectedBeforeFetchBody(t *testing.T) {
+	t.Parallel()
+
+	fetcher := newFakeProxyFetcher()
+	fetcher.metadata["com/example/demo"] = &proxymaven.MetadataResponse{Versions: []string{"1.2.0"}}
+	fetcher.files["com/example/demo/1.2.0/demo-1.2.0.jar"] = &proxymaven.FileResponse{
+		Body:          io.NopCloser(strings.NewReader("too-large")),
+		ContentType:   "application/java-archive",
+		ContentLength: 9,
+	}
+	h, _, _ := newProxyTestHandler(t, fetcher, namespace.Spec{}, WithMaxUploadBytes(8))
+
+	req := httptest.NewRequest(http.MethodGet, nsPath("/com/example/demo/1.2.0/demo-1.2.0.jar"), nil)
+	rec := httptest.NewRecorder()
+	h.Mux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502 (body=%s)", rec.Code, rec.Body.String())
 	}
 }
 

@@ -224,6 +224,20 @@ func TestHandleGet(t *testing.T) {
 			wantBody:   "<metadata></metadata>",
 		},
 		{
+			name: "get snapshot metadata checksum",
+			setupFile: &oci.RepoFile{
+				OwningRepo: testNS + "/com/example/project",
+				OwningTag:  "1.0-SNAPSHOT-metadata",
+				Name:       "maven-metadata.xml.sha1",
+				MediaType:  "text/plain",
+			},
+			setupData:  "snapshot-sha1",
+			path:       nsPath("/com/example/project/1.0-SNAPSHOT/maven-metadata.xml.sha1"),
+			method:     http.MethodGet,
+			wantStatus: http.StatusOK,
+			wantBody:   "snapshot-sha1",
+		},
+		{
 			name: "get release metadata",
 			setupFile: &oci.RepoFile{
 				OwningRepo: testNS + "/com/example/project",
@@ -236,6 +250,20 @@ func TestHandleGet(t *testing.T) {
 			method:     http.MethodGet,
 			wantStatus: http.StatusOK,
 			wantBody:   "<metadata></metadata>",
+		},
+		{
+			name: "get release metadata checksum",
+			setupFile: &oci.RepoFile{
+				OwningRepo: testNS + "/com/example/project",
+				OwningTag:  "metadata",
+				Name:       "maven-metadata.xml.sha1",
+				MediaType:  "text/plain",
+			},
+			setupData:  "release-sha1",
+			path:       nsPath("/com/example/project/maven-metadata.xml.sha1"),
+			method:     http.MethodGet,
+			wantStatus: http.StatusOK,
+			wantBody:   "release-sha1",
 		},
 	}
 

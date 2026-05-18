@@ -144,22 +144,37 @@ func (f *Fetcher) FetchFile(ctx context.Context, repoPath, version, filename str
 	if repoPath == "" || version == "" || filename == "" {
 		return nil, fmt.Errorf("maven proxy: FetchFile: repo path, version, and filename are required")
 	}
-	u, err := f.mavenURL(repoPath, version, filename)
+	return f.fetchPath(ctx, repoPath, version, filename)
+}
+
+// FetchPath opens a streaming GET for <repoPath>/<filename>. It is
+// used for Maven metadata checksum sidecars, which live next to
+// maven-metadata.xml rather than under a version directory.
+func (f *Fetcher) FetchPath(ctx context.Context, repoPath, filename string) (*FileResponse, error) {
+	if repoPath == "" || filename == "" {
+		return nil, fmt.Errorf("maven proxy: FetchPath: repo path and filename are required")
+	}
+	return f.fetchPath(ctx, repoPath, filename)
+}
+
+func (f *Fetcher) fetchPath(ctx context.Context, parts ...string) (*FileResponse, error) {
+	u, err := f.mavenURL(parts...)
 	if err != nil {
 		return nil, err
 	}
+	path := strings.Join(parts, "/")
 	resp, err := f.client.Get(ctx, u, httpclient.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		resp.Body.Close()
-		return nil, fmt.Errorf("maven proxy: file %s/%s/%s: %w", repoPath, version, filename, proxy.ErrNotFound)
+		return nil, fmt.Errorf("maven proxy: file %s: %w", path, proxy.ErrNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("maven proxy: file %s/%s/%s: status %d: %w",
-			repoPath, version, filename, resp.StatusCode, proxy.ErrUpstreamUnavailable)
+		return nil, fmt.Errorf("maven proxy: file %s: status %d: %w",
+			path, resp.StatusCode, proxy.ErrUpstreamUnavailable)
 	}
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
