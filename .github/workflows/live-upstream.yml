@@ -52,17 +52,34 @@ jobs:
           java-version: '21'
           cache: 'maven'
 
-      - name: 'Run live upstream integration tests'
+      - name: 'Run live PyPI proxy integration test'
         # Distinct build tags from the hermetic `integration` suite.
-        # Keep all live upstream packages in this single invocation so
-        # one PR check always exercises the full non-hermetic surface.
+        # The -run filter keeps this workflow focused on the live
+        # proxy test instead of re-running package unit tests.
         # ubuntu-latest ships Docker; the harness spins up zot via
         # testcontainers.
         run: |
           go test -race -count=1 \
-            -tags=pypiupstream,npmupstream,mavenupstream \
+            -tags=pypiupstream \
             -timeout=10m \
             -v \
-            ./pkg/handler/python/... \
-            ./pkg/handler/npm/... \
+            -run '^TestPythonIntegration_LivePypiProxy$' \
+            ./pkg/handler/python/...
+
+      - name: 'Run live npm proxy integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=npmupstream \
+            -timeout=10m \
+            -v \
+            -run '^TestNpmIntegration_LiveRegistryProxy$' \
+            ./pkg/handler/npm/...
+
+      - name: 'Run live Maven proxy integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=mavenupstream \
+            -timeout=10m \
+            -v \
+            -run '^TestMavenIntegration_LiveCentralProxy$' \
             ./pkg/handler/maven/...
