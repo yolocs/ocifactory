@@ -49,7 +49,7 @@ Design pillars (in priority order):
 | Cloud Run / Cloudflare deployment guides | Not started |
 | Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
 | Rate limiting | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs one combined `-tags=pypiupstream,npmupstream` job against real PyPI / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` runs separate Python / Maven / npm steps for the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs separate Python / Maven / npm proxy steps against real PyPI / Maven Central / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
@@ -231,6 +231,10 @@ These are non-negotiable. Apply them to every test in the repo:
    ```
    Don't compare field-by-field with `==` or `reflect.DeepEqual` when `cmp.Diff` will work — the diff output is what makes failures debuggable. The argument order is `(want, got)` so the diff legend reads correctly.
 5. **Fakes, not mocks.** No `gomock`, no `testify/mock`, no codegen mock libraries. Write a small fake of the interface in a `_test.go` file (or `pkg/<x>/fake.go` if reused across packages). For handler tests, don't mock `handler.Registry` — exercise the real `pkg/oci` code on top of the in-memory backend in `pkg/oci/fake.go`, so the layers are tested together.
+
+### CI integration workflow rules
+
+- Keep GitHub Actions integration jobs split by artifact format when a job can fail for Python, Maven, npm, or future repo types independently. `client-integration` should have one step per real-client test with an exact `-run` filter, and `live-upstream` should have one step per live proxy upstream test with the format-specific build tag. This makes CI failures point at the broken artifact format immediately instead of hiding it inside one combined `go test` invocation.
 
 ## Adding a new repo type — checklist
 
