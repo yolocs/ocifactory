@@ -1,11 +1,10 @@
 name: 'live-upstream'
 
 # Non-hermetic integration tests: they talk to real upstream
-# registries (PyPI, npm today; Maven Central later) over the public
-# internet. Outages, rate limits, or response-shape changes on the
-# upstream side will turn this workflow red. When that happens, read
-# the failure and decide whether it's our regression or theirs before
-# reverting.
+# registries (PyPI, npm, Maven Central) over the public internet.
+# Outages, rate limits, or response-shape changes on the upstream side
+# will turn this workflow red. When that happens, read the failure and
+# decide whether it's our regression or theirs before reverting.
 #
 # Runs on every PR + manual dispatch. PR runs catch regressions in
 # pkg/proxy/* and proxy-mode handlers before merge.
@@ -47,16 +46,34 @@ jobs:
         with:
           node-version: '22'
 
-      - name: 'Run live upstream integration tests'
+      - name: 'Run live PyPI proxy integration test'
         # Distinct build tags from the hermetic `integration` suite.
-        # Keep all live upstream packages in this single invocation so
-        # one PR check always exercises the full non-hermetic surface.
+        # The -run filter keeps this workflow focused on the live
+        # proxy test instead of re-running package unit tests.
         # ubuntu-latest ships Docker; the harness spins up zot via
         # testcontainers.
         run: |
           go test -race -count=1 \
-            -tags=pypiupstream,npmupstream \
+            -tags=pypiupstream \
             -timeout=10m \
             -v \
-            ./pkg/handler/python/... \
+            -run '^TestPythonIntegration_LivePypiProxy$' \
+            ./pkg/handler/python/...
+
+      - name: 'Run live npm proxy integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=npmupstream \
+            -timeout=10m \
+            -v \
+            -run '^TestNpmIntegration_LiveRegistryProxy$' \
             ./pkg/handler/npm/...
+
+      - name: 'Run live Maven proxy integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=mavenupstream \
+            -timeout=10m \
+            -v \
+            -run '^TestMavenIntegration_LiveCentralProxy$' \
+            ./pkg/handler/maven/...

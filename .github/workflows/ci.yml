@@ -180,7 +180,7 @@ jobs:
           fi
 
   # client-integration runs the per-format real-client tests: pip /
-  # twine / mvn driving an ocifactory subprocess against a zot
+  # twine / mvn / npm driving an ocifactory subprocess against a zot
   # registry started by testcontainers-go.
   #
   # The shared go-test job above runs the same tests but skips them
@@ -217,16 +217,33 @@ jobs:
       - name: 'Install maven'
         run: 'sudo apt-get update && sudo apt-get install -y --no-install-recommends maven'
 
-      - name: 'Run client integration tests'
+      - name: 'Run Python client integration test'
         # -tags=integration compiles the integration_test.go files
-        # the shared go-test job skips. The shared job runs the
-        # rest of the suite under the same Go version so we don't
-        # need to repeat it here.
+        # the shared go-test job skips. The -run filter keeps each
+        # step focused on one format's real-client test so failures
+        # point at the artifact format that broke.
         run: |
           go test -race -count=1 \
             -tags=integration \
             -timeout=10m \
             -v \
-            ./pkg/handler/python/... \
-            ./pkg/handler/maven/... \
+            -run '^TestPythonIntegration_RealClients$' \
+            ./pkg/handler/python/...
+
+      - name: 'Run Maven client integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=integration \
+            -timeout=10m \
+            -v \
+            -run '^TestMavenIntegration_RealClients$' \
+            ./pkg/handler/maven/...
+
+      - name: 'Run npm client integration test'
+        run: |
+          go test -race -count=1 \
+            -tags=integration \
+            -timeout=10m \
+            -v \
+            -run '^TestNpmIntegration_RealClients$' \
             ./pkg/handler/npm/...

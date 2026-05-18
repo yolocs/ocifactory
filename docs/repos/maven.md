@@ -117,6 +117,82 @@ And in `pom.xml`:
 recognises; see [`docs/auth.md`](../auth.md#how-clients-send-credentials).
 The `password` is an OIDC ID token — there is no static-password path.
 
+## Proxy mode (pull-through Maven)
+
+Set the namespace's `mode` to `"proxy"` and point `proxy.upstream` at
+the Maven 2 repository you want to mirror. For Maven Central, use
+`https://repo.maven.apache.org/maven2`:
+
+```bash
+curl -X PUT https://ocifactory-admin.your-domain/admin/v1/namespaces/maven-central \
+  -H 'content-type: application/json' \
+  -d '{"mode":"proxy",
+       "proxy":{"upstream":"https://repo.maven.apache.org/maven2"},
+       "policy":{"readers":[{"issuer":"https://accounts.google.com"}]}}'
+```
+
+Point Maven at the proxy namespace exactly like a hosted namespace:
+
+```xml
+<repository>
+  <id>ocifactory-maven-central</id>
+  <url>https://ocifactory.your-domain/maven-central/maven2/</url>
+</repository>
+```
+
+What changes on the wire:
+
+- **Artifact metadata** (`/{namespace}/maven2/<group>/<artifact>/maven-metadata.xml`)
+  and **snapshot-version metadata**
+  (`/{namespace}/maven2/<group>/<artifact>/<version>-SNAPSHOT/maven-metadata.xml`)
+  are always fetched live from upstream and served byte-for-byte. Maven
+  metadata is small and contains no absolute URLs, so ocifactory does
+  not use the OCI index cache for Maven.
+- **Artifact files** (`.jar`, `.pom`, sources, javadoc, and checksum
+  siblings such as `.sha1` / `.md5`) check OCI first. On a miss,
+  ocifactory runs the namespace's filter chain, fetches upstream
+  metadata to confirm the version and get `<lastUpdated>` for delay
+  filters, streams the file from upstream to the client, and tees the
+  same bytes into OCI. The second request for the same file serves from
+  the OCI cache.
+- **Writes** (`PUT` / `POST`) return `405 Method Not Allowed` on proxy
+  namespaces. Publish to a hosted namespace when ocifactory should be
+  the source of truth.
+- **Archetype catalogs** (`/archetype-catalog.xml`) are not pulled
+  through from upstream in proxy mode yet. Reads only check the local
+  OCI cache, and writes return `405 Method Not Allowed`.
+
+Degraded operation is intentionally simpler than PyPI/npm: upstream
+metadata returns `404 Not Found` when upstream has no metadata, `502 Bad
+Gateway` when the metadata is malformed, and `503 Service Unavailable`
+when upstream cannot be reached. File fetch errors return `404` for
+upstream not found or `502 Bad Gateway` for malformed, unavailable, or
+oversized upstream responses. There is a short in-memory negative cache
+for repeated file 404s, but no stale metadata fallback in v1.
+
+Filters use Maven package refs in `groupId:artifactId` form:
+
+```json
+{
+  "mode": "proxy",
+  "proxy": {
+    "upstream": "https://repo.maven.apache.org/maven2",
+    "filters": [
+      {"kind": "deny", "patterns": ["com.example.bad:*"]}
+    ]
+  }
+}
+```
+
+The filter chain is the same one documented in
+[`docs/proxy/filter-policy.md`](../proxy/filter-policy.md): name
+allowlist / denylist filters run before any upstream call, and the
+publish-time `delay` filter runs after `maven-metadata.xml` is fetched
+using artifact-level `<versioning><lastUpdated>` as Maven's upload-time
+proxy. Maven metadata does not carry per-version upload times; if
+`<lastUpdated>` is missing or unparsable, ocifactory fails closed and
+does not fetch the artifact.
+
 ## URL layout
 
 Every route lives under `/{namespace}/maven2/...`. The `maven2/`
@@ -362,8 +438,10 @@ are documented in [`docs/auth.md`](../auth.md) and
   generating the indirection will not get it.
 - **No staging / promotion workflow.** Every deploy is final. There is
   no "stage to a sandbox repo, then promote to releases" feature.
-- **No pull-through caching of Maven Central.** Tracked under Phase 4
-  of [`docs/ROADMAP.md`](../ROADMAP.md).
+- **Proxy mode has live metadata only.** `maven-metadata.xml` is
+  fetched from upstream on every proxy metadata request. If upstream is
+  unavailable, ocifactory returns `503` rather than serving stale or
+  synthesizing Maven metadata.
 - **`--allow-overwrite=true` loosens immutability for every release
   file type.** Snapshot versions are always overwritable by design,
   independent of the flag. Operators who want immutable release jars

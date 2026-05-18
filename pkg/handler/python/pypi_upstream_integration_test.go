@@ -4,8 +4,8 @@
 // behind a separate `pypiupstream` build tag (NOT `integration`)
 // because the test is intentionally non-hermetic: it talks to
 // https://pypi.org over the public internet. PyPI outages, rate
-// limits, or response-shape changes will turn this test red. Run it
-// on a schedule (nightly), not on every PR.
+// limits, or response-shape changes will turn this test red. CI runs
+// it on every PR in the separate live-upstream workflow.
 //
 // Invoke via `go test -tags=pypiupstream ./pkg/handler/python/...`.
 

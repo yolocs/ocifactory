@@ -24,6 +24,7 @@ Design pillars (in priority order):
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download, per-package simple-index cache | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
 | `pkg/proxy/python` + python proxy mode (registry hit → filter → PyPI JSON metadata → file fetch → tee to OCI; pull-through indexes with stale-OK + synthesis fallback; uploads → 405) | Done, tested. Wired into `pkg/handler/python` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/python.md`](docs/repos/python.md#proxy-mode-pull-through-pypi). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog), checksum verification, snapshot-always-overwrite | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
+| `pkg/proxy/maven` + maven proxy mode (registry hit → filter → Maven metadata fetch → file fetch → tee to OCI; live metadata passthrough; writes → 405) | Done, tested. Wired into `pkg/handler/maven` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md#proxy-mode-pull-through-maven). |
 | `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`), scoped + unscoped packages | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
 | `pkg/proxy/npm` + npm proxy mode (registry hit → filter → packument fetch/rewrite/cache → tarball fetch → tee to OCI; stale-OK + synthesis fallback; writes → 405) | Done, tested. Wired into `pkg/handler/npm` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md#proxy-mode-pull-through-npm). |
 | `pkg/handler` — `Server`, `Logger`, `MetricsMiddleware`, `ObservabilityHandler` (intercepts `/healthz` / `/readyz` / `/metrics` before format mux) | Done |
@@ -42,13 +43,13 @@ Design pillars (in priority order):
 | `internal/version` — build-time version stamping via `-ldflags="-X .../internal/version.Version=..."`, fallbacks to `runtime/debug.ReadBuildInfo()` for dev builds | Done. `--version` surfaces it; `/readyz` includes it in the JSON body. |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
-| Pull-through proxy / caching | Python and npm done; Maven/Go/apt and cross-format hardening remain Phase 4 work. |
+| Pull-through proxy / caching | Python, npm, and Maven done; Go/apt and cross-format hardening remain Phase 4 work. |
 | Vulnerability scanning | Not started |
 | Authorization extensibility — multiple backends (OPA / Cedar / Casbin) | Pluggable via `namespace.AuthzFactory`; only the matcher-based built-in ships in-tree. |
 | Cloud Run / Cloudflare deployment guides | Not started |
 | Structured request logging | Not started (debug-level request log via `pkg/handler.Loggeer` is present) |
 | Rate limiting | Not started |
-| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` job runs the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs one combined `-tags=pypiupstream,npmupstream` job against real PyPI / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
+| CI: lint, test, build, image publish | `go-test` from `abcxyz/pkg`; `oidc-e2e` job mints a real GitHub OIDC token and exercises the auth chain against `--repo-type=echo`; `client-integration` runs separate Python / Maven / npm steps for the `-tags=integration` real-client tests (`twine`, `mvn`, `npm`). A separate `live-upstream` workflow runs separate Python / Maven / npm proxy steps against real PyPI / Maven Central / npm on every PR (intentionally non-hermetic; upstream outages will turn it red). Image publish runs on the release workflow, not per-PR. |
 
 ## Architecture (read this before changing things)
 
@@ -230,6 +231,10 @@ These are non-negotiable. Apply them to every test in the repo:
    ```
    Don't compare field-by-field with `==` or `reflect.DeepEqual` when `cmp.Diff` will work — the diff output is what makes failures debuggable. The argument order is `(want, got)` so the diff legend reads correctly.
 5. **Fakes, not mocks.** No `gomock`, no `testify/mock`, no codegen mock libraries. Write a small fake of the interface in a `_test.go` file (or `pkg/<x>/fake.go` if reused across packages). For handler tests, don't mock `handler.Registry` — exercise the real `pkg/oci` code on top of the in-memory backend in `pkg/oci/fake.go`, so the layers are tested together.
+
+### CI integration workflow rules
+
+- Keep GitHub Actions integration jobs split by artifact format when a job can fail for Python, Maven, npm, or future repo types independently. `client-integration` should have one step per real-client test with an exact `-run` filter, and `live-upstream` should have one step per live proxy upstream test with the format-specific build tag. This makes CI failures point at the broken artifact format immediately instead of hiding it inside one combined `go test` invocation.
 
 ## Adding a new repo type — checklist
 
