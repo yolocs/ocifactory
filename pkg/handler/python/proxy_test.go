@@ -329,6 +329,51 @@ func TestProxy_FileMissFetchAndCache(t *testing.T) {
 	}
 }
 
+func TestProxy_FileMissCacheFillRequiresOnlyReadPolicy(t *testing.T) {
+	t.Parallel()
+
+	fake := newFakeFetcher()
+	const fileURL = "https://files.pythonhosted.org/packages/abc/requests-2.31.0-py3-none-any.whl"
+	fake.versionMeta["requests@2.31.0"] = &pypython.VersionMetadata{
+		Package: "requests",
+		Version: "2.31.0",
+		Files: []pypython.FileMetadata{{
+			Filename:   "requests-2.31.0-py3-none-any.whl",
+			URL:        fileURL,
+			Size:       11,
+			UploadTime: time.Date(2023, 5, 22, 15, 12, 42, 0, time.UTC),
+		}},
+		UploadTime: time.Date(2023, 5, 22, 15, 12, 42, 0, time.UTC),
+	}
+	fake.files[fileURL] = []byte("wheel-bytes")
+
+	spec := namespace.Spec{
+		Policy: namespace.Policy{
+			Readers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
+			Writers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
+		},
+	}
+	h, _, backing := newProxyTestHandler(t, fake, spec)
+
+	path := "/" + testNS + "/packages/requests/2.31.0/requests-2.31.0-py3-none-any.whl"
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+	if got, want := w.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d (body=%s)", got, want, w.Body.String())
+	}
+	if body := w.Body.String(); body != "wheel-bytes" {
+		t.Errorf("body = %q, want %q", body, "wheel-bytes")
+	}
+
+	files, err := backing.ListFiles(t.Context(), testNS+"/packages/requests")
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Errorf("backing has %d files, want 1", len(files))
+	}
+}
+
 // TestProxy_FileMetadataSidecar exercises the PEP 658 path: when pip
 // asks for `<wheel>.metadata` (because the upstream simple index
 // advertised `data-core-metadata`), the proxy synthesizes the upstream

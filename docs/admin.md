@@ -115,6 +115,9 @@ Names must satisfy:
   file downloads (allow / deny / publish-time delay). Index requests
   bypass the chain. See [`docs/proxy/filter-policy.md`](proxy/filter-policy.md)
   for the policy semantics and config shapes.
+- Shared pull-through proxy design notes, including why cold misses
+  are streamed through ocifactory instead of redirected to upstream,
+  live in [`docs/proxy/README.md`](proxy/README.md).
 - `format` is reserved for future format-specific knobs; ocifactory
   preserves it across roundtrips so a newer ocifactory's keys aren't
   silently dropped by an older one.

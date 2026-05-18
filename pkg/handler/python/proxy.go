@@ -204,8 +204,8 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 //     status.
 //  4. metadata-dependent filters (publish-time delay). Deny → 404.
 //  5. upstream file fetch.
-//  6. tee through AddFile while streaming to client. AddFile error
-//     mid-stream → 502; next request retries.
+//  6. tee through AddCachedFile while streaming to client. Cache-fill
+//     error mid-stream → 502; next request retries.
 //
 // Concurrent first-misses for the same (ns, pkg, version, filename)
 // collapse onto one upstream fetch via the file-singleflight group.
@@ -370,13 +370,13 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			body = io.TeeReader(body, teeRef)
 		}
 
-		// AddFile writes blob + file manifest + version anchor;
-		// authorizes for write on the bound namespace policy. An
+		// AddCachedFile writes blob + file manifest + version anchor;
+		// authorizes for read on the bound namespace policy. An
 		// already-exists error means a concurrent cold-miss raced us
 		// before singleflight could; probeExistingFile reports it
 		// before reading the body, so no client bytes were written and
 		// the follower path can serve from the cache the peer wrote.
-		if _, addErr := scoped.AddFile(ctx, populated, body); addErr != nil {
+		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
