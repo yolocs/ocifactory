@@ -100,8 +100,8 @@ scoped-token issuance.
 
 Turn ocifactory into a caching mirror in front of upstream registries.
 
-- [ ] Per-format upstream client (npm registry, PyPI JSON API, Maven Central,
-  `proxy.golang.org`, Debian mirrors).
+- [ ] Per-format upstream client (npm registry, PyPI JSON API, and Maven
+  Central are done; `proxy.golang.org` and Debian mirrors remain).
 - [ ] Cache semantics:
   - Immutable artifacts (specific versions): cache forever.
   - Mutable indexes (npm package doc, PyPI simple index): TTL.

@@ -24,6 +24,7 @@ Design pillars (in priority order):
 | `pkg/handler/python` — PEP 503 simple index, twine upload, pip download, per-package simple-index cache | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/python.md`](docs/repos/python.md). |
 | `pkg/proxy/python` + python proxy mode (registry hit → filter → PyPI JSON metadata → file fetch → tee to OCI; pull-through indexes with stale-OK + synthesis fallback; uploads → 405) | Done, tested. Wired into `pkg/handler/python` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/python.md`](docs/repos/python.md#proxy-mode-pull-through-pypi). |
 | `pkg/handler/maven` — Maven 2 layout (releases, snapshots, metadata, archetype catalog), checksum verification, snapshot-always-overwrite | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md). |
+| `pkg/proxy/maven` + maven proxy mode (registry hit → filter → Maven metadata fetch → file fetch → tee to OCI; live metadata passthrough; writes → 405) | Done, tested. Wired into `pkg/handler/maven` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/maven.md`](docs/repos/maven.md#proxy-mode-pull-through-maven). |
 | `pkg/handler/npm` — npm registry HTTP protocol (`npm publish`, `npm install`, `npm dist-tag add\|ls`), scoped + unscoped packages | Done, tested (incl. real-client integration tests). Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md). |
 | `pkg/proxy/npm` + npm proxy mode (registry hit → filter → packument fetch/rewrite/cache → tarball fetch → tee to OCI; stale-OK + synthesis fallback; writes → 405) | Done, tested. Wired into `pkg/handler/npm` for namespaces with `mode: proxy`. Operator docs: [`docs/repos/npm.md`](docs/repos/npm.md#proxy-mode-pull-through-npm). |
 | `pkg/handler` — `Server`, `Logger`, `MetricsMiddleware`, `ObservabilityHandler` (intercepts `/healthz` / `/readyz` / `/metrics` before format mux) | Done |
@@ -42,7 +43,7 @@ Design pillars (in priority order):
 | `internal/version` — build-time version stamping via `-ldflags="-X .../internal/version.Version=..."`, fallbacks to `runtime/debug.ReadBuildInfo()` for dev builds | Done. `--version` surfaces it; `/readyz` includes it in the JSON body. |
 | Go module proxy support | Not started |
 | Debian/apt support | Not started |
-| Pull-through proxy / caching | Python and npm done; Maven/Go/apt and cross-format hardening remain Phase 4 work. |
+| Pull-through proxy / caching | Python, npm, and Maven done; Go/apt and cross-format hardening remain Phase 4 work. |
 | Vulnerability scanning | Not started |
 | Authorization extensibility — multiple backends (OPA / Cedar / Casbin) | Pluggable via `namespace.AuthzFactory`; only the matcher-based built-in ships in-tree. |
 | Cloud Run / Cloudflare deployment guides | Not started |

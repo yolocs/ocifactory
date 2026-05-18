@@ -14,6 +14,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
+	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"oras.land/oras-go/v2/errdef"
 )
 
@@ -57,6 +58,7 @@ type Handler struct {
 	registry       *namespace.Registry
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
+	proxy          *proxyState
 }
 
 // Option configures optional Handler behaviour.
@@ -65,6 +67,8 @@ type Option func(*handlerConfig)
 type handlerConfig struct {
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
+	fetcherFactory FetcherFactory
+	negCache       *indexcache.NegativeCache
 }
 
 // WithAuthMiddleware installs an authentication middleware on
@@ -98,11 +102,13 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Handler{
+	h := &Handler{
 		registry:       registry,
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
-	}, nil
+	}
+	h.proxy = newProxyState(cfg)
+	return h, nil
 }
 
 // Mux returns the maven handler's router. Every route lives under
@@ -151,6 +157,12 @@ func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
 // handleArchetypeCatalog handles requests for archetype-catalog.xml.
 func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Request) {
 	scoped := h.scopedFor(req)
+	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy && (req.Method == http.MethodPut || req.Method == http.MethodPost) {
+		http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+		return
+	}
 	f := &oci.RepoFile{
 		OwningRepo: "archetype",
 		OwningTag:  "latest",
@@ -187,6 +199,16 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		// snapshot doesn't 409 on the metadata write.
 		AllowOverwrite: true,
 	}
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost {
+			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleMetadataProxy(w, req, scoped, spec, repoParts+"/"+versionSnapshot)
+		return
+	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)
 	} else { // GET, HEAD
@@ -210,6 +232,16 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		OwningTag:  "metadata", // For release artifact or version metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
+	}
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost {
+			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleMetadataProxy(w, req, scoped, spec, repoParts)
+		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)
@@ -243,6 +275,16 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		// rewrites. Release versions stay immutable and respect the
 		// registry-level --allow-overwrite default.
 		AllowOverwrite: isSnapshotVersion(version),
+	}
+	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		return
+	} else if isProxy {
+		if req.Method == http.MethodPut || req.Method == http.MethodPost {
+			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleFileGetProxy(w, req, scoped, spec, f)
+		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
 		h.handlePut(w, req, scoped, f)

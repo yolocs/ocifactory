@@ -392,9 +392,11 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
 		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		negCache := indexcache.NewNegativeCache()
 		mh, err := maven.NewHandler(nsReg,
 			maven.WithAuthMiddleware(authMW),
 			maven.WithMaxUploadBytes(cfg.MavenMaxUploadBytes),
+			maven.WithProxyNegativeCache(negCache),
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create maven handler: %w", err)
