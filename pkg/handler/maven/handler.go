@@ -200,7 +200,7 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 
 	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
-		OwningRepo: repoParts,
+		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
@@ -240,7 +240,7 @@ func (h *Handler) handleSnapshotMetadataSidecar(w http.ResponseWriter, req *http
 
 	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
-		OwningRepo:     repoParts,
+		OwningRepo:     packageOwningRepo(repoParts),
 		OwningTag:      versionSnapshot + "-metadata",
 		Name:           filename,
 		MediaType:      detectMediaType(filename),
@@ -275,7 +275,7 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 
 	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
-		OwningRepo: repoParts,
+		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  "metadata", // For release artifact or version metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
@@ -309,7 +309,7 @@ func (h *Handler) handleArtifactMetadataSidecar(w http.ResponseWriter, req *http
 
 	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
-		OwningRepo: repoParts,
+		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  "metadata",
 		Name:       filename,
 		MediaType:  detectMediaType(filename),
@@ -345,7 +345,7 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 
 	scoped := h.scopedFor(req)
 	f := &oci.RepoFile{
-		OwningRepo: repoParts,
+		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  version,
 		Name:       filename,
 		MediaType:  detectMediaType(filename),

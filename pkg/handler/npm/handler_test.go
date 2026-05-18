@@ -104,7 +104,7 @@ func TestPublish_HappyPath_Unscoped(t *testing.T) {
 	}
 
 	// Index sentinel for the package landed in the index repo.
-	if _, ok := reg.Files[testNS+"/index/example-pkg/"+indexSentinelName]; !ok {
+	if _, ok := reg.Files[testNS+"/"+packageIndexName+"/example-pkg/"+indexSentinelName]; !ok {
 		t.Errorf("index sentinel not stored")
 	}
 }
@@ -156,8 +156,8 @@ func TestPublish_MultipleVersions(t *testing.T) {
 	if got, want := reg.Aliases[testNS+"/packages/u/example-pkg/latest"], "1.1.0"; got != want {
 		t.Errorf("dist-tag latest=%q, want %q", got, want)
 	}
-	if got := len(reg.Tags[testNS+"/index"]); got != 1 {
-		t.Errorf("index tags=%v, want exactly one entry", reg.Tags[testNS+"/index"])
+	if got := len(reg.Tags[testNS+"/"+packageIndexName]); got != 1 {
+		t.Errorf("index tags=%v, want exactly one entry", reg.Tags[testNS+"/"+packageIndexName])
 	}
 }
 

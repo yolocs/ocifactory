@@ -709,13 +709,13 @@ func TestProxy_TopLevelUpstreamErrorSynthesizes(t *testing.T) {
 
 	h, _, backing := newProxyTestHandler(t, fake, namespace.Spec{})
 
-	// Seed the synthesis source — the `index` repo's tag list.
+	// Seed the synthesis source — the per-format index repo's tag list.
 	if _, err := backing.AddFile(t.Context(), &oci.RepoFile{
-		OwningRepo: testNS + "/index",
+		OwningRepo: testNS + "/" + packageIndexName,
 		OwningTag:  "requests",
 		Name:       "present",
 		MediaType:  "text/plain",
-	}, strings.NewReader("1")); err != nil {
+	}, strings.NewReader(indexSentinelContent)); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

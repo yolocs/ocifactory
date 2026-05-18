@@ -135,12 +135,13 @@ property either ocifactory or PyPI provides.
 
 ## OCI storage layout
 
-Two OCI repositories **per namespace** under `--backend-registry`:
+Package storage and the Python package-list index live **per namespace**
+under `--backend-registry` plus any configured `--repo-prefix`:
 
 | OCI repo | Canonical tags | What's stored |
 |---|---|---|
 | `<namespace>/packages/<pkg>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus one file manifest per uploaded wheel / sdist (subject-linked to the version anchor and addressable via the OCI 1.1 referrers API). Each file manifest also carries a deterministic `_f_<sha256>` tag so reads resolve in one round-trip. |
-| `<namespace>/index` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"1"`). The body is unused; `ListTags("<namespace>/index")` is the package list for this namespace. |
+| `<namespace>/python-packages` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"present\n"`). The body is unused; this is the package list for this namespace. |
 
 A third per-namespace repo, `<namespace>/ocifactory-packages`, is
 maintained by the data-plane namespace wrapper itself — its tags

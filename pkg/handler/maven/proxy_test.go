@@ -149,7 +149,7 @@ func TestProxy_FileMissFetchesAndCaches(t *testing.T) {
 	if got := rec.Body.String(); got != body {
 		t.Errorf("body=%q, want %q", got, body)
 	}
-	files, err := backing.ListFiles(t.Context(), testNS+"/com/example/demo")
+	files, err := backing.ListFiles(t.Context(), testNS+"/packages/com/example/demo")
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestProxy_FileCacheHitSkipsUpstream(t *testing.T) {
 	fetcher := newFakeProxyFetcher()
 	h, _, backing := newProxyTestHandler(t, fetcher, namespace.Spec{})
 	if _, err := backing.AddFile(t.Context(), &oci.RepoFile{
-		OwningRepo: testNS + "/com/example/demo",
+		OwningRepo: testNS + "/packages/com/example/demo",
 		OwningTag:  "1.2.0",
 		Name:       "demo-1.2.0.jar",
 		MediaType:  "application/java-archive",

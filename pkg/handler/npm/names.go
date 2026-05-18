@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // ErrInvalidPackageName is returned when an npm package name does not
@@ -25,13 +27,6 @@ const maxPackageNameLength = 214
 // segment regex, so we reject it.
 var npmNameSegmentRegExp = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-// packageOwningRepoPrefix is the OCI repo path prefix every published
-// npm package lands under. The "u/" and "s/" sub-prefixes encode
-// whether the original name was scoped without ambiguity — npm names
-// cannot contain "/" themselves, and a scope name cannot start with
-// "u" + "/" because npm forbids "/" in either half of the name.
-const packageOwningRepoPrefix = "packages"
-
 // validatePackageName returns nil when name is a syntactically valid
 // npm package name (scoped or unscoped). It enforces the subset of
 // rules that map cleanly onto OCI repo segments: lowercase alnum +
@@ -39,7 +34,7 @@ const packageOwningRepoPrefix = "packages"
 // scoped form "@<scope>/<name>". Anything else (including "~",
 // uppercase letters, or Unicode characters) is rejected.
 //
-// The encoded form (see [encodePackageNameTag]) is also checked
+// The encoded form (see [oci.EncodeTag]) is also checked
 // against the 128-char OCI tag length cap so a syntactically valid
 // but encoding-oversized name is rejected at publish time rather
 // than silently failing later when [ensureIndexSentinel] tries to
@@ -78,31 +73,10 @@ func validatePackageName(name string) error {
 	// OCI tag cap. Names with many underscores or scoped names with
 	// long components can exceed it after _HH expansion even though
 	// they fit npm's own 214-char rule.
-	if _, err := encodePackageNameTag(name); err != nil {
-		return err
+	if _, err := oci.EncodeTag(name); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidPackageName, err)
 	}
 	return nil
-}
-
-// packageOwningRepo returns the OCI [oci.RepoFile.OwningRepo] string
-// for an npm package. Callers must already have validated name via
-// [validatePackageName]; this function does NOT re-validate.
-//
-//   - unscoped "foo"          → "packages/u/foo"
-//   - scoped   "@scope/foo"   → "packages/s/scope/foo"
-//
-// The "u/" and "s/" sub-prefixes guarantee an unscoped name can never
-// collide with the scope segment of a scoped name. Both forms are
-// composed of npm-name segments, which are already OCI-distribution
-// repo-segment-valid (lowercase alnum + ".-_").
-func packageOwningRepo(name string) string {
-	if strings.HasPrefix(name, "@") {
-		rest := name[1:]
-		slash := strings.IndexByte(rest, '/')
-		scope, unscoped := rest[:slash], rest[slash+1:]
-		return packageOwningRepoPrefix + "/s/" + scope + "/" + unscoped
-	}
-	return packageOwningRepoPrefix + "/u/" + name
 }
 
 // parsePackageOwningRepo reverses [packageOwningRepo]. Returns the
@@ -128,79 +102,6 @@ func parsePackageOwningRepo(owningRepo string) (string, error) {
 	default:
 		return "", fmt.Errorf("%w: owning repo %q lacks expected prefix", ErrInvalidPackageName, owningRepo)
 	}
-}
-
-// encodePackageNameTag encodes a package name into a value safe to use
-// as an OCI tag in the [indexRepo]. OCI tags allow
-// "[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}" so "@" and "/" must be encoded.
-// Uses the same "_HH" percent-style scheme as
-// pkg/namespace.encodeTag — uppercase hex, "_" itself escaped to
-// "_5F" so the encoding is lossless.
-//
-// Callers must already have validated name via [validatePackageName].
-func encodePackageNameTag(name string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(name))
-	for _, r := range name {
-		switch {
-		case r == '_':
-			b.WriteString("_5F")
-		case r == '/':
-			b.WriteString("_2F")
-		case r == '@':
-			b.WriteString("_40")
-		case r == '.' || r == '-':
-			b.WriteRune(r)
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			return "", fmt.Errorf("%w: name %q contains character %q that cannot be encoded", ErrInvalidPackageName, name, r)
-		}
-	}
-	if b.Len() == 0 {
-		return "", fmt.Errorf("%w: empty", ErrInvalidPackageName)
-	}
-	if b.Len() > 128 {
-		return "", fmt.Errorf("%w: encoded name exceeds 128-char OCI tag limit", ErrInvalidPackageName)
-	}
-	return b.String(), nil
-}
-
-// decodePackageNameTag reverses [encodePackageNameTag]. A stray "_"
-// not followed by two valid hex digits is treated as malformed.
-func decodePackageNameTag(tag string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(tag))
-	for i := 0; i < len(tag); i++ {
-		c := tag[i]
-		if c != '_' {
-			b.WriteByte(c)
-			continue
-		}
-		if i+2 >= len(tag) {
-			return "", fmt.Errorf("malformed escape at %d in %q: trailing underscore", i, tag)
-		}
-		hi, ok1 := unhex(tag[i+1])
-		lo, ok2 := unhex(tag[i+2])
-		if !ok1 || !ok2 {
-			return "", fmt.Errorf("malformed escape at %d in %q", i, tag)
-		}
-		b.WriteByte(hi<<4 | lo)
-		i += 2
-	}
-	return b.String(), nil
-}
-
-func unhex(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
 }
 
 // tarballFilename returns the canonical tarball layer name for an npm

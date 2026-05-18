@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 func TestValidatePackageName(t *testing.T) {
@@ -114,7 +116,7 @@ func TestParsePackageOwningRepo_Malformed(t *testing.T) {
 	}
 }
 
-func TestEncodePackageNameTag(t *testing.T) {
+func TestPackageNameTagEncodingUsesOCI(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -134,22 +136,22 @@ func TestEncodePackageNameTag(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := encodePackageNameTag(tc.input)
+			got, err := oci.EncodeTag(tc.input)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("encodePackageNameTag(%q) err=%v, wantErr=%v", tc.input, err, tc.wantErr)
+				t.Fatalf("oci.EncodeTag(%q) err=%v, wantErr=%v", tc.input, err, tc.wantErr)
 			}
 			if tc.wantErr {
 				return
 			}
 			if got != tc.want {
-				t.Errorf("encodePackageNameTag(%q) = %q, want %q", tc.input, got, tc.want)
+				t.Errorf("oci.EncodeTag(%q) = %q, want %q", tc.input, got, tc.want)
 			}
-			back, err := decodePackageNameTag(got)
+			back, err := oci.DecodeTag(got)
 			if err != nil {
-				t.Errorf("decodePackageNameTag(%q) err=%v", got, err)
+				t.Errorf("oci.DecodeTag(%q) err=%v", got, err)
 			}
 			if back != tc.input {
-				t.Errorf("round-trip: decodePackageNameTag(encodePackageNameTag(%q)) = %q", tc.input, back)
+				t.Errorf("round-trip: oci.DecodeTag(oci.EncodeTag(%q)) = %q", tc.input, back)
 			}
 		})
 	}

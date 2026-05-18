@@ -43,6 +43,21 @@ func TestAdminServeConfig_Validate(t *testing.T) {
 			wantURL: &url.URL{Scheme: "https", Host: "registry.example.com", Path: "/ocifactory"},
 		},
 		{
+			name: "repo prefix accepts single segment",
+			mut: func(c *adminServeConfig) {
+				c.RepoPrefix = "prod-east"
+			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
+			name: "repo prefix rejects multi segment",
+			mut: func(c *adminServeConfig) {
+				c.RepoPrefix = "prod/east"
+			},
+			wantErr: `invalid repo-prefix "prod/east": must match [a-z0-9][a-z0-9._-]*`,
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
 			name: "missing port",
 			mut: func(c *adminServeConfig) {
 				c.Port = ""
@@ -84,6 +99,7 @@ func TestAdminServeCmd_Flags(t *testing.T) {
 	tests := []string{
 		flagPort,
 		flagBackendRegistry,
+		flagRepoPrefix,
 		flagNamespacePrefix,
 		flagEnableMetrics,
 		flagMetricsPath,

@@ -25,6 +25,7 @@ const (
 type adminServeConfig struct {
 	Port            string `mapstructure:"port"`
 	BackendRegistry string `mapstructure:"backend-registry"`
+	RepoPrefix      string `mapstructure:"repo-prefix"`
 	NamespacePrefix string `mapstructure:"namespace-prefix"`
 	EnableMetrics   bool   `mapstructure:"enable-metrics"`
 	MetricsPath     string `mapstructure:"metrics-path"`
@@ -55,6 +56,9 @@ func (c *adminServeConfig) Validate() error {
 		merr = errors.Join(merr, fmt.Errorf("failed to parse backend-registry URL: %w", err))
 	} else {
 		c.RegistryURL = u
+	}
+	if err := oci.ValidateRepoPrefix(c.RepoPrefix); err != nil {
+		merr = errors.Join(merr, err)
 	}
 	return merr
 }
@@ -112,6 +116,7 @@ func buildAdminServeCmd(v *viper.Viper) *cobra.Command {
 func registerAdminServeFlags(flags *pflag.FlagSet) {
 	flags.String(flagPort, "8081", "The port the admin server listens to.")
 	flags.String(flagBackendRegistry, "", "The URL to the backend OCI registry.")
+	flags.String(flagRepoPrefix, "", "Single-segment OCI repository prefix for this ocifactory instance.")
 	flags.String(flagNamespacePrefix, namespace.DefaultPrefix,
 		"OCI repository prefix for namespace metadata and the global namespace index.")
 	flags.Bool(flagEnableMetrics, true,
@@ -139,6 +144,7 @@ func runAdminServe(ctx context.Context, cfg *adminServeConfig) error {
 		oci.WithArtifactType(namespace.ArtifactType),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
+		oci.WithRepoPrefix(cfg.RepoPrefix),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create registry: %w", err)

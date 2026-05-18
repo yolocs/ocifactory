@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -107,6 +109,11 @@ type destRepo interface {
 type Registry struct {
 	baseURL *url.URL
 
+	// repoPrefix scopes every OCI repository under an operator-owned
+	// single path segment, letting one backend host multiple
+	// ocifactory deployments without path collisions.
+	repoPrefix string
+
 	// artifactType is the operator-configured base type. We derive three
 	// suffixed subtypes (versionArtifactType / fileArtifactType /
 	// aliasArtifactType) so each manifest kind in the OCI 1.1 referrers
@@ -187,6 +194,21 @@ type RegistryOption func(*Registry) error
 func WithArtifactType(artifactType string) RegistryOption {
 	return func(r *Registry) error {
 		r.artifactType = artifactType
+		return nil
+	}
+}
+
+// WithRepoPrefix inserts prefix between the backend registry URL path
+// and every ocifactory repository name. Empty preserves the historical
+// layout. Non-empty prefixes are a single OCI repository segment:
+// lowercase alnum start, then lowercase alnum, dot, underscore, or
+// hyphen.
+func WithRepoPrefix(prefix string) RegistryOption {
+	return func(r *Registry) error {
+		if err := ValidateRepoPrefix(prefix); err != nil {
+			return err
+		}
+		r.repoPrefix = prefix
 		return nil
 	}
 }
@@ -374,6 +396,40 @@ func NewRegistry(baseURL *url.URL, opt ...RegistryOption) (*Registry, error) {
 	}
 
 	return r, nil
+}
+
+// ValidateRepoPrefix reports whether prefix is acceptable for
+// [WithRepoPrefix].
+func ValidateRepoPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	for i, r := range prefix {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case i > 0 && (r == '.' || r == '_' || r == '-'):
+		default:
+			return fmt.Errorf("invalid repo-prefix %q: must match [a-z0-9][a-z0-9._-]*", prefix)
+		}
+	}
+	return nil
+}
+
+func (r *Registry) repoRef(owningRepo string) string {
+	parts := []string{}
+	if p := strings.Trim(r.baseURL.Path, "/"); p != "" {
+		parts = append(parts, p)
+	}
+	if r.repoPrefix != "" {
+		parts = append(parts, r.repoPrefix)
+	}
+	if owningRepo != "" {
+		parts = append(parts, owningRepo)
+	}
+	if len(parts) == 0 {
+		return r.baseURL.Host
+	}
+	return r.baseURL.Host + "/" + path.Join(parts...)
 }
 
 // AddFile adds a file to the registry under the OwningRepo / OwningTag pair
@@ -1288,7 +1344,7 @@ func stageUploadWithThreshold(ro io.Reader, memThreshold int64) (*stagedUpload, 
 }
 
 func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error) {
-	repoRef := r.baseURL.Host + r.baseURL.Path + "/" + f.OwningRepo
+	repoRef := r.repoRef(f.OwningRepo)
 	repo, err := remote.NewRepository(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create remote OCI repo: %w", err)
@@ -1355,7 +1411,7 @@ func (r remoteRepo) DeleteTag(ctx context.Context, tag string) error {
 // configured OCI registry, reusing the same authenticated http.Client setup
 // as newBackend. The returned pusher is good for a single AddFile call.
 func (r *Registry) newStreamPusher(ctx context.Context, f *RepoFile) (streamingPusher, error) {
-	repoRef := r.baseURL.Host + r.baseURL.Path + "/" + f.OwningRepo
+	repoRef := r.repoRef(f.OwningRepo)
 	ref, err := registry.ParseReference(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse repository reference %q: %w", repoRef, err)

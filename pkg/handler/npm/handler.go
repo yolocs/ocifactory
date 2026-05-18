@@ -64,7 +64,7 @@ const (
 	// constant placeholder layer whose presence is what we read off
 	// the index repo's tag list. The body is unused.
 	indexSentinelName    = "present"
-	indexSentinelContent = "1"
+	indexSentinelContent = "present\n"
 
 	// versionMetaName is the layer name we store the per-version
 	// packument fragment under. Same `(OwningRepo, OwningTag)` as the
@@ -935,35 +935,10 @@ func (h *Handler) handleDistTagDelete(w http.ResponseWriter, req *http.Request) 
 	http.Error(w, "dist-tag removal is not supported in this version", http.StatusNotImplemented)
 }
 
-// ensureIndexSentinel writes the per-package sentinel in the index
-// repo iff no tag for the package exists yet — identical to python's
-// pattern. The index repo's tags are encoded npm names; the layer
-// body is a constant placeholder.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped handler.Registry, npmName string) error {
-	encoded, err := encodePackageNameTag(npmName)
-	if err != nil {
-		return err
-	}
-	tags, err := scoped.ListTags(ctx, "index")
-	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		return fmt.Errorf("list index tags: %w", err)
-	}
-	for _, t := range tags {
-		if t == encoded {
-			return nil
-		}
-	}
-	sentinelRF := &oci.RepoFile{
-		OwningRepo: "index",
-		OwningTag:  encoded,
-		Name:       indexSentinelName,
-		MediaType:  "text/plain",
-		Size:       int64(len(indexSentinelContent)),
-	}
-	if _, err := scoped.AddFile(ctx, sentinelRF, strings.NewReader(indexSentinelContent)); err != nil && !errors.Is(err, oci.ErrAlreadyExists) {
-		return fmt.Errorf("add index sentinel: %w", err)
-	}
-	return nil
+// ensureIndexSentinel marks the package name in the per-format
+// namespace index.
+func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *namespace.ScopedRegistry, npmName string) error {
+	return scoped.Index(packageIndexName).Mark(ctx, npmName)
 }
 
 // verifyChecksums recomputes the sha1 (dist.shasum) and sha512

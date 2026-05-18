@@ -83,6 +83,32 @@ handlers pass `application/vnd.ocifactory.python`,
 `application/vnd.ocifactory.maven`, `application/vnd.ocifactory.npm`,
 etc. The three subtypes are derived in `NewRegistry`.
 
+## Repository layout
+
+The effective OCI repository path is:
+
+```text
+<backend-registry path>/<repo-prefix>/<namespace>/<owning-repo>
+```
+
+`--repo-prefix` is optional and defaults to empty, preserving the older
+`<backend-registry path>/<namespace>/...` layout. Use it when multiple
+ocifactory instances share one OCI backend: for example, `--repo-prefix=a`
+and `--repo-prefix=b` keep `default/packages/...` disjoint under
+`.../a/default/packages/...` and `.../b/default/packages/...`.
+
+Package storage always uses a format-owned `packages/...` codec:
+
+| Format | Package repo shape |
+|---|---|
+| Python | `packages/<pep503-normalized-name>` |
+| npm | `packages/u/<name>` or `packages/s/<scope>/<name>` |
+| Maven | `packages/<groupId path>/<artifactId>` |
+
+Sibling/internal repos such as `archetype`, `ocifactory-packages`,
+`python-packages`, `npm-packages`, and `ocifactory-proxy-cache/...`
+live under `<namespace>/` but outside `packages/`.
+
 ## Worked example — Python release (`twine upload dist/*`)
 
 A user runs:

@@ -187,7 +187,7 @@ func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Re
 		return fileFlightResult{streamed: true}, nil
 	})
 	if err != nil {
-		h.writeProxyFileError(w, req, err, amLeader, teeRef, packageRef(f.OwningRepo), f.OwningTag, f.Name)
+		h.writeProxyFileError(w, req, err, amLeader, teeRef, packageRef(upstreamRepoPath(f.OwningRepo)), f.OwningTag, f.Name)
 		return
 	}
 
@@ -209,7 +209,8 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		return
 	}
 
-	pkg := packageRef(f.OwningRepo)
+	repoPath := upstreamRepoPath(f.OwningRepo)
+	pkg := packageRef(repoPath)
 	version := f.OwningTag
 	filename := f.Name
 	if h.proxy.negCache != nil {
@@ -247,13 +248,13 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{cached: true}, nil
 		}
 
-		meta, ferr := fetcher.GetMetadata(ctx, f.OwningRepo)
+		meta, ferr := fetcher.GetMetadata(ctx, repoPath)
 		if ferr != nil {
 			return fileFlightResult{}, ferr
 		}
 		if len(meta.Versions) > 0 && !contains(meta.Versions, version) {
 			return fileFlightResult{}, fmt.Errorf("maven proxy: version %s missing from metadata for %s: %w",
-				version, f.OwningRepo, proxy.ErrNotFound)
+				version, repoPath, proxy.ErrNotFound)
 		}
 		if decision, denyFilter, derr := spec.Proxy.Filters.Decide(ctx, filter.Ref{
 			Package: pkg, Version: version, UploadTime: meta.LastUpdated,
@@ -265,7 +266,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			return fileFlightResult{filterDeny: true, filterName: filterKind(denyFilter)}, nil
 		}
 
-		fileResp, ferr := fetcher.FetchFile(ctx, f.OwningRepo, version, filename)
+		fileResp, ferr := fetcher.FetchFile(ctx, repoPath, version, filename)
 		if ferr != nil {
 			return fileFlightResult{}, ferr
 		}
@@ -524,6 +525,10 @@ func packageRef(repo string) string {
 	artifact := parts[len(parts)-1]
 	groupID := strings.Join(parts[:len(parts)-1], ".")
 	return groupID + ":" + artifact
+}
+
+func upstreamRepoPath(owningRepo string) string {
+	return repoPartsFromOwningRepo(owningRepo)
 }
 
 func filterKind(f filter.Filter) string {

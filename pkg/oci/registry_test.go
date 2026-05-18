@@ -74,6 +74,73 @@ func TestNewRegistry(t *testing.T) {
 	}
 }
 
+func TestNewRegistryRepoPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		baseURL    *url.URL
+		repoPrefix string
+		owningRepo string
+		wantRef    string
+		wantErr    bool
+	}{
+		{
+			name:       "empty prefix preserves old path",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/root"},
+			owningRepo: "default/packages/foo",
+			wantRef:    "example.com/root/default/packages/foo",
+		},
+		{
+			name:       "single segment prefix sits between url path and namespace repo",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/root"},
+			repoPrefix: "prod-east",
+			owningRepo: "default/packages/foo",
+			wantRef:    "example.com/root/prod-east/default/packages/foo",
+		},
+		{
+			name:       "leading slash in url path does not double slash",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com", Path: "/root/"},
+			repoPrefix: "a",
+			owningRepo: "default/packages/foo",
+			wantRef:    "example.com/root/a/default/packages/foo",
+		},
+		{
+			name:       "multi segment prefix rejected",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com"},
+			repoPrefix: "prod/east",
+			wantErr:    true,
+		},
+		{
+			name:       "uppercase prefix rejected",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com"},
+			repoPrefix: "Prod",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := []RegistryOption{}
+			if tt.repoPrefix != "" {
+				opts = append(opts, WithRepoPrefix(tt.repoPrefix))
+			}
+			got, err := NewRegistry(tt.baseURL, opts...)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewRegistry() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if diff := cmp.Diff(tt.wantRef, got.repoRef(tt.owningRepo)); diff != "" {
+				t.Errorf("repoRef() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestDetectFileMediaType(t *testing.T) {
 	t.Parallel()
 

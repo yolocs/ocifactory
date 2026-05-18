@@ -565,7 +565,7 @@ func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request,
 //     - success → rewrite URLs → indexcache.Put → serve + warm L1.
 //     - upstream error + stale cache → serve stale; log.
 //     - upstream error + no cache → synthesize from
-//     ListFiles("packages/"+pkg) (existing hosted code path).
+//     ListFiles(packageOwningRepo(pkg)) (existing hosted code path).
 //     - synthesis empty → 503.
 //
 // Concurrent refreshes for the same (namespace, pkg) collapse onto
@@ -576,7 +576,7 @@ func (h *Handler) handlePackageIndexProxy(w http.ResponseWriter, req *http.Reque
 
 // handleSimpleIndexProxy serves /{ns}/simple/ in proxy mode. Same
 // flow as the per-package path with cache key pkg="" and synthesis
-// fallback `ListTags("index")`.
+// fallback through the per-format namespace index.
 func (h *Handler) handleSimpleIndexProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec) {
 	h.serveProxyIndex(w, req, scoped, spec, "")
 }
@@ -697,9 +697,9 @@ type indexFlightResult struct {
 
 // synthesizeIndex serves a minimal but accurate index built from local
 // listings when both the upstream and the cache are unavailable. For
-// per-package: enumerate files in `packages/<pkg>` and render the same
-// HTML/JSON the hosted path would. For top-level: enumerate tags on
-// `index` (hosted handler's existing dedupe list).
+// per-package: enumerate files in the package repo and render the same
+// HTML/JSON the hosted path would. For top-level: enumerate the
+// python package namespace index.
 //
 // An empty synthesis result means we have no cached files for this
 // (namespace, package) either — 503, since serving a literal empty
@@ -711,8 +711,8 @@ func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, scop
 	ns := scoped.Namespace()
 
 	if pkg == "" {
-		tags, err := scoped.ListTags(ctx, "index")
-		if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		tags, err := scoped.Index(packageIndexName).List(ctx)
+		if err != nil {
 			handler.WriteError(ctx, w, http.StatusServiceUnavailable, upstreamErr,
 				fmt.Sprintf("upstream unavailable and synthesis failed: %v", err))
 			return
@@ -781,22 +781,17 @@ func writeIndexBody(w http.ResponseWriter, req *http.Request, body []byte, conte
 }
 
 // pathPackage extracts the (normalized) package name from a RepoFile's
-// OwningRepo. The python handler stores files under
-// "packages/<pkg>", so we trim the prefix; any other shape is a bug
-// in this package and we surface "" so downstream filter / metadata
-// calls fail loudly.
+// OwningRepo. Any other shape is a bug in this package and we surface
+// "" so downstream filter / metadata calls fail loudly.
 func pathPackage(f *oci.RepoFile) string {
-	const prefix = "packages/"
 	if f == nil {
 		return ""
 	}
-	if len(f.OwningRepo) <= len(prefix) {
+	pkg, ok := packageFromOwningRepo(f.OwningRepo)
+	if !ok {
 		return ""
 	}
-	if f.OwningRepo[:len(prefix)] != prefix {
-		return ""
-	}
-	return f.OwningRepo[len(prefix):]
+	return pkg
 }
 
 // negativeKey is the cache key for negative-cache entries on proxy

@@ -173,14 +173,14 @@ Scoped packages round-trip through the same URL shape npm uses:
 
 ## OCI storage layout
 
-Three OCI repositories per namespace under `--backend-registry`,
-prefixed with the namespace segment by the data-plane wrapper:
+Package storage and the npm package-list index live per namespace under
+`--backend-registry` plus any configured `--repo-prefix`:
 
 | OCI repo | Canonical tags | What's stored |
 |---|---|---|
 | `<namespace>/packages/u/<name>` | `<version>` per release | A version anchor manifest tagged with `<version>`, plus two file manifests (tarball `<name>-<version>.tgz` and `package.json`) subject-linked to the anchor and addressable via the OCI 1.1 referrers API. Used for unscoped packages. |
 | `<namespace>/packages/s/<scope>/<name>` | `<version>` per release | Same shape; used for scoped (`@scope/name`) packages. |
-| `<namespace>/index` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"1"`). `ListTags("<namespace>/index")` is the namespace's package list. |
+| `<namespace>/npm-packages` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"present\n"`). The namespace index primitive decodes tags before returning package names. |
 
 A fourth per-namespace repo, `<namespace>/ocifactory-packages`, is
 maintained by the namespace wrapper itself — its tags enumerate every
@@ -216,13 +216,10 @@ repo `packages/s/scope/name`. The `s/` and `u/` sub-prefixes
 guarantee an unscoped name can never collide with the scope half of
 a scoped name.
 
-The `index` repo's tags follow a different scheme because OCI tags
-allow uppercase letters and underscores. Names there are encoded
-with the `_HH` percent-style scheme that
-`pkg/namespace.encodeTag` uses, so `@scope/foo` becomes
-`_40scope_2Ffoo` in the index repo. The encoding is lossless and the
-helpers `encodePackageNameTag` / `decodePackageNameTag` in
-`pkg/handler/npm/names.go` round-trip exactly.
+The `npm-packages` repo's tags follow a different scheme because OCI
+tags cannot contain `@` or `/`. Names there are encoded with
+`oci.EncodeTag`, so `@scope/foo` becomes `_40scope_2Ffoo`. The
+encoding is lossless and `oci.DecodeTag` round-trips it exactly.
 
 ## Publish flow
 

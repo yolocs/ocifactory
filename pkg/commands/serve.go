@@ -68,6 +68,7 @@ const (
 	flagPort                            = "port"
 	flagRepoType                        = "repo-type"
 	flagBackendRegistry                 = "backend-registry"
+	flagRepoPrefix                      = "repo-prefix"
 	flagDisableStreamingPush            = "disable-streaming-push"
 	flagDisableBlobRedirect             = "disable-blob-redirect"
 	flagAllowOverwrite                  = "allow-overwrite"
@@ -97,6 +98,7 @@ type serveConfig struct {
 	Port                 string        `mapstructure:"port"`
 	RepoType             string        `mapstructure:"repo-type"`
 	BackendRegistry      string        `mapstructure:"backend-registry"`
+	RepoPrefix           string        `mapstructure:"repo-prefix"`
 	DisableStreamingPush bool          `mapstructure:"disable-streaming-push"`
 	DisableBlobRedirect  bool          `mapstructure:"disable-blob-redirect"`
 	AllowOverwrite       bool          `mapstructure:"allow-overwrite"`
@@ -200,6 +202,9 @@ func (c *serveConfig) Validate() error {
 			c.RegistryURL = u
 		}
 	}
+	if err := oci.ValidateRepoPrefix(c.RepoPrefix); err != nil {
+		merr = errors.Join(merr, err)
+	}
 	return merr
 }
 
@@ -257,6 +262,8 @@ func registerServeFlags(flags *pflag.FlagSet) {
 		fmt.Sprintf("Type of repository to serve. Allowed: %v", supportedRepoTypes))
 	flags.String(flagBackendRegistry, "",
 		"The URL to the backend OCI registry.")
+	flags.String(flagRepoPrefix, "",
+		"Single-segment OCI repository prefix for this ocifactory instance.")
 	flags.Bool(flagDisableStreamingPush, false,
 		"Force every blob upload through the buffered + monolithic path. "+
 			"Bodies above the in-memory threshold will spill to a temp file "+
@@ -376,6 +383,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		oci.WithAllowOverwrite(cfg.AllowOverwrite),
 		oci.WithMetrics(rec),
 		oci.WithBackendAuth(bp),
+		oci.WithRepoPrefix(cfg.RepoPrefix),
 	}
 
 	switch cfg.RepoType {
@@ -415,7 +423,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
 		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
-		idxCache, err := indexcache.NewCache(cfg.RegistryURL, indexcache.WithBackendAuth(bp))
+		idxCache, err := indexcache.NewCache(cfg.RegistryURL,
+			indexcache.WithBackendAuth(bp),
+			indexcache.WithRepoPrefix(cfg.RepoPrefix),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create proxy index cache: %w", err)
 		}
@@ -448,7 +459,10 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		// these (cheap — no I/O on construction); a proxy namespace
 		// admin-Put'd at runtime starts using them on its next
 		// request without restart.
-		idxCache, err := indexcache.NewCache(cfg.RegistryURL, indexcache.WithBackendAuth(bp))
+		idxCache, err := indexcache.NewCache(cfg.RegistryURL,
+			indexcache.WithBackendAuth(bp),
+			indexcache.WithRepoPrefix(cfg.RepoPrefix),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create proxy index cache: %w", err)
 		}

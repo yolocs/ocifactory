@@ -30,6 +30,7 @@ Useful flags:
 | Flag | Purpose |
 |---|---|
 | `--backend-registry` | Required. OCI registry URL that stores namespace metadata and the namespace index. |
+| `--repo-prefix` | Optional single OCI path segment that scopes this ocifactory instance inside the backend registry. Use the same value on `ocifactory serve` and `ocifactory admin serve`. |
 | `--port` | Listener port. Defaults to `8081`; `PORT` is also honored for PaaS deployments. |
 | `--namespace-prefix` | Optional OCI repository prefix for namespace metadata and the global namespace index. Defaults to empty. Use a lowercase OCI-safe path segment such as `control-plane`. |
 | `--backend-auth-kind` and related `--backend-auth-*` flags | Same backend credential providers as the data-plane service. |

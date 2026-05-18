@@ -34,6 +34,7 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -46,6 +47,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 const (
@@ -101,6 +103,7 @@ const layerMediaType = "application/octet-stream"
 // state on the Cache itself.
 type Cache struct {
 	baseURL    *url.URL
+	repoPrefix string
 	authClient *auth.Client
 	plainHTTP  bool
 
@@ -142,6 +145,18 @@ func WithBackendAuth(p backend.Provider) Option {
 			Cache:      auth.NewCache(),
 			Credential: credFn,
 		}
+		return nil
+	}
+}
+
+// WithRepoPrefix scopes cache repositories under the same
+// single-segment prefix used by pkg/oci.Registry.
+func WithRepoPrefix(prefix string) Option {
+	return func(c *Cache) error {
+		if err := oci.ValidateRepoPrefix(prefix); err != nil {
+			return err
+		}
+		c.repoPrefix = prefix
 		return nil
 	}
 }
@@ -334,11 +349,11 @@ func (c *Cache) Put(ctx context.Context, ns, pkg string, body []byte, contentTyp
 }
 
 func (c *Cache) repoPath(ns, pkg string) string {
-	return path.Join(ns, cacheRepoSegment, pkg)
+	return path.Join(c.repoPrefix, ns, cacheRepoSegment, pkg)
 }
 
 func (c *Cache) newRemoteTarget(_ context.Context, repoPath string) (oras.Target, error) {
-	repoRef := c.baseURL.Host + c.baseURL.Path + "/" + repoPath
+	repoRef := c.baseURL.Host + "/" + path.Join(strings.Trim(c.baseURL.Path, "/"), repoPath)
 	repo, err := remote.NewRepository(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("create remote repository %q: %w", repoRef, err)

@@ -3,7 +3,6 @@ package namespace
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -332,6 +331,13 @@ func (r *Registry) packageIndexRepo(namespace string) string {
 	return path.Join(namespace, r.indexSuffix)
 }
 
+// NamespaceIndex is a tag-backed sibling repository inside one
+// namespace. Tags are encoded keys; callers see only decoded keys.
+type NamespaceIndex struct {
+	scoped *ScopedRegistry
+	name   string
+}
+
 // ScopedRegistry is a per-namespace view of a [Registry]. Every
 // method authorizes the bound namespace, prefixes OwningRepo (or the
 // raw repo string for ListTags/ListFiles/etc.) with it, and forwards
@@ -352,6 +358,13 @@ type ScopedRegistry struct {
 
 // Namespace returns the bound namespace name.
 func (s *ScopedRegistry) Namespace() string { return s.namespace }
+
+// Index returns a handle to a named namespace-local sentinel index.
+// The index name is a single repo segment such as "python-packages";
+// the backing repo lives beside package repos at "<namespace>/<name>".
+func (s *ScopedRegistry) Index(name string) *NamespaceIndex {
+	return &NamespaceIndex{scoped: s, name: name}
+}
 
 // Authorize checks whether the request context's authenticated
 // subject may perform op in the bound namespace. Format handlers use
@@ -528,31 +541,7 @@ func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {
 }
 
 func (r *Registry) listPackages(ctx context.Context, namespace string) ([]string, error) {
-	tags, err := r.inner.ListTags(ctx, r.packageIndexRepo(namespace))
-	if err != nil {
-		if errors.Is(err, errdef.ErrNotFound) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("list package index for %q: %w", namespace, err)
-	}
-	out := make([]string, 0, len(tags))
-	for _, t := range tags {
-		decoded, derr := decodeTag(t)
-		if derr != nil {
-			// A tag that doesn't decode means an admin or a
-			// previous ocifactory version wrote a non-encoded tag.
-			// Skip it rather than failing the whole listing — the
-			// contract is "best-effort enumeration" and a stray
-			// tag is no reason to deny callers their other
-			// packages.
-			logging.FromContext(ctx).WarnContext(ctx, "namespace package index: skipping undecodable tag",
-				"namespace", namespace, "tag", t, "error", derr,
-			)
-			continue
-		}
-		out = append(out, decoded)
-	}
-	return out, nil
+	return r.listIndex(ctx, namespace, r.indexSuffix)
 }
 
 // AppendRefs authorizes the bound namespace for write and forwards
@@ -589,7 +578,7 @@ func (s *ScopedRegistry) DeleteRepoFiles(ctx context.Context, repo string) error
 		return err
 	}
 	s.parent.indexed.Remove(indexedKey(s.namespace, repo))
-	encoded, encErr := encodeTag(repo)
+	encoded, encErr := oci.EncodeTag(repo)
 	if encErr != nil {
 		// The repo passed authorize() and resolveRepo() so this
 		// should never fail; treat as bug-not-vuln and log.
@@ -654,29 +643,143 @@ func (r *Registry) recordPackage(ctx context.Context, namespace, owningRepo stri
 		return
 	}
 
-	encoded, err := encodeTag(owningRepo)
-	if err != nil {
-		logging.FromContext(ctx).WarnContext(ctx, "namespace package index: encode failed",
+	if err := r.markIndex(ctx, namespace, r.indexSuffix, owningRepo); err != nil {
+		logging.FromContext(ctx).WarnContext(ctx, "namespace package index update failed",
 			"namespace", namespace, "owning_repo", owningRepo, "error", err,
 		)
 		return
 	}
+	r.indexed.Add(key, struct{}{})
+}
+
+// Mark records key in the index.
+func (i *NamespaceIndex) Mark(ctx context.Context, key string) error {
+	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpWrite); err != nil {
+		return err
+	}
+	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+		return err
+	}
+	return i.scoped.parent.markIndex(ctx, i.scoped.namespace, i.name, key)
+}
+
+// Unmark removes key from the index. Missing keys are a no-op.
+func (i *NamespaceIndex) Unmark(ctx context.Context, key string) error {
+	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpWrite); err != nil {
+		return err
+	}
+	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+		return err
+	}
+	encoded, err := oci.EncodeTag(key)
+	if err != nil {
+		return err
+	}
+	if err := i.scoped.parent.inner.DeleteTagFiles(ctx, path.Join(i.scoped.namespace, i.name), encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+// Has reports whether key is present in the index.
+func (i *NamespaceIndex) Has(ctx context.Context, key string) (bool, error) {
+	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpRead); err != nil {
+		return false, err
+	}
+	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+		return false, err
+	}
+	encoded, err := oci.EncodeTag(key)
+	if err != nil {
+		return false, err
+	}
+	tags, err := i.scoped.parent.inner.ListTags(ctx, path.Join(i.scoped.namespace, i.name))
+	if err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, tag := range tags {
+		if tag == encoded {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// List returns all decoded keys in the index.
+func (i *NamespaceIndex) List(ctx context.Context) ([]string, error) {
+	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpRead); err != nil {
+		return nil, err
+	}
+	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+		return nil, err
+	}
+	return i.scoped.parent.listIndex(ctx, i.scoped.namespace, i.name)
+}
+
+func (r *Registry) markIndex(ctx context.Context, namespace, indexName, key string) error {
+	encoded, err := oci.EncodeTag(key)
+	if err != nil {
+		return err
+	}
 	rf := &oci.RepoFile{
-		OwningRepo: r.packageIndexRepo(namespace),
+		OwningRepo: path.Join(namespace, indexName),
 		OwningTag:  encoded,
 		Name:       packageIndexSentinelFile,
 		MediaType:  "text/plain",
 		Size:       int64(len(packageIndexSentinelBody)),
 	}
 	if _, err := r.inner.AddFile(ctx, rf, bytes.NewReader(packageIndexSentinelBody)); err != nil && !errors.Is(err, oci.ErrAlreadyExists) {
-		logging.FromContext(ctx).WarnContext(ctx, "namespace package index update failed",
-			"namespace", namespace,
-			"owning_repo", owningRepo,
-			"error", err,
-		)
-		return
+		return err
 	}
-	r.indexed.Add(key, struct{}{})
+	return nil
+}
+
+func (r *Registry) listIndex(ctx context.Context, namespace, indexName string) ([]string, error) {
+	tags, err := r.inner.ListTags(ctx, path.Join(namespace, indexName))
+	if err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list index %q for %q: %w", indexName, namespace, err)
+	}
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		decoded, derr := oci.DecodeTag(t)
+		if derr != nil {
+			logging.FromContext(ctx).WarnContext(ctx, "namespace index: skipping undecodable tag",
+				"namespace", namespace, "index", indexName, "tag", t, "error", derr,
+			)
+			continue
+		}
+		out = append(out, decoded)
+	}
+	return out, nil
+}
+
+func (r *Registry) validatePublicIndexName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: index name must not be empty", ErrInvalidOwningRepo)
+	}
+	if name == r.indexSuffix {
+		return fmt.Errorf("%w: index name %q is reserved", ErrInvalidOwningRepo, name)
+	}
+	if path.Clean(name) != name || strings.ContainsRune(name, '/') || name == "." || name == ".." {
+		return fmt.Errorf("%w: index name %q is not a single canonical segment", ErrInvalidOwningRepo, name)
+	}
+	for i, rr := range name {
+		switch {
+		case rr >= 'a' && rr <= 'z', rr >= '0' && rr <= '9':
+		case i > 0 && (rr == '.' || rr == '_' || rr == '-'):
+		case i == 0 && (rr == '.' || rr == '_' || rr == '-'):
+			return fmt.Errorf("%w: index name %q must start with a lowercase letter or digit", ErrInvalidOwningRepo, name)
+		default:
+			return fmt.Errorf("%w: index name %q contains invalid character %q", ErrInvalidOwningRepo, name, rr)
+		}
+	}
+	return nil
 }
 
 // stripPrefix removes a leading "<namespace>/" from owningRepo. The
@@ -694,72 +797,6 @@ func stripPrefix(owningRepo, namespace string) string {
 		return owningRepo[len(prefix):]
 	}
 	return owningRepo
-}
-
-// encodeTag escapes owningRepo into a string usable as an OCI tag
-// name. OCI tags allow [A-Za-z0-9_.-] only, so '/' must be escaped.
-// We use a percent-style encoding (every '_' becomes "_5F" and every
-// '/' becomes "_2F") rather than a substring like "__" because the
-// substring approach silently collides: encodeTag("a/b") and
-// encodeTag("a__b") would otherwise both produce "a__b". The
-// encoding is lossless for any input over the OCI repo charset and
-// round-trips exactly.
-func encodeTag(owningRepo string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(owningRepo))
-	for _, r := range owningRepo {
-		switch {
-		case r == '_':
-			b.WriteString("_5F")
-		case r == '/':
-			b.WriteString("_2F")
-		case r == '.' || r == '-':
-			b.WriteRune(r)
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-		default:
-			// OCI repo paths are lowercase alnum + ".-_/" per the
-			// distribution spec; anything else means the caller is
-			// constructing a malformed owning-repo. Surface it
-			// rather than silently mangling.
-			return "", fmt.Errorf("%w: owning repo %q contains invalid character %q", ErrInvalidOwningRepo, owningRepo, r)
-		}
-	}
-	if b.Len() == 0 {
-		return "", fmt.Errorf("%w: owning repo must not be empty", ErrInvalidOwningRepo)
-	}
-	if b.Len() > 128 {
-		// OCI tag spec: 1-128 chars. Most realistic repo names fit
-		// after escaping; extremely long ones don't.
-		return "", fmt.Errorf("%w: encoded owning repo exceeds 128-char OCI tag limit", ErrInvalidOwningRepo)
-	}
-	return b.String(), nil
-}
-
-// decodeTag reverses [encodeTag]. Any "_HH" sequence (where HH is
-// a two-char hex pair) is replaced by the corresponding byte; a
-// stray '_' not followed by valid hex is a malformed encoding and
-// surfaces as an error.
-func decodeTag(tag string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(tag))
-	for i := 0; i < len(tag); i++ {
-		c := tag[i]
-		if c != '_' {
-			b.WriteByte(c)
-			continue
-		}
-		if i+2 >= len(tag) {
-			return "", fmt.Errorf("malformed escape at %d: trailing underscore", i)
-		}
-		decoded, err := hex.DecodeString(tag[i+1 : i+3])
-		if err != nil {
-			return "", fmt.Errorf("malformed escape at %d: %w", i, err)
-		}
-		b.WriteByte(decoded[0])
-		i += 2
-	}
-	return b.String(), nil
 }
 
 func indexedKey(namespace, owningRepo string) string {
