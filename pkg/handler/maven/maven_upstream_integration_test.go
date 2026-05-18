@@ -13,37 +13,34 @@ package maven_test
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/handler/integrationtest"
+	mavenhandler "github.com/yolocs/ocifactory/pkg/handler/maven"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 // TestMavenIntegration_LiveCentralProxy proves Maven proxy mode works
-// end to end against real Maven Central: a real mvn dependency:get
-// through a real ocifactory subprocess fetches, caches, and re-serves
-// real Maven artifact bytes.
+// end to end against real Maven Central: a real ocifactory subprocess
+// fetches, caches, and re-serves real Maven artifact bytes. Real Maven
+// client behaviour is covered by the hermetic `integration` test; this
+// live test intentionally keeps Maven Central traffic small and focused
+// on the proxy path.
 //
-// Test artifact: org.slf4j:slf4j-api:1.7.36. Tiny, dependency-free
-// for our purposes when resolved with -Dtransitive=false, and stable.
+// Test artifact: org.slf4j:slf4j-api:1.7.36. Tiny, stable, and widely
+// cached by Maven Central.
 func TestMavenIntegration_LiveCentralProxy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live-maven integration test in -short mode")
 	}
 	t.Parallel()
-
-	integrationtest.SkipIfMissing(t, "mvn", "java")
 
 	h := integrationtest.Start(t, "maven")
 	seedMavenProxyNamespace(t, h.ZotURL, h.BackendRepo, "maven-central", "https://repo.maven.apache.org/maven2")
@@ -90,21 +87,45 @@ func TestMavenIntegration_LiveCentralProxy(t *testing.T) {
 		}
 	})
 
-	t.Run("mvn_dependency_get_through_proxy", func(t *testing.T) {
+	t.Run("artifact_fetch_through_proxy", func(t *testing.T) {
 		t.Parallel()
 
-		coordinate := fmt.Sprintf("%s:%s:%s", groupID, artifactID, version)
+		artifactPath := strings.ReplaceAll(groupID, ".", "/") + "/" + artifactID + "/" + version + "/" + artifactID + "-" + version + ".jar"
+		artifactURL := repoURL + artifactPath
+		body := getLiveMavenURL(t, artifactURL, 2*1024*1024)
+		if len(body) == 0 {
+			t.Fatalf("artifact body from %s is empty", artifactURL)
+		}
+		assertMavenArtifactCached(t, h.ZotURL, h.BackendRepo, "maven-central", groupID, artifactID, version)
 
-		localRepo := t.TempDir()
-		runLiveMavenGet(t, repoURL, localRepo, coordinate)
-		assertMavenArtifactCached(t, localRepo, groupID, artifactID, version)
-
-		// A second fresh local repo proves the cached artifact can be
-		// served back through OCI to a new Maven client invocation.
-		localRepo2 := t.TempDir()
-		runLiveMavenGet(t, repoURL, localRepo2, coordinate)
-		assertMavenArtifactCached(t, localRepo2, groupID, artifactID, version)
+		body2 := getLiveMavenURL(t, artifactURL, 2*1024*1024)
+		if len(body2) != len(body) {
+			t.Fatalf("cached artifact size = %d, want %d", len(body2), len(body))
+		}
 	})
+}
+
+func getLiveMavenURL(t *testing.T, url string, limit int64) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s status = %d, want 200; body:\n%s", url, resp.StatusCode, body)
+	}
+	return body
 }
 
 // seedMavenProxyNamespace writes a proxy-mode namespace into the OCI
@@ -134,75 +155,31 @@ func seedMavenProxyNamespace(t *testing.T, zotURL *url.URL, backendRepo, name, u
 	}
 }
 
-func runLiveMavenGet(t *testing.T, repoURL, localRepo, coordinate string) {
+func assertMavenArtifactCached(t *testing.T, zotURL *url.URL, backendRepo, namespaceName, groupID, artifactID, version string) {
 	t.Helper()
-	warmLiveMavenDependencyPlugin(t, localRepo)
-
-	settings := liveMavenSettings(t, repoURL, localRepo)
-	cmd := exec.Command("mvn",
-		"-B",
-		"-s", settings,
-		"-Dmaven.repo.local="+localRepo,
-		"-DremoteRepositories=ocifactory::default::"+repoURL,
-		"-Dartifact="+coordinate,
-		"-Dtransitive=false",
-		"org.apache.maven.plugins:maven-dependency-plugin:3.6.1:get",
+	regURL := &url.URL{Scheme: zotURL.Scheme, Host: zotURL.Host, Path: "/" + backendRepo}
+	inner, err := oci.NewRegistry(regURL,
+		oci.WithBackendAuth(backend.Anonymous()),
+		oci.WithArtifactType(mavenhandler.ArtifactType),
 	)
-	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
-	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("mvn dependency:get %s: %v\n%s", coordinate, err, out)
+		t.Fatalf("oci.NewRegistry: %v", err)
 	}
-}
-
-func warmLiveMavenDependencyPlugin(t *testing.T, localRepo string) {
-	t.Helper()
-	cmd := exec.Command("mvn",
-		"-B",
-		"-Dmaven.repo.local="+localRepo,
-		"org.apache.maven.plugins:maven-dependency-plugin:3.6.1:help",
-	)
-	cmd.Env = append(os.Environ(), "HOME="+t.TempDir())
-	out, err := cmd.CombinedOutput()
+	f := &oci.RepoFile{
+		OwningRepo: namespaceName + "/" + strings.ReplaceAll(groupID, ".", "/") + "/" + artifactID,
+		OwningTag:  version,
+		Name:       artifactID + "-" + version + ".jar",
+		MediaType:  "application/java-archive",
+	}
+	desc, rc, err := inner.ReadFile(t.Context(), f)
 	if err != nil {
-		t.Fatalf("warm maven dependency plugin: %v\n%s", err, out)
+		t.Fatalf("read cached artifact from OCI: %v", err)
 	}
-}
-
-func liveMavenSettings(t *testing.T, repoURL, localRepo string) string {
-	t.Helper()
-	settings := fmt.Sprintf(`<settings>
-  <localRepository>%s</localRepository>
-  <interactiveMode>false</interactiveMode>
-  <mirrors>
-    <mirror>
-      <id>ocifactory-all</id>
-      <url>%s</url>
-      <mirrorOf>*</mirrorOf>
-    </mirror>
-  </mirrors>
-</settings>
-`, localRepo, repoURL)
-	path := filepath.Join(t.TempDir(), "settings.xml")
-	if err := os.WriteFile(path, []byte(settings), 0o600); err != nil {
-		t.Fatalf("write settings.xml: %v", err)
+	defer rc.Close()
+	if desc.File.Size == 0 {
+		t.Fatalf("cached artifact has zero size")
 	}
-	return path
-}
-
-func assertMavenArtifactCached(t *testing.T, localRepo, groupID, artifactID, version string) {
-	t.Helper()
-	jarPath := filepath.Join(localRepo,
-		strings.ReplaceAll(groupID, ".", string(filepath.Separator)),
-		artifactID,
-		version,
-		fmt.Sprintf("%s-%s.jar", artifactID, version),
-	)
-	info, err := os.Stat(jarPath)
-	if err != nil {
-		t.Fatalf("stat resolved jar %s: %v", jarPath, err)
-	}
-	if info.Size() == 0 {
-		t.Fatalf("resolved jar %s is empty", jarPath)
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		t.Fatalf("read cached artifact body: %v", err)
 	}
 }
