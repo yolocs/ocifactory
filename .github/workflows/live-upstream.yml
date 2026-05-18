@@ -1,11 +1,10 @@
 name: 'live-upstream'
 
 # Non-hermetic integration tests: they talk to real upstream
-# registries (PyPI, npm today; Maven Central later) over the public
-# internet. Outages, rate limits, or response-shape changes on the
-# upstream side will turn this workflow red. When that happens, read
-# the failure and decide whether it's our regression or theirs before
-# reverting.
+# registries (PyPI, npm, Maven Central) over the public internet.
+# Outages, rate limits, or response-shape changes on the upstream side
+# will turn this workflow red. When that happens, read the failure and
+# decide whether it's our regression or theirs before reverting.
 #
 # Runs on every PR + manual dispatch. PR runs catch regressions in
 # pkg/proxy/* and proxy-mode handlers before merge.
@@ -47,6 +46,12 @@ jobs:
         with:
           node-version: '22'
 
+      - uses: 'actions/setup-java@v4' # ratchet:exclude
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
       - name: 'Run live upstream integration tests'
         # Distinct build tags from the hermetic `integration` suite.
         # Keep all live upstream packages in this single invocation so
@@ -55,8 +60,9 @@ jobs:
         # testcontainers.
         run: |
           go test -race -count=1 \
-            -tags=pypiupstream,npmupstream \
+            -tags=pypiupstream,npmupstream,mavenupstream \
             -timeout=10m \
             -v \
             ./pkg/handler/python/... \
-            ./pkg/handler/npm/...
+            ./pkg/handler/npm/... \
+            ./pkg/handler/maven/...
