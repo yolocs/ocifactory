@@ -155,6 +155,7 @@ func TestAdminCmd_IsRegistered(t *testing.T) {
 // TestAdminServeCmd_EnvVarBindings mutates process-global env, so cannot t.Parallel.
 func TestAdminServeCmd_EnvVarBindings(t *testing.T) {
 	t.Setenv("OCIFACTORY_BACKEND_REGISTRY", "zot.example.com:5000/ocifactory")
+	t.Setenv("OCIFACTORY_REPO_PREFIX", "prod-east")
 	t.Setenv("OCIFACTORY_NAMESPACE_PREFIX", "control-plane")
 	t.Setenv("OCIFACTORY_BACKEND_AUTH_KIND", "staticenv")
 	t.Setenv("OCIFACTORY_BACKEND_AUTH_STATICENV_USER_ENV", "REG_USER")
@@ -181,6 +182,7 @@ func TestAdminServeCmd_EnvVarBindings(t *testing.T) {
 	want := adminServeConfig{
 		Port:                            "9091",
 		BackendRegistry:                 "zot.example.com:5000/ocifactory",
+		RepoPrefix:                      "prod-east",
 		NamespacePrefix:                 "control-plane",
 		EnableMetrics:                   true,
 		MetricsPath:                     "/metrics",

@@ -412,10 +412,34 @@ func ValidateRepoPrefix(prefix string) error {
 			return fmt.Errorf("invalid repo-prefix %q: must match [a-z0-9][a-z0-9._-]*", prefix)
 		}
 	}
+	ref, err := registry.ParseReference("example.com/" + prefix)
+	if err != nil {
+		return fmt.Errorf("invalid repo-prefix %q: %w", prefix, err)
+	}
+	if err := ref.ValidateRepository(); err != nil {
+		return fmt.Errorf("invalid repo-prefix %q: %w", prefix, err)
+	}
 	return nil
 }
 
-func (r *Registry) repoRef(owningRepo string) string {
+func validateRepositoryPath(repo string) error {
+	if repo == "" {
+		return nil
+	}
+	if path.IsAbs(repo) {
+		return fmt.Errorf("repository path %q must be relative", repo)
+	}
+	cleaned := path.Clean(repo)
+	if cleaned != repo || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
+		return fmt.Errorf("repository path %q must be canonical and must not contain '..'", repo)
+	}
+	return nil
+}
+
+func (r *Registry) repoRef(owningRepo string) (string, error) {
+	if err := validateRepositoryPath(owningRepo); err != nil {
+		return "", err
+	}
 	parts := []string{}
 	if p := strings.Trim(r.baseURL.Path, "/"); p != "" {
 		parts = append(parts, p)
@@ -427,9 +451,9 @@ func (r *Registry) repoRef(owningRepo string) string {
 		parts = append(parts, owningRepo)
 	}
 	if len(parts) == 0 {
-		return r.baseURL.Host
+		return r.baseURL.Host, nil
 	}
-	return r.baseURL.Host + "/" + path.Join(parts...)
+	return r.baseURL.Host + "/" + strings.Join(parts, "/"), nil
 }
 
 // AddFile adds a file to the registry under the OwningRepo / OwningTag pair
@@ -1344,7 +1368,10 @@ func stageUploadWithThreshold(ro io.Reader, memThreshold int64) (*stagedUpload, 
 }
 
 func (r *Registry) newBackend(ctx context.Context, f *RepoFile) (destRepo, error) {
-	repoRef := r.repoRef(f.OwningRepo)
+	repoRef, err := r.repoRef(f.OwningRepo)
+	if err != nil {
+		return nil, err
+	}
 	repo, err := remote.NewRepository(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create remote OCI repo: %w", err)
@@ -1411,7 +1438,10 @@ func (r remoteRepo) DeleteTag(ctx context.Context, tag string) error {
 // configured OCI registry, reusing the same authenticated http.Client setup
 // as newBackend. The returned pusher is good for a single AddFile call.
 func (r *Registry) newStreamPusher(ctx context.Context, f *RepoFile) (streamingPusher, error) {
-	repoRef := r.repoRef(f.OwningRepo)
+	repoRef, err := r.repoRef(f.OwningRepo)
+	if err != nil {
+		return nil, err
+	}
 	ref, err := registry.ParseReference(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse repository reference %q: %w", repoRef, err)

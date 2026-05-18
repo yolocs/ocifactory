@@ -122,6 +122,32 @@ func TestNewCache(t *testing.T) {
 	}
 }
 
+func TestCache_RepoPathRejectsTraversal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		namespace string
+		pkg       string
+	}{
+		{name: "namespace traversal", namespace: "../beta", pkg: "requests"},
+		{name: "package traversal", namespace: "alpha", pkg: "../../../beta/packages/foo"},
+		{name: "absolute package path", namespace: "alpha", pkg: "/beta/packages/foo"},
+		{name: "unclean package path", namespace: "alpha", pkg: "packages/../foo"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _ := newTestCache(t)
+			if _, err := c.repoPath(tc.namespace, tc.pkg); err == nil {
+				t.Fatalf("repoPath(%q, %q) error = nil, want non-nil", tc.namespace, tc.pkg)
+			}
+		})
+	}
+}
+
 func TestCache_GetMiss(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -394,7 +420,10 @@ func TestCache_RepoPath(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := c.repoPath(tc.ns, tc.pkg)
+			got, err := c.repoPath(tc.ns, tc.pkg)
+			if err != nil {
+				t.Fatalf("repoPath(%q, %q) error = %v, want nil", tc.ns, tc.pkg, err)
+			}
 			if got != tc.want {
 				t.Errorf("repoPath(%q, %q) = %q, want %q", tc.ns, tc.pkg, got, tc.want)
 			}

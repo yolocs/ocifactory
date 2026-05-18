@@ -665,7 +665,7 @@ func TestScopedRegistry_Index_RejectsInvalidName(t *testing.T) {
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
 
-	for _, name := range []string{"", "packages/foo", "../x", "ocifactory-packages"} {
+	for _, name := range []string{"", "packages/foo", "../x", "ocifactory-packages", "prod-", "prod..east"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			err := reg.For("alpha").Index(name).Mark(ctx, "key")

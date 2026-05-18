@@ -206,9 +206,13 @@ Concretely, for a namespace named `myteam` with `--namespace-prefix=""`
 | `ocifactory-namespaces` | `myteam` | A single sentinel layer — the tag's existence is the catalogue entry. |
 
 A non-empty `--namespace-prefix` (e.g. `control-plane`) shifts both
-repos under that prefix (`control-plane/myteam`, `control-plane/ocifactory-namespaces`).
+repos under that namespace metadata prefix (`control-plane/myteam`,
+`control-plane/ocifactory-namespaces`). If `--repo-prefix` is also set,
+it is prepended before the namespace prefix, so `--repo-prefix=prod`
+and `--namespace-prefix=control-plane` store metadata under
+`prod/control-plane/myteam` and `prod/control-plane/ocifactory-namespaces`.
 Operators sharing one OCI registry between an ocifactory deployment and
-unrelated artifacts use the prefix to keep the namespaces out of the way.
+unrelated artifacts use these prefixes to keep the namespaces out of the way.
 
 ## `schema_version`
 

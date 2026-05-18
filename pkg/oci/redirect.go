@@ -82,7 +82,10 @@ func (r *Registry) blobRedirectURL(ctx context.Context, f *RepoFile) (string, er
 // answer 200 and we return ("", nil) so the caller falls through to
 // streaming via ReadFile.
 func (r *Registry) probeBlobRedirect(ctx context.Context, f *RepoFile, blobDesc ocispec.Descriptor) (string, error) {
-	repoRef := r.repoRef(f.OwningRepo)
+	repoRef, err := r.repoRef(f.OwningRepo)
+	if err != nil {
+		return "", err
+	}
 	ref, err := registry.ParseReference(repoRef)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse repository reference %q: %w", repoRef, err)

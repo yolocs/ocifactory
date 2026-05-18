@@ -769,15 +769,8 @@ func (r *Registry) validatePublicIndexName(name string) error {
 	if path.Clean(name) != name || strings.ContainsRune(name, '/') || name == "." || name == ".." {
 		return fmt.Errorf("%w: index name %q is not a single canonical segment", ErrInvalidOwningRepo, name)
 	}
-	for i, rr := range name {
-		switch {
-		case rr >= 'a' && rr <= 'z', rr >= '0' && rr <= '9':
-		case i > 0 && (rr == '.' || rr == '_' || rr == '-'):
-		case i == 0 && (rr == '.' || rr == '_' || rr == '-'):
-			return fmt.Errorf("%w: index name %q must start with a lowercase letter or digit", ErrInvalidOwningRepo, name)
-		default:
-			return fmt.Errorf("%w: index name %q contains invalid character %q", ErrInvalidOwningRepo, name, rr)
-		}
+	if err := oci.ValidateRepoPrefix(name); err != nil {
+		return fmt.Errorf("%w: index name %q is invalid: %v", ErrInvalidOwningRepo, name, err)
 	}
 	return nil
 }

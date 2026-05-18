@@ -84,6 +84,7 @@ func TestNewRegistryRepoPrefix(t *testing.T) {
 		owningRepo string
 		wantRef    string
 		wantErr    bool
+		wantRefErr bool
 	}{
 		{
 			name:       "empty prefix preserves old path",
@@ -117,6 +118,25 @@ func TestNewRegistryRepoPrefix(t *testing.T) {
 			repoPrefix: "Prod",
 			wantErr:    true,
 		},
+		{
+			name:       "trailing separator prefix rejected",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com"},
+			repoPrefix: "prod-",
+			wantErr:    true,
+		},
+		{
+			name:       "repeated dot prefix rejected",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com"},
+			repoPrefix: "prod..east",
+			wantErr:    true,
+		},
+		{
+			name:       "owning repo traversal rejected",
+			baseURL:    &url.URL{Scheme: "https", Host: "example.com"},
+			repoPrefix: "prod",
+			owningRepo: "../default/packages/foo",
+			wantRefErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -134,7 +154,17 @@ func TestNewRegistryRepoPrefix(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if diff := cmp.Diff(tt.wantRef, got.repoRef(tt.owningRepo)); diff != "" {
+			ref, err := got.repoRef(tt.owningRepo)
+			if (err != nil) != tt.wantRefErr {
+				t.Fatalf("repoRef() error = %v, wantErr %v", err, tt.wantRefErr)
+			}
+			if err != nil {
+				return
+			}
+			if tt.wantRef == "" {
+				t.Fatalf("repoRef() = %q, wantRef test value", ref)
+			}
+			if diff := cmp.Diff(tt.wantRef, ref); diff != "" {
 				t.Errorf("repoRef() mismatch (-want +got):\n%s", diff)
 			}
 		})
