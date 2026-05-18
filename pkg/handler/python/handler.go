@@ -58,7 +58,7 @@ const (
 	// across every upload of every package, so the index repo grows by
 	// one tag per package rather than one layer per (package, version).
 	indexSentinelName    = "present"
-	indexSentinelContent = "1"
+	indexSentinelContent = "present\n"
 )
 
 var (
@@ -275,9 +275,8 @@ func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
 }
 
 // handleSimpleIndex renders the root simple index — the list of every
-// package the registry knows about. The index repo carries one tag per
-// (already-normalized) package name; ListTags is enough to enumerate
-// them.
+// package the registry knows about. The namespace index carries one
+// tag per already-normalized package name.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 	scoped := h.scopedFor(req)
 	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
@@ -288,8 +287,8 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 		h.handleSimpleIndexProxy(w, req, scoped, spec)
 		return
 	}
-	tags, err := scoped.ListTags(req.Context(), "index")
-	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	tags, err := scoped.Index(packageIndexName).List(req.Context())
+	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return
 		}
@@ -444,7 +443,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	normalizedName := normalize(pkgName)
 
 	wheelRF := &oci.RepoFile{
-		OwningRepo: "packages/" + normalizedName,
+		OwningRepo: packageOwningRepo(normalizedName),
 		OwningTag:  versionNum,
 		Name:       contentName,
 		MediaType:  detectMediaType(contentName),
@@ -507,36 +506,10 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-// ensureIndexSentinel writes the index/<normalizedName> sentinel only
-// when no tag exists for that package yet. Idempotent: a second
-// upload of any version of the same package skips the write entirely
-// rather than colliding with the immutable-add contract that AddFile
-// now enforces by default.
-//
-// errdef.ErrNotFound from ListTags is treated as "no packages yet"
-// (zot returns it for empty repositories), matching how
-// handleSimpleIndex already absorbs the same shape.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped handler.Registry, normalizedName string) error {
-	tags, err := scoped.ListTags(ctx, "index")
-	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
-		return fmt.Errorf("list index tags: %w", err)
-	}
-	for _, t := range tags {
-		if t == normalizedName {
-			return nil
-		}
-	}
-	sentinelRF := &oci.RepoFile{
-		OwningRepo: "index",
-		OwningTag:  normalizedName,
-		Name:       indexSentinelName,
-		MediaType:  "text/plain",
-		Size:       int64(len(indexSentinelContent)),
-	}
-	if _, err := scoped.AddFile(ctx, sentinelRF, strings.NewReader(indexSentinelContent)); err != nil {
-		return fmt.Errorf("add index sentinel: %w", err)
-	}
-	return nil
+// ensureIndexSentinel marks the normalized package name in the
+// per-format namespace index.
+func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *namespace.ScopedRegistry, normalizedName string) error {
+	return scoped.Index(packageIndexName).Mark(ctx, normalizedName)
 }
 
 // errFieldTooLarge is returned by readTextPart when a non-file form
@@ -620,7 +593,7 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 
 	pkg = normalize(pkg)
 	f := &oci.RepoFile{
-		OwningRepo: "packages/" + pkg,
+		OwningRepo: packageOwningRepo(pkg),
 		OwningTag:  version,
 		Name:       filename,
 		MediaType:  detectMediaType(filename),
@@ -708,7 +681,7 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 // is what goes into the simple-index cache; both HTML and JSON
 // renderers pivot off it.
 func (h *Handler) resolvePackageFiles(ctx context.Context, scoped handler.Registry, pkg string) ([]cachedFile, error) {
-	rawFiles, err := scoped.ListFiles(ctx, "packages/"+pkg)
+	rawFiles, err := scoped.ListFiles(ctx, packageOwningRepo(pkg))
 	if err != nil {
 		return nil, err
 	}

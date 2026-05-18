@@ -30,6 +30,7 @@ Useful flags:
 | Flag | Purpose |
 |---|---|
 | `--backend-registry` | Required. OCI registry URL that stores namespace metadata and the namespace index. |
+| `--repo-prefix` | Optional single OCI path segment that scopes this ocifactory instance inside the backend registry. Use the same value on `ocifactory serve` and `ocifactory admin serve`. |
 | `--port` | Listener port. Defaults to `8081`; `PORT` is also honored for PaaS deployments. |
 | `--namespace-prefix` | Optional OCI repository prefix for namespace metadata and the global namespace index. Defaults to empty. Use a lowercase OCI-safe path segment such as `control-plane`. |
 | `--backend-auth-kind` and related `--backend-auth-*` flags | Same backend credential providers as the data-plane service. |
@@ -205,9 +206,13 @@ Concretely, for a namespace named `myteam` with `--namespace-prefix=""`
 | `ocifactory-namespaces` | `myteam` | A single sentinel layer — the tag's existence is the catalogue entry. |
 
 A non-empty `--namespace-prefix` (e.g. `control-plane`) shifts both
-repos under that prefix (`control-plane/myteam`, `control-plane/ocifactory-namespaces`).
+repos under that namespace metadata prefix (`control-plane/myteam`,
+`control-plane/ocifactory-namespaces`). If `--repo-prefix` is also set,
+it is prepended before the namespace prefix, so `--repo-prefix=prod`
+and `--namespace-prefix=control-plane` store metadata under
+`prod/control-plane/myteam` and `prod/control-plane/ocifactory-namespaces`.
 Operators sharing one OCI registry between an ocifactory deployment and
-unrelated artifacts use the prefix to keep the namespaces out of the way.
+unrelated artifacts use these prefixes to keep the namespaces out of the way.
 
 ## `schema_version`
 

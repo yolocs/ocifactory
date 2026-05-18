@@ -231,10 +231,10 @@ func TestHandlePut(t *testing.T) {
 
 			if tc.wantIndex {
 				// Verify the per-package sentinel was written under
-				// <ns>/index/<pkgName>. The body is a constant
+				// <ns>/<format-index>/<pkgName>. The body is a constant
 				// placeholder, not the version, so the OCI backend
 				// deduplicates the blob across uploads.
-				indexKey := testNS + "/index/" + tc.pkgName + "/" + indexSentinelName
+				indexKey := testNS + "/" + packageIndexName + "/" + tc.pkgName + "/" + indexSentinelName
 				indexContent, ok := registry.Files[indexKey]
 				if !ok {
 					t.Errorf("Index sentinel not found in registry: %s", indexKey)
@@ -245,7 +245,7 @@ func TestHandlePut(t *testing.T) {
 				// The version string should never appear as a layer name in
 				// the index repo — that was the per-version write the new
 				// sentinel approach replaces.
-				perVersionKey := testNS + "/index/" + tc.pkgName + "/" + tc.version
+				perVersionKey := testNS + "/" + packageIndexName + "/" + tc.pkgName + "/" + tc.version
 				if _, ok := registry.Files[perVersionKey]; ok {
 					t.Errorf("Per-version index layer must not exist: %s", perVersionKey)
 				}
@@ -626,7 +626,7 @@ func TestIndexSentinel(t *testing.T) {
 			uploads:       []upload{{pkg: "requests", version: "1.0.0"}},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/" + packageIndexName + "/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -638,7 +638,7 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"requests"},
 			wantIndexFiles: map[string]string{
-				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/" + packageIndexName + "/requests/" + indexSentinelName: indexSentinelContent,
 			},
 		},
 		{
@@ -651,9 +651,9 @@ func TestIndexSentinel(t *testing.T) {
 			},
 			wantIndexTags: []string{"django", "flask", "requests"},
 			wantIndexFiles: map[string]string{
-				testNS + "/index/requests/" + indexSentinelName: indexSentinelContent,
-				testNS + "/index/flask/" + indexSentinelName:    indexSentinelContent,
-				testNS + "/index/django/" + indexSentinelName:   indexSentinelContent,
+				testNS + "/" + packageIndexName + "/requests/" + indexSentinelName: indexSentinelContent,
+				testNS + "/" + packageIndexName + "/flask/" + indexSentinelName:    indexSentinelContent,
+				testNS + "/" + packageIndexName + "/django/" + indexSentinelName:   indexSentinelContent,
 			},
 		},
 	}
@@ -671,7 +671,7 @@ func TestIndexSentinel(t *testing.T) {
 				}
 			}
 
-			gotIndexTags := append([]string{}, registry.Tags[testNS+"/index"]...)
+			gotIndexTags := append([]string{}, registry.Tags[testNS+"/"+packageIndexName]...)
 			sort.Strings(gotIndexTags)
 			if diff := cmp.Diff(tc.wantIndexTags, gotIndexTags); diff != "" {
 				t.Errorf("index repo tags mismatch (-want +got):\n%s", diff)
@@ -679,7 +679,7 @@ func TestIndexSentinel(t *testing.T) {
 
 			gotIndexFiles := map[string]string{}
 			for k, v := range registry.Files {
-				if strings.HasPrefix(k, testNS+"/index/") {
+				if strings.HasPrefix(k, testNS+"/"+packageIndexName+"/") {
 					gotIndexFiles[k] = string(v)
 				}
 			}
@@ -796,7 +796,7 @@ func TestHandleSimpleIndex(t *testing.T) {
 			t.Parallel()
 
 			registry := oci.NewFakeRegistry()
-			registry.Tags[testNS+"/index"] = append(registry.Tags[testNS+"/index"], tc.setupTags...)
+			registry.Tags[testNS+"/"+packageIndexName] = append(registry.Tags[testNS+"/"+packageIndexName], tc.setupTags...)
 
 			h, _ := newTestHandler(t, registry)
 
@@ -856,7 +856,7 @@ func TestPEP503Normalization(t *testing.T) {
 			}
 			// And the index sentinel is at the normalized name.
 			normalized := normalize(tc.uploadAs)
-			if _, ok := reg.Files[testNS+"/index/"+normalized+"/"+indexSentinelName]; !ok {
+			if _, ok := reg.Files[testNS+"/"+packageIndexName+"/"+normalized+"/"+indexSentinelName]; !ok {
 				t.Errorf("missing index sentinel under normalized name %q", normalized)
 			}
 
@@ -1054,7 +1054,7 @@ func TestSimpleIndexJSONList(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags[testNS+"/index"] = []string{"flask", "requests"}
+	reg.Tags[testNS+"/"+packageIndexName] = []string{"flask", "requests"}
 	h, _ := newTestHandler(t, reg)
 
 	req := httptest.NewRequest(http.MethodGet, "/"+testNS+"/simple/", nil)
@@ -1273,7 +1273,7 @@ func TestNoAcceptHeader_DefaultsToHTML(t *testing.T) {
 	t.Parallel()
 
 	reg := oci.NewFakeRegistry()
-	reg.Tags[testNS+"/index"] = []string{"flask"}
+	reg.Tags[testNS+"/"+packageIndexName] = []string{"flask"}
 	h, _ := newTestHandler(t, reg)
 
 	for _, path := range []string{"/" + testNS + "/simple/", "/" + testNS + "/simple/flask/"} {
@@ -1520,7 +1520,7 @@ func TestHandleFilePut_ReuploadOfDifferentVersionSucceeds(t *testing.T) {
 
 	// Exactly one sentinel under the index repo, regardless of how
 	// many versions were uploaded.
-	indexTags := reg.Tags[testNS+"/index"]
+	indexTags := reg.Tags[testNS+"/"+packageIndexName]
 	if got, want := len(indexTags), 1; got != want {
 		t.Errorf("index tags = %v, want exactly one entry for the package", indexTags)
 	}

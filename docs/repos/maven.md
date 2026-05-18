@@ -325,16 +325,18 @@ segment):
 
 | Maven URL | OCI repo | Canonical tag | File name on the file manifest |
 |---|---|---|---|
-| `/{ns}/maven2/{groupId}/{artifactId}/{version}/{filename}` | `<ns>/{groupId}/{artifactId}` | `{version}` | `{filename}` |
-| `/{ns}/maven2/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `<ns>/{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
-| `/{ns}/maven2/{groupId}/{artifactId}/maven-metadata.xml` | `<ns>/{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
+| `/{ns}/maven2/{groupId}/{artifactId}/{version}/{filename}` | `<ns>/packages/{groupId}/{artifactId}` | `{version}` | `{filename}` |
+| `/{ns}/maven2/{groupId}/{artifactId}/{version}-SNAPSHOT/maven-metadata.xml` | `<ns>/packages/{groupId}/{artifactId}` | `{version}-SNAPSHOT-metadata` | `maven-metadata.xml` |
+| `/{ns}/maven2/{groupId}/{artifactId}/maven-metadata.xml` | `<ns>/packages/{groupId}/{artifactId}` | `metadata` | `maven-metadata.xml` |
 | `/{ns}/maven2/archetype-catalog.xml` | `<ns>/archetype` | `latest` | `archetype-catalog.xml` |
 
 `{groupId}` keeps its slash form (`com/example/foo`), matching the URL.
 The namespace wrapper adds the `<ns>/` prefix transparently; the maven
-handler addresses repos as `{groupId}/{artifactId}` and the wrapper
-turns them into `<ns>/{groupId}/{artifactId}` before they hit the OCI
-backend.
+handler's storage codec addresses package repos as
+`packages/{groupId}/{artifactId}` and the wrapper turns them into
+`<ns>/packages/{groupId}/{artifactId}` before they hit the OCI backend.
+If `--repo-prefix` is configured, that prefix sits before `<ns>` in the
+backend repository path.
 
 A fourth per-namespace repo, `<ns>/ocifactory-packages`, is maintained
 by the namespace wrapper itself — its tags enumerate every owning-repo

@@ -158,7 +158,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get existing jar",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "1.0.0",
 				Name:       "project-1.0.0.jar",
 				MediaType:  "application/java-archive",
@@ -172,7 +172,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "head existing jar",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "1.0.0",
 				Name:       "project-1.0.0.jar",
 				MediaType:  "application/java-archive",
@@ -212,7 +212,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get snapshot metadata",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "1.0-SNAPSHOT-metadata",
 				Name:       "maven-metadata.xml",
 				MediaType:  "text/xml",
@@ -226,7 +226,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get snapshot metadata checksum",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "1.0-SNAPSHOT-metadata",
 				Name:       "maven-metadata.xml.sha1",
 				MediaType:  "text/plain",
@@ -240,7 +240,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get release metadata",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "metadata",
 				Name:       "maven-metadata.xml",
 				MediaType:  "text/xml",
@@ -254,7 +254,7 @@ func TestHandleGet(t *testing.T) {
 		{
 			name: "get release metadata checksum",
 			setupFile: &oci.RepoFile{
-				OwningRepo: testNS + "/com/example/project",
+				OwningRepo: testNS + "/packages/com/example/project",
 				OwningTag:  "metadata",
 				Name:       "maven-metadata.xml.sha1",
 				MediaType:  "text/plain",
@@ -326,7 +326,7 @@ func TestHandleGet_BlobRedirect(t *testing.T) {
 	t.Parallel()
 
 	setupFile := &oci.RepoFile{
-		OwningRepo: testNS + "/com/example/project",
+		OwningRepo: testNS + "/packages/com/example/project",
 		OwningTag:  "1.0.0",
 		Name:       "project-1.0.0.jar",
 		MediaType:  "application/java-archive",
@@ -436,16 +436,16 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 		if strings.Contains(parts[len(parts)-2], "-SNAPSHOT") {
 			// This is a version level maven-metadata.xml for snapshots.
 			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-				OwningTag:  parts[len(parts)-2] + "-metadata",       // versionId-metadata
+				OwningRepo: packageOwningRepo(strings.Join(parts[:len(parts)-2], "/")), // groupId/artifactId
+				OwningTag:  parts[len(parts)-2] + "-metadata",                          // versionId-metadata
 				Name:       fn,
 				MediaType:  "text/xml",
 			}
 		} else {
 			// This is a group/artifact level maven-metadata.xml for releases.
 			return &oci.RepoFile{
-				OwningRepo: strings.Join(parts[:len(parts)-1], "/"), // groupId/artifactId
-				OwningTag:  "metadata",                              // metadata
+				OwningRepo: packageOwningRepo(strings.Join(parts[:len(parts)-1], "/")), // groupId/artifactId
+				OwningTag:  "metadata",                                                 // metadata
 				Name:       fn,
 				MediaType:  "text/xml",
 			}
@@ -457,8 +457,8 @@ func pathToRepoFile(t *testing.T, p string) *oci.RepoFile {
 	}
 
 	return &oci.RepoFile{
-		OwningRepo: strings.Join(parts[:len(parts)-2], "/"), // groupId/artifactId
-		OwningTag:  parts[len(parts)-2],                     // versionId
+		OwningRepo: packageOwningRepo(strings.Join(parts[:len(parts)-2], "/")), // groupId/artifactId
+		OwningTag:  parts[len(parts)-2],                                        // versionId
 		Name:       fn,
 		MediaType:  detectMediaType(fn),
 	}
@@ -541,7 +541,7 @@ func TestHandlePut_MaxUploadBytes(t *testing.T) {
 			// Backend was contacted iff the artifact key was written.
 			// The test handler setup writes namespace-metadata blobs
 			// unconditionally, so check for the artifact key directly.
-			artifactKey := testNS + "/com/example/project/1.0.0/project-1.0.0.jar"
+			artifactKey := testNS + "/packages/com/example/project/1.0.0/project-1.0.0.jar"
 			_, hit := reg.Files[artifactKey]
 			if hit != tc.wantBackendHit {
 				t.Errorf("backend hit = %v, want %v", hit, tc.wantBackendHit)

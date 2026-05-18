@@ -127,7 +127,7 @@ func TestNamespace_NotInReadersForbidden(t *testing.T) {
 	// Seed a file directly so a successful authz would have something
 	// to find.
 	if _, err := fake.AddFile(t.Context(), &oci.RepoFile{
-		OwningRepo: testNS + "/com/example/foo",
+		OwningRepo: testNS + "/packages/com/example/foo",
 		OwningTag:  "1.0.0",
 		Name:       "foo-1.0.0.jar",
 	}, strings.NewReader("jar")); err != nil {
@@ -269,11 +269,10 @@ func TestNamespace_CrossNamespaceIsolation_Checksum(t *testing.T) {
 	}
 }
 
-// TestNamespace_ReservedIndexRepoRejected confirms a writer cannot
-// reach the wrapper's own per-namespace package-index repo via a
-// maven URL that names "ocifactory-packages" as the first repo
-// segment.
-func TestNamespace_ReservedIndexRepoRejected(t *testing.T) {
+// TestNamespace_ReservedIndexNameIsPackageScoped confirms a maven URL
+// that names "ocifactory-packages" lands under packages/ and cannot
+// collide with the wrapper's own per-namespace package-index repo.
+func TestNamespace_ReservedIndexNameIsPackageScoped(t *testing.T) {
 	t.Parallel()
 
 	fake := oci.NewFakeRegistry()
@@ -290,8 +289,11 @@ func TestNamespace_ReservedIndexRepoRejected(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPut, nsPath("/ocifactory-packages/1.0.0/x.jar"), strings.NewReader("jar"))
 	w := httptest.NewRecorder()
 	h.Mux().ServeHTTP(w, r)
-	if got, want := w.Code, http.StatusBadRequest; got != want {
+	if got, want := w.Code, http.StatusCreated; got != want {
 		t.Errorf("status = %d, want %d (body=%s)", got, want, w.Body.String())
+	}
+	if _, ok := fake.Files[testNS+"/packages/ocifactory-packages/1.0.0/x.jar"]; !ok {
+		t.Errorf("file not stored under packages/ocifactory-packages; got %v", fake.Files)
 	}
 }
 

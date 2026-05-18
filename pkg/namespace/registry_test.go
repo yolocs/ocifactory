@@ -607,6 +607,78 @@ func TestScopedRegistry_PackageIndex_Isolated(t *testing.T) {
 	}
 }
 
+func TestScopedRegistry_Index_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	fake, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	idx := reg.For("alpha").Index("python-packages")
+
+	keys := []string{"requests", "foo_bar", "@scope/pkg"}
+	for _, key := range keys {
+		if err := idx.Mark(ctx, key); err != nil {
+			t.Fatalf("Mark(%q): %v", key, err)
+		}
+	}
+	if err := idx.Mark(ctx, keys[0]); err != nil {
+		t.Fatalf("Mark duplicate: %v", err)
+	}
+
+	has, err := idx.Has(ctx, "@scope/pkg")
+	if err != nil {
+		t.Fatalf("Has: %v", err)
+	}
+	if !has {
+		t.Fatalf("Has(%q) = false, want true", "@scope/pkg")
+	}
+	has, err = idx.Has(ctx, "missing")
+	if err != nil {
+		t.Fatalf("Has missing: %v", err)
+	}
+	if has {
+		t.Fatalf("Has(%q) = true, want false", "missing")
+	}
+
+	if err := idx.Unmark(ctx, "foo_bar"); err != nil {
+		t.Fatalf("Unmark: %v", err)
+	}
+	got, err := idx.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	slices.Sort(got)
+	want := []string{"@scope/pkg", "requests"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("List mismatch (-want +got):\n%s", diff)
+	}
+
+	if _, ok := fake.Files["alpha/python-packages/requests/present"]; !ok {
+		t.Errorf("Index Mark wrote keys %v, want alpha/python-packages/requests/present", slicesSortedKeys(fake.Files))
+	}
+}
+
+func TestScopedRegistry_Index_RejectsInvalidName(t *testing.T) {
+	t.Parallel()
+
+	_, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+
+	for _, name := range []string{"", "packages/foo", "../x", "ocifactory-packages", "prod-", "prod..east"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := reg.For("alpha").Index(name).Mark(ctx, "key")
+			if err == nil {
+				t.Fatalf("Index(%q).Mark = nil, want error", name)
+			}
+			if !errors.Is(err, namespace.ErrInvalidOwningRepo) {
+				t.Errorf("Index(%q).Mark err = %v, want errors.Is(ErrInvalidOwningRepo)", name, err)
+			}
+		})
+	}
+}
+
 // TestScopedRegistry_TagEncoding_RoundTrip pins the encoding
 // properties: collision-free between names that differ only in '/'
 // vs '_'.

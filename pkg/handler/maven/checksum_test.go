@@ -284,8 +284,8 @@ func TestHandlePut_ChecksumIntegration(t *testing.T) {
 	md5Path := artifactPath + ".md5"
 	const artifactBody = "jar content"
 	// Backend keys include the namespace prefix.
-	storedJarSha1 := testNS + "/com/example/project/1.0.0/project-1.0.0.jar.sha1"
-	storedJarMD5 := testNS + "/com/example/project/1.0.0/project-1.0.0.jar.md5"
+	storedJarSha1 := testNS + "/packages/com/example/project/1.0.0/project-1.0.0.jar.sha1"
+	storedJarMD5 := testNS + "/packages/com/example/project/1.0.0/project-1.0.0.jar.md5"
 
 	cases := []struct {
 		name         string

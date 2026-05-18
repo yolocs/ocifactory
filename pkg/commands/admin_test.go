@@ -43,6 +43,21 @@ func TestAdminServeConfig_Validate(t *testing.T) {
 			wantURL: &url.URL{Scheme: "https", Host: "registry.example.com", Path: "/ocifactory"},
 		},
 		{
+			name: "repo prefix accepts single segment",
+			mut: func(c *adminServeConfig) {
+				c.RepoPrefix = "prod-east"
+			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
+			name: "repo prefix rejects multi segment",
+			mut: func(c *adminServeConfig) {
+				c.RepoPrefix = "prod/east"
+			},
+			wantErr: `invalid repo-prefix "prod/east": must match [a-z0-9][a-z0-9._-]*`,
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
 			name: "missing port",
 			mut: func(c *adminServeConfig) {
 				c.Port = ""
@@ -84,6 +99,7 @@ func TestAdminServeCmd_Flags(t *testing.T) {
 	tests := []string{
 		flagPort,
 		flagBackendRegistry,
+		flagRepoPrefix,
 		flagNamespacePrefix,
 		flagEnableMetrics,
 		flagMetricsPath,
@@ -139,6 +155,7 @@ func TestAdminCmd_IsRegistered(t *testing.T) {
 // TestAdminServeCmd_EnvVarBindings mutates process-global env, so cannot t.Parallel.
 func TestAdminServeCmd_EnvVarBindings(t *testing.T) {
 	t.Setenv("OCIFACTORY_BACKEND_REGISTRY", "zot.example.com:5000/ocifactory")
+	t.Setenv("OCIFACTORY_REPO_PREFIX", "prod-east")
 	t.Setenv("OCIFACTORY_NAMESPACE_PREFIX", "control-plane")
 	t.Setenv("OCIFACTORY_BACKEND_AUTH_KIND", "staticenv")
 	t.Setenv("OCIFACTORY_BACKEND_AUTH_STATICENV_USER_ENV", "REG_USER")
@@ -165,6 +182,7 @@ func TestAdminServeCmd_EnvVarBindings(t *testing.T) {
 	want := adminServeConfig{
 		Port:                            "9091",
 		BackendRegistry:                 "zot.example.com:5000/ocifactory",
+		RepoPrefix:                      "prod-east",
 		NamespacePrefix:                 "control-plane",
 		EnableMetrics:                   true,
 		MetricsPath:                     "/metrics",

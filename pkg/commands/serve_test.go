@@ -76,6 +76,21 @@ func TestServeConfig_Validate(t *testing.T) {
 			wantURL: &url.URL{Scheme: "https", Host: "gar.example.com", Path: "/project"},
 		},
 		{
+			name: "repo prefix accepts single segment",
+			mut: func(c *serveConfig) {
+				c.RepoPrefix = "prod-east"
+			},
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
+			name: "repo prefix rejects multi segment",
+			mut: func(c *serveConfig) {
+				c.RepoPrefix = "prod/east"
+			},
+			wantErr: "repo-prefix",
+			wantURL: &url.URL{Scheme: "http", Host: "example.com"},
+		},
+		{
 			name: "missing authn config rejects",
 			mut: func(c *serveConfig) {
 				c.DisableAuthn = false
@@ -175,6 +190,7 @@ func TestServeCmd_Flags(t *testing.T) {
 		{name: flagPort, flagName: flagPort},
 		{name: flagRepoType, flagName: flagRepoType, shorthand: "t"},
 		{name: flagBackendRegistry, flagName: flagBackendRegistry},
+		{name: flagRepoPrefix, flagName: flagRepoPrefix},
 		{name: flagDisableStreamingPush, flagName: flagDisableStreamingPush},
 		{name: flagAllowOverwrite, flagName: flagAllowOverwrite},
 		{name: flagDisableAuthn, flagName: flagDisableAuthn},
@@ -212,6 +228,7 @@ func TestServeCmd_Flags(t *testing.T) {
 func TestServeCmd_EnvVarBindings(t *testing.T) {
 	t.Setenv("OCIFACTORY_REPO_TYPE", "python")
 	t.Setenv("OCIFACTORY_BACKEND_REGISTRY", "zot.example.com:5000/ocifactory")
+	t.Setenv("OCIFACTORY_REPO_PREFIX", "prod-east")
 	t.Setenv("OCIFACTORY_AUTHN_KIND", "oidc")
 	t.Setenv("OCIFACTORY_AUTHN_OIDC_ISSUERS",
 		"https://accounts.google.com,https://token.actions.githubusercontent.com")
@@ -248,6 +265,7 @@ func TestServeCmd_EnvVarBindings(t *testing.T) {
 		Port:            "9090",
 		RepoType:        "python",
 		BackendRegistry: "zot.example.com:5000/ocifactory",
+		RepoPrefix:      "prod-east",
 		// Defaults the production binary advertises in --help.
 		EnableMetrics:        true,
 		MetricsPath:          "/metrics",

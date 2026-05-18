@@ -34,6 +34,7 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -46,6 +47,8 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
+	"github.com/yolocs/ocifactory/pkg/namespace"
+	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
 const (
@@ -101,6 +104,7 @@ const layerMediaType = "application/octet-stream"
 // state on the Cache itself.
 type Cache struct {
 	baseURL    *url.URL
+	repoPrefix string
 	authClient *auth.Client
 	plainHTTP  bool
 
@@ -142,6 +146,18 @@ func WithBackendAuth(p backend.Provider) Option {
 			Cache:      auth.NewCache(),
 			Credential: credFn,
 		}
+		return nil
+	}
+}
+
+// WithRepoPrefix scopes cache repositories under the same
+// single-segment prefix used by pkg/oci.Registry.
+func WithRepoPrefix(prefix string) Option {
+	return func(c *Cache) error {
+		if err := oci.ValidateRepoPrefix(prefix); err != nil {
+			return err
+		}
+		c.repoPrefix = prefix
 		return nil
 	}
 }
@@ -234,11 +250,15 @@ func NewCache(baseURL *url.URL, opts ...Option) (*Cache, error) {
 // dangling tag) is returned wrapped.
 //
 // pkg may contain '/' (npm scoped packages, Maven groupId paths);
-// the caller is responsible for normalising the value (rejecting
-// "..", absolute paths, etc.) so a maliciously-crafted pkg cannot
+// Cache validates that ns and pkg are canonical relative paths before
+// opening the backend target so a maliciously-crafted value cannot
 // traverse out of the namespace's cache prefix.
 func (c *Cache) Get(ctx context.Context, ns, pkg string) ([]byte, string, time.Time, bool, error) {
-	target, err := c.newTargetFunc(ctx, c.repoPath(ns, pkg))
+	repoPath, err := c.repoPath(ns, pkg)
+	if err != nil {
+		return nil, "", time.Time{}, false, err
+	}
+	target, err := c.newTargetFunc(ctx, repoPath)
 	if err != nil {
 		return nil, "", time.Time{}, false, fmt.Errorf("indexcache: open target: %w", err)
 	}
@@ -289,7 +309,11 @@ func (c *Cache) Get(ctx context.Context, ns, pkg string) ([]byte, string, time.T
 // underlying tag write; the last writer wins, which is the expected
 // behaviour for a refresh-on-read cache.
 func (c *Cache) Put(ctx context.Context, ns, pkg string, body []byte, contentType string) error {
-	target, err := c.newTargetFunc(ctx, c.repoPath(ns, pkg))
+	repoPath, err := c.repoPath(ns, pkg)
+	if err != nil {
+		return err
+	}
+	target, err := c.newTargetFunc(ctx, repoPath)
 	if err != nil {
 		return fmt.Errorf("indexcache: open target: %w", err)
 	}
@@ -333,12 +357,40 @@ func (c *Cache) Put(ctx context.Context, ns, pkg string, body []byte, contentTyp
 	return nil
 }
 
-func (c *Cache) repoPath(ns, pkg string) string {
-	return path.Join(ns, cacheRepoSegment, pkg)
+func (c *Cache) repoPath(ns, pkg string) (string, error) {
+	if err := namespace.ValidateName(ns); err != nil {
+		return "", fmt.Errorf("indexcache: invalid namespace %q: %w", ns, err)
+	}
+	if err := validateCachePackagePath(pkg); err != nil {
+		return "", err
+	}
+	parts := []string{}
+	if c.repoPrefix != "" {
+		parts = append(parts, c.repoPrefix)
+	}
+	parts = append(parts, ns, cacheRepoSegment)
+	if pkg != "" {
+		parts = append(parts, pkg)
+	}
+	return strings.Join(parts, "/"), nil
+}
+
+func validateCachePackagePath(pkg string) error {
+	if pkg == "" {
+		return nil
+	}
+	if path.IsAbs(pkg) {
+		return fmt.Errorf("indexcache: package path %q must be relative", pkg)
+	}
+	cleaned := path.Clean(pkg)
+	if cleaned != pkg || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
+		return fmt.Errorf("indexcache: package path %q must be canonical and must not contain '..'", pkg)
+	}
+	return nil
 }
 
 func (c *Cache) newRemoteTarget(_ context.Context, repoPath string) (oras.Target, error) {
-	repoRef := c.baseURL.Host + c.baseURL.Path + "/" + repoPath
+	repoRef := c.baseURL.Host + "/" + path.Join(strings.Trim(c.baseURL.Path, "/"), repoPath)
 	repo, err := remote.NewRepository(repoRef)
 	if err != nil {
 		return nil, fmt.Errorf("create remote repository %q: %w", repoRef, err)
