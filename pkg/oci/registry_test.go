@@ -427,6 +427,24 @@ func TestAddReadRoundtrip(t *testing.T) {
 		t.Fatalf("AppendRefs() error = %v", err)
 	}
 
+	tests := []struct {
+		name string
+		tag  string
+		want string
+	}{
+		{name: "canonical", tag: "v0", want: "v0"},
+		{name: "alias", tag: "tag1", want: "v0"},
+	}
+	for _, tc := range tests {
+		got, err := r.ResolveTag(ctx, "foobar", tc.tag)
+		if err != nil {
+			t.Fatalf("ResolveTag %s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("ResolveTag %s = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
 	// Read by ref tag.
 	if gotDesc, body, err := r.ReadFile(ctx, &RepoFile{
 		OwningRepo: "foobar",

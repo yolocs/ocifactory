@@ -161,6 +161,14 @@ func (p artifactPackage) ListTags(ctx context.Context) ([]Tag, error) {
 	return out, nil
 }
 
+func (p artifactPackage) ResolveTag(ctx context.Context, tag string) (Version, error) {
+	version, err := p.scoped.ResolveTag(ctx, p.name, tag)
+	if err != nil {
+		return Version{}, err
+	}
+	return Version{Name: version}, nil
+}
+
 func (p artifactPackage) ListFiles(ctx context.Context, opts ListFilesOptions) ([]FileInfo, error) {
 	files, err := p.scoped.ListFiles(ctx, p.name)
 	if err != nil {

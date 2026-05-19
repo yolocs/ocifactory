@@ -84,6 +84,7 @@ type RegistryBackend interface {
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
 	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
 	ListTags(ctx context.Context, repo string) ([]string, error)
+	ResolveTag(ctx context.Context, repo string, tag string) (string, error)
 	ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error)
 	AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error
 	DeleteRepoFiles(ctx context.Context, repo string) error
@@ -485,6 +486,19 @@ func (s *ScopedRegistry) ListTags(ctx context.Context, repo string) ([]string, e
 		return nil, err
 	}
 	return s.parent.inner.ListTags(ctx, scoped)
+}
+
+// ResolveTag authorizes the bound namespace for read and returns the
+// canonical version tag identified by tag within repo.
+func (s *ScopedRegistry) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
+		return "", err
+	}
+	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	if err != nil {
+		return "", err
+	}
+	return s.parent.inner.ResolveTag(ctx, scoped, tag)
 }
 
 // ListFiles authorizes the bound namespace for read and returns

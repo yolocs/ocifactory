@@ -101,7 +101,7 @@ Add test coverage that `pkg.Tag(ctx, "latest", "1.0.0")` and `pkg.ListTags(ctx)`
 
 Replace hosted-path direct calls to `ListFiles`, `ListTags`, `AppendRefs`, and `ReadFile` with `artifact.Package` methods.
 
-Progress: npm publish file writes and dist-tag writes now use `artifact.Package`. Packument and dist-tag read paths still use the old scoped registry pending typed tag-target resolution.
+Progress: npm publish file writes, dist-tag writes, packument dist-tag resolution, and dist-tag read paths now use `artifact.Package`. `Package.ResolveTag` returns an `artifact.Version` so npm no longer infers tag targets by reading `package.json` through aliases and matching blob digests.
 
 - [x] **Step 3: Run npm tests**
 

@@ -959,6 +959,9 @@ func (b *addFileFailingBackend) BlobRedirectURL(ctx context.Context, f *oci.Repo
 func (b *addFileFailingBackend) ListTags(ctx context.Context, repo string) ([]string, error) {
 	return b.inner.ListTags(ctx, repo)
 }
+func (b *addFileFailingBackend) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+	return b.inner.ResolveTag(ctx, repo, tag)
+}
 func (b *addFileFailingBackend) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
 	return b.inner.ListFiles(ctx, repo)
 }

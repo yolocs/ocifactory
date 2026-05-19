@@ -543,7 +543,12 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	out, status, err := h.buildPackument(ctx, req, scoped, pkg)
+	artifactNS, err := h.artifactNamespaceFor(req)
+	if err != nil {
+		h.writeRegistryError(ctx, w, err, "failed to resolve namespace")
+		return
+	}
+	out, status, err := h.buildPackument(ctx, req, artifactNS.Package(packageOwningRepo(pkg)), pkg)
 	if err != nil {
 		if status == http.StatusNotFound {
 			http.Error(w, "package not found", http.StatusNotFound)
@@ -569,10 +574,8 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (h *Handler) buildPackument(ctx context.Context, req *http.Request, scoped handler.Registry, pkg string) (*packument, int, error) {
-	repo := packageOwningRepo(pkg)
-
-	files, err := scoped.ListFiles(ctx, repo)
+func (h *Handler) buildPackument(ctx context.Context, req *http.Request, artifactPkg artifact.Package, pkg string) (*packument, int, error) {
+	files, err := artifactPkg.ListFiles(ctx, artifact.ListFilesOptions{})
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return nil, http.StatusNotFound, err
@@ -594,10 +597,10 @@ func (h *Handler) buildPackument(ctx context.Context, req *http.Request, scoped 
 	}
 	byVersion := map[string]*versionFiles{}
 	for _, f := range files {
-		vf, ok := byVersion[f.OwningTag]
+		vf, ok := byVersion[f.Version]
 		if !ok {
 			vf = &versionFiles{}
-			byVersion[f.OwningTag] = vf
+			byVersion[f.Version] = vf
 		}
 		switch {
 		case f.Name == versionMetaName:
@@ -626,13 +629,11 @@ func (h *Handler) buildPackument(ctx context.Context, req *http.Request, scoped 
 		}
 		canonicalSet[version] = struct{}{}
 
-		metaRF := &oci.RepoFile{
-			OwningRepo: repo,
-			OwningTag:  version,
-			Name:       versionMetaName,
-			MediaType:  "application/json",
+		handle, err := artifactPkg.GetFile(ctx, version, versionMetaName)
+		if err != nil {
+			return nil, 0, err
 		}
-		_, rc, err := scoped.ReadFile(ctx, metaRF)
+		rc, err := handle.Open(ctx)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -684,43 +685,23 @@ func (h *Handler) buildPackument(ctx context.Context, req *http.Request, scoped 
 		return nil, http.StatusNotFound, errdef.ErrNotFound
 	}
 
-	// Resolve dist-tags. Every tag that ListTags returns but
-	// ListFiles didn't cover (those are the canonical versions) is
-	// an alias. We resolve each alias by fetching its package.json
-	// via RefTag and matching the descriptor digest back against
-	// the canonical version we already know.
-	allTags, tagErr := scoped.ListTags(ctx, repo)
+	// Resolve dist-tags. The artifact layer filters canonical versions
+	// out of ListTags, so every returned tag is an alias we can resolve
+	// directly to its target version instead of inferring the target by
+	// reading package.json through the alias and matching blob digests.
+	allTags, tagErr := artifactPkg.ListTags(ctx)
 	if tagErr != nil && !errors.Is(tagErr, errdef.ErrNotFound) {
 		return nil, 0, tagErr
 	}
-	digestByVersion := map[string]string{}
-	for version, vf := range byVersion {
-		if vf.metaDigest != "" {
-			digestByVersion[vf.metaDigest] = version
-		}
-	}
 	for _, tag := range allTags {
-		if _, isCanonical := canonicalSet[tag]; isCanonical {
-			continue
-		}
-		aliasRF := &oci.RepoFile{
-			OwningRepo: repo,
-			RefTag:     tag,
-			Name:       versionMetaName,
-			MediaType:  "application/json",
-		}
-		desc, rc, err := scoped.ReadFile(ctx, aliasRF)
+		target, err := artifactPkg.ResolveTag(ctx, tag.Name)
 		if err != nil {
-			// Stray alias we can't resolve — skip rather than
-			// failing the whole packument.
 			continue
 		}
-		_ = rc.Close()
-		target := digestByVersion[desc.File.Digest.String()]
-		if target == "" {
+		if _, ok := canonicalSet[target.Name]; !ok {
 			continue
 		}
-		out.DistTags[tag] = target
+		out.DistTags[tag.Name] = target.Name
 	}
 
 	// No server-side fallback for an unset "latest" dist-tag. The
@@ -794,18 +775,14 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	repo := packageOwningRepo(pkg)
-
-	tags, err := scoped.ListTags(ctx, repo)
+	artifactNS, err := h.artifactNamespaceFor(req)
 	if err != nil {
-		if errors.Is(err, errdef.ErrNotFound) {
-			http.Error(w, "package not found", http.StatusNotFound)
-			return
-		}
-		h.writeRegistryError(ctx, w, err, "failed to list tags")
+		h.writeRegistryError(ctx, w, err, "failed to resolve namespace")
 		return
 	}
-	files, err := scoped.ListFiles(ctx, repo)
+	artifactPkg := artifactNS.Package(packageOwningRepo(pkg))
+
+	files, err := artifactPkg.ListFiles(ctx, artifact.ListFilesOptions{})
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			http.Error(w, "package not found", http.StatusNotFound)
@@ -827,33 +804,30 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 	}
 
 	canonicalSet := map[string]struct{}{}
-	digestByVersion := map[string]string{}
 	for _, f := range files {
-		canonicalSet[f.OwningTag] = struct{}{}
-		if f.Name == versionMetaName {
-			digestByVersion[f.Digest] = f.OwningTag
+		canonicalSet[f.Version] = struct{}{}
+	}
+
+	tags, err := artifactPkg.ListTags(ctx)
+	if err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			http.Error(w, "package not found", http.StatusNotFound)
+			return
 		}
+		h.writeRegistryError(ctx, w, err, "failed to list tags")
+		return
 	}
 
 	out := map[string]string{}
 	for _, tag := range tags {
-		if _, isCanonical := canonicalSet[tag]; isCanonical {
-			continue
-		}
-		aliasRF := &oci.RepoFile{
-			OwningRepo: repo,
-			RefTag:     tag,
-			Name:       versionMetaName,
-			MediaType:  "application/json",
-		}
-		desc, rc, err := scoped.ReadFile(ctx, aliasRF)
+		target, err := artifactPkg.ResolveTag(ctx, tag.Name)
 		if err != nil {
 			continue
 		}
-		_ = rc.Close()
-		if v, ok := digestByVersion[desc.File.Digest.String()]; ok {
-			out[tag] = v
+		if _, ok := canonicalSet[target.Name]; !ok {
+			continue
 		}
+		out[tag.Name] = target.Name
 	}
 
 	w.Header().Set("Content-Type", distTagsMediaType)

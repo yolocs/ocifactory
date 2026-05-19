@@ -199,6 +199,19 @@ func (r *FakeRegistry) ListTags(ctx context.Context, repo string) ([]string, err
 	return tags, nil
 }
 
+// ResolveTag resolves a canonical or alias tag to its canonical version.
+func (r *FakeRegistry) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if slices.Contains(r.Tags[repo], tag) {
+		return tag, nil
+	}
+	if canonical, ok := r.Aliases[aliasKey(repo, tag)]; ok {
+		return canonical, nil
+	}
+	return "", fmt.Errorf("tag %q not found in repo %q: %w", tag, repo, errdef.ErrNotFound)
+}
+
 // ListFiles enumerates files keyed under the repo, ignoring alias tags
 // (alias resolution would double-count files that already appear under
 // their canonical version). Digest is computed from the stored content

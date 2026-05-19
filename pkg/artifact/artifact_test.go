@@ -49,6 +49,13 @@ func TestNamespacePackagePutGetListAndTag(t *testing.T) {
 	if diff := cmp.Diff([]string{"1.0.0"}, versions); diff != "" {
 		t.Errorf("ListVersions mismatch (-want +got):\n%s", diff)
 	}
+	resolvedVersion, err := pkg.ResolveTag(ctx, "1.0.0")
+	if err != nil {
+		t.Fatalf("ResolveTag canonical version: %v", err)
+	}
+	if diff := cmp.Diff(Version{Name: "1.0.0"}, resolvedVersion); diff != "" {
+		t.Errorf("ResolveTag canonical version mismatch (-want +got):\n%s", diff)
+	}
 
 	files, err := pkg.ListFiles(ctx, ListFilesOptions{})
 	if err != nil {
@@ -74,6 +81,13 @@ func TestNamespacePackagePutGetListAndTag(t *testing.T) {
 	}
 	if diff := cmp.Diff([]Tag{{Name: "latest"}}, tags); diff != "" {
 		t.Errorf("ListTags mismatch (-want +got):\n%s", diff)
+	}
+	resolvedAlias, err := pkg.ResolveTag(ctx, "latest")
+	if err != nil {
+		t.Fatalf("ResolveTag alias: %v", err)
+	}
+	if diff := cmp.Diff(Version{Name: "1.0.0"}, resolvedAlias); diff != "" {
+		t.Errorf("ResolveTag alias mismatch (-want +got):\n%s", diff)
 	}
 
 	handle, err := pkg.GetFileByTag(ctx, "latest", "requests.whl")

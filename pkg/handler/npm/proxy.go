@@ -333,9 +333,15 @@ type indexFlightResult struct {
 	contentType string
 }
 
-func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, pkg string, upstreamErr error) {
+func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, _ *namespace.ScopedRegistry, pkg string, upstreamErr error) {
 	ctx := req.Context()
-	out, status, err := h.buildPackument(ctx, req, scoped, pkg)
+	artifactNS, nsErr := h.artifactNamespaceFor(req)
+	if nsErr != nil {
+		handler.WriteError(ctx, w, http.StatusServiceUnavailable, upstreamErr,
+			fmt.Sprintf("upstream unavailable and namespace lookup failed: %v", nsErr))
+		return
+	}
+	out, status, err := h.buildPackument(ctx, req, artifactNS.Package(packageOwningRepo(pkg)), pkg)
 	if err != nil {
 		if status == http.StatusNotFound {
 			handler.WriteError(ctx, w, http.StatusServiceUnavailable, upstreamErr, "upstream unavailable, no cached packument")

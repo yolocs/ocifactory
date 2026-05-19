@@ -27,6 +27,7 @@ type Package interface {
 	GetFileByTag(ctx context.Context, tag, name string) (FileHandle, error)
 	ListVersions(ctx context.Context) ([]string, error)
 	ListTags(ctx context.Context) ([]Tag, error)
+	ResolveTag(ctx context.Context, tag string) (Version, error)
 	ListFiles(ctx context.Context, opts ListFilesOptions) ([]FileInfo, error)
 	Tag(ctx context.Context, tag, version string) error
 }
@@ -60,6 +61,11 @@ type FileInfo struct {
 type Tag struct {
 	Name    string
 	Version string
+}
+
+// Version is a canonical package version.
+type Version struct {
+	Name string
 }
 
 // ListFilesOptions filters package file listings.

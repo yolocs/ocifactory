@@ -915,6 +915,39 @@ func (r *Registry) ListTags(ctx context.Context, repo string) ([]string, error) 
 	return out, nil
 }
 
+// ResolveTag resolves tag within repo to the canonical version tag it
+// identifies. Canonical version tags resolve to themselves; alias tags
+// resolve through their AliasTargetAnnotation.
+func (r *Registry) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+	if tag == "" {
+		return "", fmt.Errorf("tag must not be empty")
+	}
+	backend, err := r.newBackendFunc(ctx, &RepoFile{OwningRepo: repo})
+	if err != nil {
+		return "", err
+	}
+	desc, err := backend.Resolve(ctx, tag)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve tag %q: %w", tag, err)
+	}
+	var manifest ocispec.Manifest
+	if err := fetchManifestJSON(ctx, backend, desc, &manifest); err != nil {
+		return "", fmt.Errorf("failed to fetch tag manifest %q: %w", tag, err)
+	}
+	switch manifest.ArtifactType {
+	case r.versionArtifactType:
+		return tag, nil
+	case r.aliasArtifactType:
+		canonical := manifest.Annotations[AliasTargetAnnotation]
+		if canonical == "" {
+			return "", fmt.Errorf("alias manifest %q is missing %s annotation", tag, AliasTargetAnnotation)
+		}
+		return canonical, nil
+	default:
+		return "", fmt.Errorf("%w: tag %q has artifactType %q", ErrAliasCollision, tag, manifest.ArtifactType)
+	}
+}
+
 // ListFiles enumerates all files across all canonical versions in repo.
 // Aliases are skipped by checking each tag's manifest artifactType so the
 // same file isn't reported twice. The blob digest comes from the

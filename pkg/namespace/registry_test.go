@@ -836,6 +836,44 @@ func TestScopedRegistry_AppendRefs_Forwards(t *testing.T) {
 	}
 }
 
+func TestScopedRegistry_ResolveTag(t *testing.T) {
+	t.Parallel()
+
+	_, reg, store := setup(t)
+	putNamespace(t, store, "alpha", allowAllSpec())
+	ctx := aliceCtx(t)
+	scoped := reg.For("alpha")
+
+	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	if err := scoped.AppendRefs(ctx, repoFoo, "1.0.0", "latest"); err != nil {
+		t.Fatalf("AppendRefs: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		tag  string
+		want string
+	}{
+		{name: "canonical", tag: "1.0.0", want: "1.0.0"},
+		{name: "alias", tag: "latest", want: "1.0.0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := scoped.ResolveTag(ctx, repoFoo, tc.tag)
+			if err != nil {
+				t.Fatalf("ResolveTag: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ResolveTag = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex verifies
 // BOTH the in-process indexed marker AND the backend
 // ocifactory-packages tag are cleared.
