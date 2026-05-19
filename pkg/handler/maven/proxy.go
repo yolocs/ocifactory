@@ -87,8 +87,8 @@ func (p *proxyState) fetcherFor(upstream string) (ProxyFetcher, error) {
 	return actual.(ProxyFetcher), nil
 }
 
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
-	spec, err := scoped.Spec(req.Context())
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView) (*namespace.Spec, bool, bool) {
+	spec, err := view.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return nil, false, false
@@ -100,9 +100,9 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 	return spec, isProxy, true
 }
 
-func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, repoPath string) {
+func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, repoPath string) {
 	ctx := req.Context()
-	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
+	if err := view.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return
 		}
@@ -132,10 +132,10 @@ func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, 
 	writeProxyBytes(w, req, resp.Body, resp.ContentType)
 }
 
-func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile, repoPath string) {
+func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, f *oci.RepoFile, repoPath string) {
 	ctx := req.Context()
 
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 	fetcher, err := h.proxy.fetcherFor(spec.Proxy.Upstream)
@@ -144,13 +144,13 @@ func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Re
 		return
 	}
 
-	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + f.OwningTag + "|" + f.Name
+	key := view.Namespace() + "|" + f.OwningRepo + "|" + f.OwningTag + "|" + f.Name
 	isHead := req.Method == http.MethodHead
 	amLeader := false
 	var teeRef *tolerantWriter
 	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
 		amLeader = true
-		if hit, hitErr := h.peekRegistry(ctx, scoped, f); hitErr == nil && hit {
+		if hit, hitErr := h.peekRegistry(ctx, view, f); hitErr == nil && hit {
 			return fileFlightResult{cached: true}, nil
 		}
 		fileResp, ferr := fetcher.FetchPath(ctx, repoPath, f.Name)
@@ -179,7 +179,7 @@ func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Re
 			teeRef = &tolerantWriter{w: w}
 			body = io.TeeReader(body, teeRef)
 		}
-		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
+		if _, addErr := view.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
@@ -196,17 +196,17 @@ func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Re
 	if result.streamed && amLeader && !isHead {
 		return
 	}
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
 }
 
-func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 
@@ -215,7 +215,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	version := f.OwningTag
 	filename := f.Name
 	if h.proxy.negCache != nil {
-		key := negativeKey(scoped.Namespace(), f.OwningRepo, version, filename)
+		key := negativeKey(view.Namespace(), f.OwningRepo, version, filename)
 		if h.proxy.negCache.IsKnownMissing(key) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -239,13 +239,13 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		return
 	}
 
-	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
+	key := view.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
 	isHead := req.Method == http.MethodHead
 	amLeader := false
 	var teeRef *tolerantWriter
 	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
 		amLeader = true
-		if hit, hitErr := h.peekRegistry(ctx, scoped, f); hitErr == nil && hit {
+		if hit, hitErr := h.peekRegistry(ctx, view, f); hitErr == nil && hit {
 			return fileFlightResult{cached: true}, nil
 		}
 
@@ -297,7 +297,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 			teeRef = &tolerantWriter{w: w}
 			body = io.TeeReader(body, teeRef)
 		}
-		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
+		if _, addErr := view.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
@@ -314,7 +314,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
 			if h.proxy.negCache != nil {
-				h.proxy.negCache.RecordMiss(negativeKey(scoped.Namespace(), f.OwningRepo, version, filename))
+				h.proxy.negCache.RecordMiss(negativeKey(view.Namespace(), f.OwningRepo, version, filename))
 			}
 			http.Error(w, "not found", http.StatusNotFound)
 		case errors.Is(err, proxy.ErrUpstreamMalformed):
@@ -341,7 +341,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	if result.streamed && amLeader && !isHead {
 		return
 	}
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
@@ -429,8 +429,8 @@ func (h *Handler) writeProxyFileError(w http.ResponseWriter, req *http.Request, 
 	}
 }
 
-func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
-	_, rc, err := scoped.ReadFile(ctx, f)
+func (h *Handler) peekRegistry(ctx context.Context, view *artifact.NamespaceView, f *oci.RepoFile) (bool, error) {
+	_, rc, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false, nil
@@ -441,19 +441,19 @@ func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNames
 	return true, nil
 }
 
-func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
+func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
 	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
+		if redirectURL, err := view.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return true
 		} else if err != nil {
 			logger.DebugContext(ctx, "maven proxy redirect probe failed; streaming", "error", err)
 		}
 	}
-	desc, rc, err := scoped.ReadFile(ctx, f)
+	desc, rc, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false

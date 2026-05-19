@@ -12,28 +12,28 @@ import (
 )
 
 type artifactNamespace struct {
-	scoped *ScopedNamespace
+	view *NamespaceView
 }
 
 func (n artifactNamespace) Name() string {
-	return n.scoped.Namespace()
+	return n.view.Namespace()
 }
 
 func (n artifactNamespace) Spec(ctx context.Context) (*nsmeta.Spec, error) {
-	return n.scoped.Spec(ctx)
+	return n.view.Spec(ctx)
 }
 
 func (n artifactNamespace) Package(name string) Package {
-	return artifactPackage{scoped: n.scoped, name: name}
+	return artifactPackage{view: n.view, name: name}
 }
 
 func (n artifactNamespace) ListPackages(ctx context.Context) ([]string, error) {
-	return n.scoped.ListPackages(ctx)
+	return n.view.ListPackages(ctx)
 }
 
 type artifactPackage struct {
-	scoped *ScopedNamespace
-	name   string
+	view *NamespaceView
+	name string
 }
 
 func (p artifactPackage) Name() string {
@@ -58,9 +58,9 @@ func (p artifactPackage) putFile(ctx context.Context, version string, file FileP
 	rf.Size = file.Size
 	rf.AllowOverwrite = file.AllowOverwrite
 	if cached {
-		return p.scoped.AddCachedFile(ctx, rf, body)
+		return p.view.AddCachedFile(ctx, rf, body)
 	}
-	return p.scoped.AddFile(ctx, rf, body)
+	return p.view.AddFile(ctx, rf, body)
 }
 
 func (p artifactPackage) GetFile(_ context.Context, version, name string) (FileHandle, error) {
@@ -69,8 +69,8 @@ func (p artifactPackage) GetFile(_ context.Context, version, name string) (FileH
 		return nil, err
 	}
 	return &fileHandle{
-		scoped: p.scoped,
-		file:   rf,
+		view: p.view,
+		file: rf,
 		info: FileInfo{
 			Package: p.name,
 			Version: version,
@@ -85,8 +85,8 @@ func (p artifactPackage) GetFileByTag(_ context.Context, tag, name string) (File
 		return nil, err
 	}
 	return &fileHandle{
-		scoped: p.scoped,
-		file:   rf,
+		view: p.view,
+		file: rf,
 		info: FileInfo{
 			Package: p.name,
 			Name:    name,
@@ -115,7 +115,7 @@ func (p artifactPackage) ListVersions(ctx context.Context) ([]string, error) {
 }
 
 func (p artifactPackage) ListTags(ctx context.Context) ([]Tag, error) {
-	allTags, err := p.scoped.ListTags(ctx, p.name)
+	allTags, err := p.view.ListTags(ctx, p.name)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func (p artifactPackage) ListTags(ctx context.Context) ([]Tag, error) {
 }
 
 func (p artifactPackage) ResolveTag(ctx context.Context, tag string) (Version, error) {
-	version, err := p.scoped.ResolveTag(ctx, p.name, tag)
+	version, err := p.view.ResolveTag(ctx, p.name, tag)
 	if err != nil {
 		return Version{}, err
 	}
@@ -147,7 +147,7 @@ func (p artifactPackage) ResolveTag(ctx context.Context, tag string) (Version, e
 }
 
 func (p artifactPackage) ListFiles(ctx context.Context, opts ListFilesOptions) ([]FileInfo, error) {
-	files, err := p.scoped.ListFiles(ctx, p.name)
+	files, err := p.view.ListFiles(ctx, p.name)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (p artifactPackage) Tag(ctx context.Context, tag, version string) error {
 	if tag == "" {
 		return errors.New("tag must not be empty")
 	}
-	return p.scoped.AppendRefs(ctx, p.name, version, tag)
+	return p.view.AppendRefs(ctx, p.name, version, tag)
 }
 
 func (p artifactPackage) repoFile(version, tag, name string) (*oci.RepoFile, error) {
@@ -198,9 +198,9 @@ func (p artifactPackage) repoFile(version, tag, name string) (*oci.RepoFile, err
 }
 
 type fileHandle struct {
-	scoped *ScopedNamespace
-	file   *oci.RepoFile
-	info   FileInfo
+	view *NamespaceView
+	file *oci.RepoFile
+	info FileInfo
 }
 
 func (h *fileHandle) Info() FileInfo {
@@ -211,14 +211,14 @@ func (h *fileHandle) DownloadURL(ctx context.Context) (string, error) {
 	if h == nil || h.file == nil {
 		return "", errors.New("file handle must not be nil")
 	}
-	return h.scoped.BlobRedirectURL(ctx, h.file)
+	return h.view.BlobRedirectURL(ctx, h.file)
 }
 
 func (h *fileHandle) Open(ctx context.Context) (io.ReadCloser, error) {
 	if h == nil || h.file == nil {
 		return nil, errors.New("file handle must not be nil")
 	}
-	desc, rc, err := h.scoped.ReadFile(ctx, h.file)
+	desc, rc, err := h.view.ReadFile(ctx, h.file)
 	if err != nil {
 		return nil, err
 	}
@@ -232,5 +232,5 @@ func (h *fileHandle) Open(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func (p artifactPackage) String() string {
-	return fmt.Sprintf("%s/%s", p.scoped.Namespace(), p.name)
+	return fmt.Sprintf("%s/%s", p.view.Namespace(), p.name)
 }

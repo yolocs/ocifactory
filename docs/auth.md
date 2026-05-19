@@ -41,7 +41,7 @@ router, so:
   sub-router that doesn't `Use(authMW)`.
 
 Authorization runs one layer deeper, inside the
-`artifact.ScopedNamespace` wrapper: every `AddFile` / `ReadFile` /
+`artifact.NamespaceView` wrapper: every `AddFile` / `ReadFile` /
 `ListTags` / `ListFiles` call routes through the namespace's
 compiled `Policy` before reaching the OCI backend, so even a
 handler bug that skipped its own pre-check would not let a request

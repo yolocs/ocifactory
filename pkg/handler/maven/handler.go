@@ -92,9 +92,9 @@ func WithMaxUploadBytes(n int64) Option {
 // NewHandler creates a new Handler.
 //
 // artifacts is the data-plane wrapper that hands out per-request
-// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every routed
+// [*artifact.NamespaceView] views via [artifact.Store.View]. Every routed
 // handler func resolves the namespace from the request URL
-// (`/{namespace}/maven2/...`) and obtains a scoped view at the top.
+// (`/{namespace}/maven2/...`) and obtains a view view at the top.
 func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		maxUploadBytes: DefaultMaxUploadBytes,
@@ -159,16 +159,16 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*artifact.ScopedNamespace] for
+// namespaceViewFor returns the per-request [*artifact.NamespaceView] for
 // the namespace in req's URL. Cheap to construct; called per request.
-func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
-	return h.artifacts.For(mux.Vars(req)["namespace"])
+func (h *Handler) namespaceViewFor(req *http.Request) *artifact.NamespaceView {
+	return h.artifacts.View(mux.Vars(req)["namespace"])
 }
 
 // handleArchetypeCatalog handles requests for archetype-catalog.xml.
 func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Request) {
-	scoped := h.scopedFor(req)
-	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	view := h.namespaceViewFor(req)
+	if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy && (req.Method == http.MethodPut || req.Method == http.MethodPost) {
 		http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
@@ -181,9 +181,9 @@ func (h *Handler) handleArchetypeCatalog(w http.ResponseWriter, req *http.Reques
 		MediaType:  "text/xml",
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
@@ -198,7 +198,7 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  versionSnapshot + "-metadata", // e.g., 1.0-SNAPSHOT-metadata
@@ -210,20 +210,20 @@ func (h *Handler) handleSnapshotMetadata(w http.ResponseWriter, req *http.Reques
 		// snapshot doesn't 409 on the metadata write.
 		AllowOverwrite: true,
 	}
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		if req.Method == http.MethodPut || req.Method == http.MethodPost {
 			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
 			return
 		}
-		h.handleMetadataProxy(w, req, scoped, spec, repoParts+"/"+versionSnapshot)
+		h.handleMetadataProxy(w, req, view, spec, repoParts+"/"+versionSnapshot)
 		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
@@ -238,7 +238,7 @@ func (h *Handler) handleSnapshotMetadataSidecar(w http.ResponseWriter, req *http
 		return
 	}
 
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	f := &oci.RepoFile{
 		OwningRepo:     packageOwningRepo(repoParts),
 		OwningTag:      versionSnapshot + "-metadata",
@@ -246,20 +246,20 @@ func (h *Handler) handleSnapshotMetadataSidecar(w http.ResponseWriter, req *http
 		MediaType:      detectMediaType(filename),
 		AllowOverwrite: true,
 	}
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		if req.Method == http.MethodPut || req.Method == http.MethodPost {
 			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
 			return
 		}
-		h.handleMetadataSidecarProxy(w, req, scoped, spec, f, repoParts+"/"+versionSnapshot)
+		h.handleMetadataSidecarProxy(w, req, view, spec, f, repoParts+"/"+versionSnapshot)
 		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else {
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
@@ -273,27 +273,27 @@ func (h *Handler) handleArtifactMetadata(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  "metadata", // For release artifact or version metadata
 		Name:       "maven-metadata.xml",
 		MediaType:  "text/xml",
 	}
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		if req.Method == http.MethodPut || req.Method == http.MethodPost {
 			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
 			return
 		}
-		h.handleMetadataProxy(w, req, scoped, spec, repoParts)
+		h.handleMetadataProxy(w, req, view, spec, repoParts)
 		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
@@ -307,27 +307,27 @@ func (h *Handler) handleArtifactMetadataSidecar(w http.ResponseWriter, req *http
 		return
 	}
 
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  "metadata",
 		Name:       filename,
 		MediaType:  detectMediaType(filename),
 	}
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		if req.Method == http.MethodPut || req.Method == http.MethodPost {
 			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
 			return
 		}
-		h.handleMetadataSidecarProxy(w, req, scoped, spec, f, repoParts)
+		h.handleMetadataSidecarProxy(w, req, view, spec, f, repoParts)
 		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else {
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
@@ -343,7 +343,7 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	f := &oci.RepoFile{
 		OwningRepo: packageOwningRepo(repoParts),
 		OwningTag:  version,
@@ -357,25 +357,25 @@ func (h *Handler) handleRegularArtifact(w http.ResponseWriter, req *http.Request
 		// registry-level --allow-overwrite default.
 		AllowOverwrite: isSnapshotVersion(version),
 	}
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		if req.Method == http.MethodPut || req.Method == http.MethodPost {
 			http.Error(w, "uploads disabled on proxy namespaces", http.StatusMethodNotAllowed)
 			return
 		}
-		h.handleFileGetProxy(w, req, scoped, spec, f)
+		h.handleFileGetProxy(w, req, view, spec, f)
 		return
 	}
 	if req.Method == http.MethodPut || req.Method == http.MethodPost {
-		h.handlePut(w, req, scoped, f)
+		h.handlePut(w, req, view, f)
 	} else { // GET, HEAD
-		h.handleGet(w, req, scoped, f)
+		h.handleGet(w, req, view, f)
 	}
 }
 
 // handlePut processes PUT/POST requests to add a file.
-func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
+func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, view handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	if h.maxUploadBytes > 0 {
@@ -384,7 +384,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 
 	defer req.Body.Close()
 
-	body, err := h.maybeVerifyChecksum(req, scoped, f)
+	body, err := h.maybeVerifyChecksum(req, view, f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "checksum verification failed", "error", err)
 		if handler.WriteNamespaceError(w, err) {
@@ -406,7 +406,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 		return
 	}
 
-	desc, err := scoped.AddFile(req.Context(), f, body)
+	desc, err := view.AddFile(req.Context(), f, body)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to add file", "error", err)
 		if handler.WriteNamespaceError(w, err) {
@@ -436,9 +436,9 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 // req.ContentLength via f.Size so AddFile keeps its streaming fast path.
 // For checksum filenames it buffers the (always tiny) body, validates it
 // against the previously-uploaded companion artifact (looked up through
-// the per-request scoped artifact view), and returns a reader over the
+// the per-request view artifact view), and returns a reader over the
 // buffered bytes so AddFile still sees an io.Reader.
-func (h *Handler) maybeVerifyChecksum(req *http.Request, scoped handler.Registry, f *oci.RepoFile) (io.Reader, error) {
+func (h *Handler) maybeVerifyChecksum(req *http.Request, view handler.Registry, f *oci.RepoFile) (io.Reader, error) {
 	if ext, _, _ := checksumExt(f.Name); ext == "" {
 		// Forward the HTTP Content-Length so AddFile can short-circuit
 		// the peek-and-decide buffer for sized uploads (mvn deploy
@@ -457,7 +457,7 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, scoped handler.Registry
 		return nil, badRequest("checksum body exceeds %d bytes", maxChecksumBodyBytes)
 	}
 
-	if err := verifyChecksumUpload(req.Context(), scoped, f, body); err != nil {
+	if err := verifyChecksumUpload(req.Context(), view, f, body); err != nil {
 		return nil, err
 	}
 
@@ -465,14 +465,14 @@ func (h *Handler) maybeVerifyChecksum(req *http.Request, scoped handler.Registry
 	return bytes.NewReader(body), nil
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
+func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, view handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	// HEAD wants headers only — never redirect. The redirect path is
 	// only worth taking when the response would otherwise transfer
 	// bytes; HEAD has no egress to save.
 	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+		if redirectURL, err := view.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
 			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return
@@ -485,7 +485,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped han
 		}
 	}
 
-	desc, r, err := scoped.ReadFile(req.Context(), f)
+	desc, r, err := view.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
 		if handler.WriteNamespaceError(w, err) {

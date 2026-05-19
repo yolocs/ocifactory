@@ -132,9 +132,9 @@ func WithMaxUploadBytes(n int64) Option {
 // NewHandler constructs a new npm format handler.
 //
 // artifacts is the data-plane wrapper that hands out per-request
-// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every
+// [*artifact.NamespaceView] views via [artifact.Store.View]. Every
 // routed handler resolves the namespace from the request URL
-// (`/{namespace}/...`) and obtains a scoped view at the top.
+// (`/{namespace}/...`) and obtains a namespace view at the top.
 func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 	if artifacts == nil {
 		return nil, errors.New("artifact store must not be nil")
@@ -156,7 +156,7 @@ func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 
 // Mux returns the npm handler's router. Every npm route lives under
 // `/{namespace}/...` so the handler resolves the namespace from the
-// URL on each request and routes through the namespace-scoped
+// URL on each request and routes through the namespaced
 // artifact view.
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
@@ -204,10 +204,10 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*artifact.ScopedNamespace] for
+// namespaceViewFor returns the per-request [*artifact.NamespaceView] for
 // the namespace in req's URL. Cheap to construct; called per request.
-func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
-	return h.artifacts.For(mux.Vars(req)["namespace"])
+func (h *Handler) namespaceViewFor(req *http.Request) *artifact.NamespaceView {
+	return h.artifacts.View(mux.Vars(req)["namespace"])
 }
 
 func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
@@ -232,8 +232,8 @@ func (h *Handler) handlePing(w http.ResponseWriter, req *http.Request) {
 // behaves as though the feature isn't available.
 func (h *Handler) handleUnsupported(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodDelete {
-		scoped := h.scopedFor(req)
-		if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+		view := h.namespaceViewFor(req)
+		if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 			return
 		} else if isProxy {
 			http.Error(w, "writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
@@ -266,9 +266,9 @@ func (h *Handler) handleUnsupported(w http.ResponseWriter, req *http.Request) {
 func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 
-	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		http.Error(w, "publishes disabled on proxy namespaces", http.StatusMethodNotAllowed)
@@ -455,7 +455,7 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	if err := h.ensureIndexSentinel(ctx, scoped, pkgFromURL); err != nil {
+	if err := h.ensureIndexSentinel(ctx, view, pkgFromURL); err != nil {
 		// Best-effort — the package is published either way. Log
 		// at WARN so the operator notices a systematic problem
 		// (e.g. a permissions error on the index repo) but don't
@@ -486,7 +486,7 @@ func (h *Handler) addFile(ctx context.Context, pkg artifact.Package, version str
 	return true
 }
 
-// writeRegistryError translates a scoped-registry error into a
+// writeRegistryError translates a artifact-view error into a
 // canonical HTTP status. Mirrors the python / maven handler's mapping
 // table so an operator triaging an npm publish sees the same status
 // codes they would for an analogous failure in another format.
@@ -525,7 +525,7 @@ func (h *Handler) writeRegistryError(ctx context.Context, w http.ResponseWriter,
 // back to us, not to npmjs.org.
 func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	pkg := mux.Vars(req)["package"]
 
 	if err := validatePackageName(pkg); err != nil {
@@ -533,10 +533,10 @@ func (h *Handler) handlePackument(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
-		h.handlePackumentProxy(w, req, scoped, spec, pkg)
+		h.handlePackumentProxy(w, req, view, spec, pkg)
 		return
 	}
 
@@ -715,7 +715,7 @@ func (h *Handler) buildPackument(ctx context.Context, req *http.Request, artifac
 // the maven / python file-get flow: try a backend redirect, fall back
 // to streaming through ocifactory.
 func (h *Handler) handleTarballGet(w http.ResponseWriter, req *http.Request) {
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	vars := mux.Vars(req)
 	pkg := vars["package"]
 	filename := vars["filename"]
@@ -741,14 +741,14 @@ func (h *Handler) handleTarballGet(w http.ResponseWriter, req *http.Request) {
 		MediaType:  "application/octet-stream",
 	}
 
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
-		h.handleTarballGetProxy(w, req, scoped, spec, f)
+		h.handleTarballGetProxy(w, req, view, spec, f)
 		return
 	}
 
-	if !h.tryServeTarballFromRegistry(w, req, scoped, f) {
+	if !h.tryServeTarballFromRegistry(w, req, view, f) {
 		http.Error(w, "tarball not found", http.StatusNotFound)
 		return
 	}
@@ -758,17 +758,17 @@ func (h *Handler) handleTarballGet(w http.ResponseWriter, req *http.Request) {
 // alias-target map the same way [handlePackument] does.
 func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	pkg := mux.Vars(req)["package"]
 	if err := validatePackageName(pkg); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if spec, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if spec, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
-		h.handleDistTagListProxy(w, req, scoped, spec, pkg)
+		h.handleDistTagListProxy(w, req, view, spec, pkg)
 		return
 	}
 
@@ -838,12 +838,12 @@ func (h *Handler) handleDistTagList(w http.ResponseWriter, req *http.Request) {
 // Body is a JSON-encoded version string ("1.2.3", quoted).
 func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 	vars := mux.Vars(req)
 	pkg := vars["package"]
 	tag := vars["tag"]
 
-	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		http.Error(w, "dist-tag writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
@@ -909,8 +909,8 @@ func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 // removal is more surface than the v1 issue justifies. Operators
 // re-point unwanted dist-tags to a known version instead.
 func (h *Handler) handleDistTagDelete(w http.ResponseWriter, req *http.Request) {
-	scoped := h.scopedFor(req)
-	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	view := h.namespaceViewFor(req)
+	if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		http.Error(w, "dist-tag writes disabled on proxy namespaces", http.StatusMethodNotAllowed)
@@ -921,8 +921,8 @@ func (h *Handler) handleDistTagDelete(w http.ResponseWriter, req *http.Request) 
 
 // ensureIndexSentinel marks the package name in the per-format
 // namespace index.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *artifact.ScopedNamespace, npmName string) error {
-	return scoped.Index(packageIndexName).Mark(ctx, npmName)
+func (h *Handler) ensureIndexSentinel(ctx context.Context, view *artifact.NamespaceView, npmName string) error {
+	return view.Index(packageIndexName).Mark(ctx, npmName)
 }
 
 // verifyChecksums recomputes the sha1 (dist.shasum) and sha512

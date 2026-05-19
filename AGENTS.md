@@ -77,7 +77,7 @@ HTTP request ──►     │  cmd/ocifactory  (CLI entrypoint)         │
                      └───────────────┬──────────────────────────┘
                                      │ handler.Registry interface
                      ┌───────────────▼──────────────────────────┐
-                     │  pkg/artifact.ScopedNamespace             │
+                     │  pkg/artifact.NamespaceView               │
                      │  • authorizes (read/write) against the    │
                      │    namespace's compiled Policy            │
                      │  • prefixes OwningRepo with <namespace>/  │
@@ -108,13 +108,13 @@ Read that doc before touching the `pkg/oci` write paths.
 ### Key types
 
 - `oci.RepoFile{OwningRepo, OwningTag, RefTag, Name, MediaType, Digest, Size, AllowOverwrite}` — addresses one file inside the OCI-backed virtual store.
-  - `OwningRepo` is the OCI repository name **relative to the namespace** at the handler boundary. Package storage must use the format's `storage.go` codec and live under `packages/<format-specific encoding>` (e.g. `packages/requests`, `packages/com/foo/bar`). Sibling/internal repos such as `archetype`, `ocifactory-packages`, `python-packages`, `npm-packages`, and `_proxy_cache`/`ocifactory-proxy-cache` stay outside `packages/`. The `artifact.ScopedNamespace` wrapper prefixes with `<namespace>/`, and `pkg/oci` may add `--repo-prefix` before that, so the real backend repo can be `<repo-prefix>/<namespace>/packages/requests`.
+  - `OwningRepo` is the OCI repository name **relative to the namespace** at the handler boundary. Package storage must use the format's `storage.go` codec and live under `packages/<format-specific encoding>` (e.g. `packages/requests`, `packages/com/foo/bar`). Sibling/internal repos such as `archetype`, `ocifactory-packages`, `python-packages`, `npm-packages`, and `_proxy_cache`/`ocifactory-proxy-cache` stay outside `packages/`. The `artifact.NamespaceView` wrapper prefixes with `<namespace>/`, and `pkg/oci` may add `--repo-prefix` before that, so the real backend repo can be `<repo-prefix>/<namespace>/packages/requests`.
   - `OwningTag` is the canonical version tag (e.g. `2.31.0`). It identifies the **version manifest** — a constant-size anchor in the [OCI 1.1 referrers layout](docs/architecture/storage-model.md). Files for that version are *not* layers on this manifest; each file is its own **file manifest** with `subject = versionDesc`, addressed via the referrers API and tagged with a deterministic `_f_<sha256>` tag so reads resolve in one round-trip.
   - `RefTag` is an alias tag like `latest`. It identifies an **alias manifest** with `subject = versionDesc` and the canonical version recorded in the `ocifactory.alias.target` annotation.
   - `AllowOverwrite` is a per-file flag handlers set when the file is intentionally mutable (Maven snapshot artifacts, snapshot `maven-metadata.xml`). It overrides the registry-level `--allow-overwrite` default for that one call.
   - The three manifest kinds are distinguished by `artifactType` suffix — `.version`, `.file`, `.alias` — appended to the operator-configured base type (e.g. `application/vnd.ocifactory.python.version`).
-- `handler.Registry` — the interface every per-format handler depends on. Keep it minimal; do not push format-specific concepts into it. Implementations are `*oci.Registry` (raw) and `*artifact.ScopedNamespace` (namespaced + authorized, used in production).
-- `artifact.Store` / `artifact.ScopedNamespace` — the data-plane artifact wrapper. `Store.For(ns)` returns a cheap per-request `ScopedNamespace` that handlers use as their `handler.Registry`. Authorizer instances are cached per namespace (`DefaultPolicyCacheTTL = 60s`) and invalidated automatically when admin-side `namespace.Store.Put` / `namespace.Store.Delete` fires the mutation hook.
+- `handler.Registry` — the interface every per-format handler depends on. Keep it minimal; do not push format-specific concepts into it. Implementations are `*oci.Registry` (raw) and `*artifact.NamespaceView` (namespaced + authorized, used in production).
+- `artifact.Store` / `artifact.NamespaceView` — the data-plane artifact wrapper. `Store.View(ns)` returns a cheap per-request `NamespaceView` that handlers use as their `handler.Registry`. Authorizer instances are cached per namespace (`DefaultPolicyCacheTTL = 60s`) and invalidated automatically when admin-side `namespace.Store.Put` / `namespace.Store.Delete` fires the mutation hook.
 - `namespace.Policy` — the JSON-serialised authz block on a namespace `Spec`. Empty Policy is deny-all. `Readers` and `Writers` are independent `SubjectMatcher` lists; matchers ANDed across fields (`issuer`, `sub_match` regex, `email`, `claims_match`, `kind`).
 - `auth.AuthContext{Issuer, ID, Email, Claims}` — the verified caller identity the OIDC authenticator installs into the request context. The `namespace.PolicyAuthorizer` consumes it; out-of-tree authorizers (OPA / Cedar / Casbin) plug in via `artifact.WithAuthzFactory`.
 - `auth.Authorizer` / `auth.Op` (`OpRead`, `OpWrite`) — the coarse pluggable authz surface every namespace policy compiles to.
@@ -125,10 +125,10 @@ Each `pkg/handler/<format>` package owns:
 - `RepoType` constant (`"npm"`, `"python"`, …) — used by `serve` to dispatch.
 - `ArtifactType` constant — the OCI manifest `artifactType` base (e.g. `application/vnd.ocifactory.npm`). `pkg/oci` appends `.version` / `.file` / `.alias` to it so the three manifest kinds are distinguishable in the OCI backend.
 - `NewHandler(*artifact.Store, opts ...Option) (*Handler, error)` — takes the artifact data-plane wrapper, not a raw `*oci.Registry`, so every request goes through the authorizer.
-- `Mux() http.Handler` — gorilla/mux router for that format's URL scheme. Mount every route on a `router.PathPrefix("/{namespace}").Subrouter()` (or `"/{namespace}/<format-prefix>"`) so the handler can read the namespace from `mux.Vars(req)` and call `r.For(ns)` to get a per-request `*artifact.ScopedNamespace`.
-- Translation logic mapping client protocol calls ↔ `RepoFile` operations through the scoped artifact.
+- `Mux() http.Handler` — gorilla/mux router for that format's URL scheme. Mount every route on a `router.PathPrefix("/{namespace}").Subrouter()` (or `"/{namespace}/<format-prefix>"`) so the handler can read the namespace from `mux.Vars(req)` and call `r.View(ns)` to get a per-request `*artifact.NamespaceView`.
+- Translation logic mapping client protocol calls ↔ `RepoFile` operations through the namespace view.
 
-When adding a new format, copy the structure from `pkg/handler/python` (it's the most complete reference, including the embedded simple index template, the per-package simple-index cache, and the `storage.go` codec + `ScopedNamespace.Index` pattern for fast "list packages").
+When adding a new format, copy the structure from `pkg/handler/python` (it's the most complete reference, including the embedded simple index template, the per-package simple-index cache, and the `storage.go` codec + `NamespaceView.Index` pattern for fast "list packages").
 
 ### Namespace URL layout
 
@@ -143,15 +143,15 @@ single hostname serves multiple formats per namespace:
 | npm    | `/{namespace}/<pkg>`, `/{namespace}/{@scope/name}`, `/{namespace}/-/package/<pkg>/dist-tags/<tag>`, `/{namespace}/-/ping` |
 
 Namespaces have to be created via the [admin API](docs/admin.md) before any
-request can land on them — there is no auto-vivification. `ScopedNamespace`
+request can land on them — there is no auto-vivification. `NamespaceView`
 returns `namespace.ErrNotFound` (mapped to 404 by `handler.WriteNamespaceError`)
 when the namespace's metadata document is missing.
 
 ### Index repos pattern
 
-For formats where you need "list all packages I have" (PyPI simple index, npm registry root, etc.), use `(*artifact.ScopedNamespace).Index("<format>-packages")`. The namespace index primitive owns tag encoding/decoding and stores one sentinel tag per package in a sibling repo outside `packages/`; do not write literal `OwningRepo: "index"` entries from handlers.
+For formats where you need "list all packages I have" (PyPI simple index, npm registry root, etc.), use `(*artifact.NamespaceView).Index("<format>-packages")`. The namespace index primitive owns tag encoding/decoding and stores one sentinel tag per package in a sibling repo outside `packages/`; do not write literal `OwningRepo: "index"` entries from handlers.
 
-Separately, `artifact.Store` itself maintains a per-namespace **package index repo** at `<namespace>/ocifactory-packages` (configurable via `WithPackageIndexSuffix`). It's an in-process LRU-deduped record of every owning-repo the wrapper has written to, used by `admin serve`'s soft-delete to refuse deleting a non-empty namespace. Format handlers don't write to it directly — every `ScopedNamespace.AddFile` call updates it best-effort.
+Separately, `artifact.Store` itself maintains a per-namespace **package index repo** at `<namespace>/ocifactory-packages` (configurable via `WithPackageIndexSuffix`). It's an in-process LRU-deduped record of every owning-repo the wrapper has written to, used by `admin serve`'s soft-delete to refuse deleting a non-empty namespace. Format handlers don't write to it directly — every `NamespaceView.AddFile` call updates it best-effort.
 
 ## Build, run, test
 
@@ -241,10 +241,10 @@ These are non-negotiable. Apply them to every test in the repo:
 1. Create `pkg/handler/<format>/` with `handler.go`, the `Mux()`, and translation logic.
 2. Define `RepoType` and `ArtifactType` constants.
 3. Define a `storage.go` codec module that owns the `packages/<encoding>` mapping. Handlers must call the codec, not construct `OwningRepo` strings inline.
-4. If the format needs package enumeration, use `(*ScopedNamespace).Index("<format>-packages")`; do not write to a literal `OwningRepo: "index"`. If user data must become an OCI tag, use `oci.EncodeTag` / `oci.DecodeTag`.
-5. **Mount every route under a `/{namespace}` sub-router** so the handler can read the namespace from `mux.Vars(req)` and call `registry.For(ns)` to get a per-request `*artifact.ScopedNamespace`. Optionally prefix routes with a per-format segment (`/{namespace}/maven2/...`, `/{namespace}/simple/...`) when the URL would otherwise be ambiguous against another format on the same hostname.
+4. If the format needs package enumeration, use `(*NamespaceView).Index("<format>-packages")`; do not write to a literal `OwningRepo: "index"`. If user data must become an OCI tag, use `oci.EncodeTag` / `oci.DecodeTag`.
+5. **Mount every route under a `/{namespace}` sub-router** so the handler can read the namespace from `mux.Vars(req)` and call `registry.View(ns)` to get a per-request `*artifact.NamespaceView`. Optionally prefix routes with a per-format segment (`/{namespace}/maven2/...`, `/{namespace}/simple/...`) when the URL would otherwise be ambiguous against another format on the same hostname.
 6. **Accept `WithAuthMiddleware(func(http.Handler) http.Handler)` as an Option** and chain the middleware on whichever routes need authentication. The convention today (python, maven, npm) is `router.Use(mux.MiddlewareFunc(h.authMW))` on the root router (python, maven) or on the `/{namespace}` sub-router (npm) so every route is gated. Public-by-default formats (Go module proxy listings, future read-without-token endpoints) would chain on a sub-router and leave reads ungated; outlier endpoints with their own auth contract sit on a sub-router that doesn't chain it at all. **Do not add an open default**: in `pkg/commands/serve.go`, always pass `WithAuthMiddleware(authMW)` when constructing the handler. The handler-side option is permissive (omitting it leaves routes ungated, which is what tests want), so the gate against silent-no-auth lives in serve.go — verify it's wired before merging.
-7. **Take a `*artifact.Store` in `NewHandler`**, not a `*oci.Registry`. Every backend op flows through the scoped view so the namespace's compiled `Policy` runs on every read and write. Map `namespace.ErrNotFound`, `namespace.ErrInvalidName`, `namespace.ErrInvalidOwningRepo`, and `auth.ErrUnauthorized` to HTTP via `handler.WriteNamespaceError` — there's a shared helper because every format needs the same translation.
+7. **Take a `*artifact.Store` in `NewHandler`**, not a `*oci.Registry`. Every backend op flows through the namespace view so the namespace's compiled `Policy` runs on every read and write. Map `namespace.ErrNotFound`, `namespace.ErrInvalidName`, `namespace.ErrInvalidOwningRepo`, and `auth.ErrUnauthorized` to HTTP via `handler.WriteNamespaceError` — there's a shared helper because every format needs the same translation.
 8. Plumb it into `pkg/commands/serve.go`'s `supportedRepoTypes` and the `switch` in `Run`. Build a `namespace.Store` for control-plane metadata and an `artifact.Store` for data-plane access next to the format-specific `*oci.Registry`, then pass the artifact store to the handler constructor along with `WithAuthMiddleware(authMW)`.
 9. Add handler tests using the `oci.fake` backend (cover happy path + 404 + auth errors at minimum). Add a `pkg/handler/<format>/auth_test.go` that mirrors `pkg/handler/python/auth_test.go`: a deny-all middleware reaches every route, omitting the option leaves routes ungated, and the middleware chains before the route handler runs. Add a `pkg/handler/<format>/namespace_test.go` mirroring `pkg/handler/python/namespace_test.go`: unknown namespace → 404, deny-all policy → 403, cross-namespace request can't reach another namespace's data.
 10. Add an integration test or a documented manual test against a real client (`pip`, `mvn`, `npm install`, `go mod download`, `apt-get`). The harness in `pkg/handler/integrationtest/` seeds a `default` namespace via `Store.Put` before the subprocess starts; copy that pattern.

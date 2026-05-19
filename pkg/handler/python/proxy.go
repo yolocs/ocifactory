@@ -183,8 +183,8 @@ func (p *proxyState) fetcherFor(upstream string) (ProxyFetcher, error) {
 // namespace and whether the request should be served via the proxy
 // path. When the namespace is unknown or malformed, it writes the
 // matching error response and returns ok=false so the caller stops.
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
-	spec, err := scoped.Spec(req.Context())
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView) (*namespace.Spec, bool, bool) {
+	spec, err := view.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return nil, false, false
@@ -210,14 +210,14 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 //
 // Concurrent first-misses for the same (ns, pkg, version, filename)
 // collapse onto one upstream fetch via the file-singleflight group.
-func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
 	// Cache-hit fast path. ReadFile authorizes for read and serves
 	// from OCI just like the hosted path; on miss we bubble through
 	// to the upstream resolver.
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 
@@ -226,7 +226,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	filename := f.Name
 
 	if h.proxy.negCache != nil {
-		negKey := negativeKey(scoped.Namespace(), pkg, version, filename)
+		negKey := negativeKey(view.Namespace(), pkg, version, filename)
 		if h.proxy.negCache.IsKnownMissing(negKey) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -266,7 +266,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	// and simultaneously tees the bytes onto its own ResponseWriter.
 	// Followers observe a "streamed" outcome and re-read the now-cached
 	// file from OCI to serve their own clients.
-	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
+	key := view.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
 	isHead := req.Method == http.MethodHead
 	amLeader := false
 	// teeRef captures the leader's tee writer so the outer error branch
@@ -282,7 +282,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 
 		// Re-check the registry inside the singleflight — a peer
 		// may have populated the cache while we were waiting.
-		if hit, hitErr := h.peekRegistry(ctx, scoped, f); hitErr == nil && hit {
+		if hit, hitErr := h.peekRegistry(ctx, view, f); hitErr == nil && hit {
 			return fileFlightResult{cached: true}, nil
 		}
 
@@ -377,7 +377,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		// before singleflight could; probeExistingFile reports it
 		// before reading the body, so no client bytes were written and
 		// the follower path can serve from the cache the peer wrote.
-		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
+		if _, addErr := view.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
@@ -403,7 +403,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
 			if h.proxy.negCache != nil {
-				h.proxy.negCache.RecordMiss(negativeKey(scoped.Namespace(), pkg, version, filename))
+				h.proxy.negCache.RecordMiss(negativeKey(view.Namespace(), pkg, version, filename))
 			}
 			http.Error(w, "not found", http.StatusNotFound)
 		case errors.Is(err, proxy.ErrUpstreamMalformed):
@@ -434,7 +434,7 @@ func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, s
 	// HEAD that needs the headers written, or we hit ErrAlreadyExists
 	// mid-flight. All three serve the canonical headers + body from
 	// the cache the leader just populated.
-	if h.tryServeFromRegistry(w, req, scoped, f) {
+	if h.tryServeFromRegistry(w, req, view, f) {
 		return
 	}
 	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
@@ -494,8 +494,8 @@ type fileFlightResult struct {
 // "peer wrote the file, re-serve from cache" and "peer failed, do
 // our own fetch". Returns (true, nil) on hit, (false, nil) on miss,
 // non-nil error on backend trouble.
-func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
-	desc, rc, err := scoped.ReadFile(ctx, f)
+func (h *Handler) peekRegistry(ctx context.Context, view *artifact.NamespaceView, f *oci.RepoFile) (bool, error) {
+	desc, rc, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false, nil
@@ -511,12 +511,12 @@ func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNames
 // flow. Returns true on success (response written), false on miss so
 // the caller continues with the proxy fetch. Errors other than
 // not-found are written as the appropriate HTTP status and return true.
-func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
+func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
 	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
+		if redirectURL, err := view.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return true
 		} else if err != nil {
@@ -524,7 +524,7 @@ func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request,
 		}
 	}
 
-	desc, r, err := scoped.ReadFile(ctx, f)
+	desc, r, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false
@@ -571,21 +571,21 @@ func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request,
 //
 // Concurrent refreshes for the same (namespace, pkg) collapse onto
 // one upstream fetch via the index-singleflight group.
-func (h *Handler) handlePackageIndexProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
-	h.serveProxyIndex(w, req, scoped, spec, pkg)
+func (h *Handler) handlePackageIndexProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, pkg string) {
+	h.serveProxyIndex(w, req, view, spec, pkg)
 }
 
 // handleSimpleIndexProxy serves /{ns}/simple/ in proxy mode. Same
 // flow as the per-package path with cache key pkg="" and synthesis
 // fallback through the per-format namespace index.
-func (h *Handler) handleSimpleIndexProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec) {
-	h.serveProxyIndex(w, req, scoped, spec, "")
+func (h *Handler) handleSimpleIndexProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec) {
+	h.serveProxyIndex(w, req, view, spec, "")
 }
 
-func (h *Handler) serveProxyIndex(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
+func (h *Handler) serveProxyIndex(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
-	ns := scoped.Namespace()
+	ns := view.Namespace()
 	cacheKey := ns + "|" + pkg
 
 	// L1 in-memory cache fast path.
@@ -688,7 +688,7 @@ func (h *Handler) serveProxyIndex(w http.ResponseWriter, req *http.Request, scop
 		return
 	}
 
-	h.synthesizeIndex(w, req, scoped, pkg, err)
+	h.synthesizeIndex(w, req, view, pkg, err)
 }
 
 type indexFlightResult struct {
@@ -706,13 +706,13 @@ type indexFlightResult struct {
 // (namespace, package) either — 503, since serving a literal empty
 // index would have pip conclude the package was unyanked, which is
 // worse than a clear "we're degraded" signal.
-func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, pkg string, upstreamErr error) {
+func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, pkg string, upstreamErr error) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
-	ns := scoped.Namespace()
+	ns := view.Namespace()
 
 	if pkg == "" {
-		tags, err := scoped.Index(packageIndexName).List(ctx)
+		tags, err := view.Index(packageIndexName).List(ctx)
 		if err != nil {
 			handler.WriteError(ctx, w, http.StatusServiceUnavailable, upstreamErr,
 				fmt.Sprintf("upstream unavailable and synthesis failed: %v", err))
@@ -742,7 +742,7 @@ func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, scop
 		return
 	}
 
-	files, err := h.resolvePackageFiles(ctx, scoped, pkg)
+	files, err := h.resolvePackageFiles(ctx, view, pkg)
 	if err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		handler.WriteError(ctx, w, http.StatusServiceUnavailable, upstreamErr,
 			fmt.Sprintf("upstream unavailable and synthesis failed: %v", err))

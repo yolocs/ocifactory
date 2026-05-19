@@ -162,8 +162,8 @@ func WithProxyL1IndexCacheTTL(d time.Duration) Option {
 	return func(c *handlerConfig) { c.proxyL1IndexCacheTTL = d }
 }
 
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
-	spec, err := scoped.Spec(req.Context())
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView) (*namespace.Spec, bool, bool) {
+	spec, err := view.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return nil, false, false
@@ -175,9 +175,9 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 	return spec, isProxy, true
 }
 
-func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
+func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
-	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
+	if err := view.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return
 		}
@@ -185,7 +185,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	result, err := h.loadPackumentProxy(ctx, scoped, spec, pkg)
+	result, err := h.loadPackumentProxy(ctx, view, spec, pkg)
 	if err == nil {
 		writeProxyPackumentBody(w, req, result.body, result.contentType)
 		return
@@ -203,12 +203,12 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "proxy fetcher unavailable")
 		return
 	}
-	h.synthesizePackument(w, req, scoped, pkg, err)
+	h.synthesizePackument(w, req, view, pkg, err)
 }
 
-func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
+func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
-	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
+	if err := view.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return
 		}
@@ -216,7 +216,7 @@ func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	result, err := h.loadPackumentProxy(ctx, scoped, spec, pkg)
+	result, err := h.loadPackumentProxy(ctx, view, spec, pkg)
 	if err != nil {
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
@@ -251,9 +251,9 @@ type proxyPackumentResult struct {
 	contentType string
 }
 
-func (h *Handler) loadPackumentProxy(ctx context.Context, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) (proxyPackumentResult, error) {
+func (h *Handler) loadPackumentProxy(ctx context.Context, view *artifact.NamespaceView, spec *namespace.Spec, pkg string) (proxyPackumentResult, error) {
 	logger := logging.FromContext(ctx)
-	ns := scoped.Namespace()
+	ns := view.Namespace()
 	cacheKey := ns + "|" + pkg
 	indexKey := proxyIndexCacheKey(pkg)
 
@@ -334,7 +334,7 @@ type indexFlightResult struct {
 	contentType string
 }
 
-func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, _ *artifact.ScopedNamespace, pkg string, upstreamErr error) {
+func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, _ *artifact.NamespaceView, pkg string, upstreamErr error) {
 	ctx := req.Context()
 	artifactNS, nsErr := h.artifactNamespaceFor(req)
 	if nsErr != nil {
@@ -359,11 +359,11 @@ func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, 
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
-	if h.tryServeTarballFromRegistry(w, req, scoped, f) {
+	if h.tryServeTarballFromRegistry(w, req, view, f) {
 		return
 	}
 
@@ -376,7 +376,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 	filename := f.Name
 
 	if h.proxy.negCache != nil {
-		key := negativeKey(scoped.Namespace(), pkg, version, filename)
+		key := negativeKey(view.Namespace(), pkg, version, filename)
 		if h.proxy.negCache.IsKnownMissing(key) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -400,13 +400,13 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	key := scoped.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
+	key := view.Namespace() + "|" + f.OwningRepo + "|" + version + "|" + filename
 	isHead := req.Method == http.MethodHead
 	amLeader := false
 	var teeRef *tolerantWriter
 	resultV, err, _ := h.proxy.fileFlight.Do(key, func() (any, error) {
 		amLeader = true
-		if hit, hitErr := h.peekTarball(ctx, scoped, f); hitErr == nil && hit {
+		if hit, hitErr := h.peekTarball(ctx, view, f); hitErr == nil && hit {
 			return fileFlightResult{cached: true}, nil
 		}
 
@@ -427,7 +427,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 		var rewrittenPackument []byte
 		packumentContentType := resp.PackumentContentType
 		if resp.Packument != nil {
-			if body, rerr := proxynpm.RewritePackument(resp.Packument, scoped.Namespace(), pkg); rerr == nil {
+			if body, rerr := proxynpm.RewritePackument(resp.Packument, view.Namespace(), pkg); rerr == nil {
 				rewrittenPackument = body
 			} else {
 				logger.DebugContext(ctx, "npm packument rewrite during tarball fill failed", "error", rerr)
@@ -450,14 +450,14 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 			teeRef = &tolerantWriter{w: w}
 			body = io.TeeReader(body, teeRef)
 		}
-		if _, addErr := scoped.AddCachedFile(ctx, populated, body); addErr != nil {
+		if _, addErr := view.AddCachedFile(ctx, populated, body); addErr != nil {
 			if errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{cached: true}, nil
 			}
 			return fileFlightResult{}, addErr
 		}
 		if len(rewrittenPackument) > 0 {
-			h.cachePackument(ctx, scoped.Namespace(), pkg, rewrittenPackument, packumentContentType)
+			h.cachePackument(ctx, view.Namespace(), pkg, rewrittenPackument, packumentContentType)
 		}
 		if len(resp.Version) > 0 {
 			metaRF := &oci.RepoFile{
@@ -467,11 +467,11 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 				MediaType:  "application/json",
 				Size:       int64(len(resp.Version)),
 			}
-			if _, addErr := scoped.AddCachedFile(ctx, metaRF, bytes.NewReader(resp.Version)); addErr != nil && !errors.Is(addErr, oci.ErrAlreadyExists) {
+			if _, addErr := view.AddCachedFile(ctx, metaRF, bytes.NewReader(resp.Version)); addErr != nil && !errors.Is(addErr, oci.ErrAlreadyExists) {
 				return fileFlightResult{}, addErr
 			}
 		}
-		if err := h.ensureIndexSentinel(ctx, scoped, pkg); err != nil {
+		if err := h.ensureIndexSentinel(ctx, view, pkg); err != nil {
 			logger.DebugContext(ctx, "npm proxy index sentinel write failed", "error", err)
 		}
 		return fileFlightResult{streamed: true}, nil
@@ -485,7 +485,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 		switch {
 		case errors.Is(err, proxy.ErrNotFound):
 			if h.proxy.negCache != nil {
-				h.proxy.negCache.RecordMiss(negativeKey(scoped.Namespace(), pkg, version, filename))
+				h.proxy.negCache.RecordMiss(negativeKey(view.Namespace(), pkg, version, filename))
 			}
 			http.Error(w, "not found", http.StatusNotFound)
 		case errors.Is(err, proxy.ErrUpstreamMalformed):
@@ -509,7 +509,7 @@ func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request
 	if result.streamed && amLeader && !isHead {
 		return
 	}
-	if h.tryServeTarballFromRegistry(w, req, scoped, f) {
+	if h.tryServeTarballFromRegistry(w, req, view, f) {
 		return
 	}
 	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
@@ -551,8 +551,8 @@ type fileFlightResult struct {
 	filterName string
 }
 
-func (h *Handler) peekTarball(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
-	_, rc, err := scoped.ReadFile(ctx, f)
+func (h *Handler) peekTarball(ctx context.Context, view *artifact.NamespaceView, f *oci.RepoFile) (bool, error) {
+	_, rc, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false, nil
@@ -563,18 +563,18 @@ func (h *Handler) peekTarball(ctx context.Context, scoped *artifact.ScopedNamesp
 	return true, nil
 }
 
-func (h *Handler) tryServeTarballFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
+func (h *Handler) tryServeTarballFromRegistry(w http.ResponseWriter, req *http.Request, view *artifact.NamespaceView, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
+		if redirectURL, err := view.BlobRedirectURL(ctx, f); err == nil && redirectURL != "" {
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return true
 		} else if err != nil {
 			logger.DebugContext(ctx, "npm tarball redirect probe failed; streaming", "error", err)
 		}
 	}
-	desc, rc, err := scoped.ReadFile(ctx, f)
+	desc, rc, err := view.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false

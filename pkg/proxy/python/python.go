@@ -12,7 +12,7 @@
 // pointed at (typically files.pythonhosted.org). The fetcher does not
 // know about OCI: it returns response bodies and the caller (the
 // python handler's proxy path) tees them through
-// [pkg/artifact.ScopedNamespace.AddFile] while serving the client.
+// [pkg/artifact.NamespaceView.AddFile] while serving the client.
 //
 // There is no shared Fetcher interface — see the design issue
 // (#118) for why. The handler holds a concrete *Fetcher and calls the

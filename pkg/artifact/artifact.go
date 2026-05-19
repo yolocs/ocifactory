@@ -10,7 +10,7 @@ import (
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// Namespace is a namespace-scoped view of artifact storage.
+// Namespace is the handler-facing view of artifact storage inside one namespace.
 type Namespace interface {
 	Name() string
 	Spec(ctx context.Context) (*namespace.Spec, error)

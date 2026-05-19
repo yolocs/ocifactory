@@ -104,18 +104,18 @@ type NamespaceStore interface {
 // Store is the data-plane wrapper that holds the cross-namespace
 // state — the authorizer cache, the package-index dedupe set, the
 // pluggable authz factory — and hands out per-namespace
-// [ScopedNamespace] views via [Store.For].
+// [NamespaceView] views via [Store.View].
 //
 // Handlers don't use *Store directly; they hold a
-// *ScopedNamespace obtained per request:
+// *NamespaceView obtained per request:
 //
 //	ns := mux.Vars(req)["namespace"]
-//	scoped := r.For(ns)
-//	desc, err := scoped.AddFile(ctx, f, body)
+//	view := r.View(ns)
+//	desc, err := view.AddFile(ctx, f, body)
 //
-// *ScopedNamespace implements the existing [pkg/handler.Registry]
+// *NamespaceView implements the existing [pkg/handler.Registry]
 // interface, so handlers can swap a *pkg/oci.Registry for a
-// *ScopedNamespace without changing any call site — namespace-aware
+// *NamespaceView without changing any call site — namespace-aware
 // authz and OwningRepo prefixing happen transparently.
 type Store struct {
 	inner       Backend
@@ -199,21 +199,21 @@ func NewStore(inner Backend, namespaces NamespaceStore, opts ...StoreOption) *St
 // Namespace returns a handler-facing namespace after validating that the
 // namespace metadata exists.
 func (r *Store) Namespace(ctx context.Context, name string) (Namespace, error) {
-	scoped := r.For(name)
-	if _, err := scoped.Spec(ctx); err != nil {
+	view := r.View(name)
+	if _, err := view.Spec(ctx); err != nil {
 		return nil, err
 	}
-	return artifactNamespace{scoped: scoped}, nil
+	return artifactNamespace{view: view}, nil
 }
 
-// For returns a [ScopedNamespace] bound to namespace. The returned
+// View returns a [NamespaceView] bound to namespace. The returned
 // view is cheap to construct (a small struct, no I/O) so handlers
 // should call it per request rather than caching it. The bound
 // namespace is enforced on every method invocation — there is no
 // way to issue a cross-namespace operation through a single
-// ScopedNamespace.
-func (r *Store) For(namespace string) *ScopedNamespace {
-	return &ScopedNamespace{parent: r, namespace: namespace}
+// NamespaceView.
+func (r *Store) View(namespace string) *NamespaceView {
+	return &NamespaceView{parent: r, namespace: namespace}
 }
 
 // InvalidatePolicy drops the cached authorizer for name so the next
@@ -251,7 +251,7 @@ func (r *Store) authorize(ctx context.Context, namespace string, op auth.Op) err
 }
 
 // specFor is the cache-aware single-namespace lookup that
-// [Store.authorizerFor] and [ScopedNamespace.Spec] funnel through.
+// [Store.authorizerFor] and [NamespaceView.Spec] funnel through.
 // On a hit it returns the cached entry without any I/O; on a miss it
 // resolves through the shared singleflight so concurrent callers
 // observe one [Store.Get] + authorizer compile.
@@ -350,43 +350,43 @@ func (r *Store) packageIndexRepo(namespace string) string {
 // NamespaceIndex is a tag-backed sibling repository inside one
 // namespace. Tags are encoded keys; callers see only decoded keys.
 type NamespaceIndex struct {
-	scoped *ScopedNamespace
-	name   string
+	view *NamespaceView
+	name string
 }
 
-// ScopedNamespace is a per-namespace view of a [Store]. Every
+// NamespaceView is a per-namespace view of a [Store]. Every
 // method authorizes the bound namespace, prefixes OwningRepo (or the
 // raw repo string for ListTags/ListFiles/etc.) with it, and forwards
 // to the underlying OCI backend.
 //
 // The struct is intentionally cheap to construct — it carries a
 // pointer to the parent and a string. Handlers obtain one per
-// request via [Store.For] and discard it when the request
+// request via [Store.View] and discard it when the request
 // finishes.
 //
-// *ScopedNamespace implements the existing [pkg/handler.Registry]
+// *NamespaceView implements the existing [pkg/handler.Registry]
 // interface so handler code that previously held a *pkg/oci.Registry
-// can swap to a *ScopedNamespace with no signature changes.
-type ScopedNamespace struct {
+// can swap to a *NamespaceView with no signature changes.
+type NamespaceView struct {
 	parent    *Store
 	namespace string
 }
 
 // Namespace returns the bound namespace name.
-func (s *ScopedNamespace) Namespace() string { return s.namespace }
+func (s *NamespaceView) Namespace() string { return s.namespace }
 
 // Index returns a handle to a named namespace-local sentinel index.
 // The index name is a single repo segment such as "python-packages";
 // the backing repo lives beside package repos at "<namespace>/<name>".
-func (s *ScopedNamespace) Index(name string) *NamespaceIndex {
-	return &NamespaceIndex{scoped: s, name: name}
+func (s *NamespaceView) Index(name string) *NamespaceIndex {
+	return &NamespaceIndex{view: s, name: name}
 }
 
 // Authorize checks whether the request context's authenticated
 // subject may perform op in the bound namespace. Format handlers use
 // this for protocol paths that don't naturally map to a concrete OCI
 // read/write operation before returning data.
-func (s *ScopedNamespace) Authorize(ctx context.Context, op auth.Op) error {
+func (s *NamespaceView) Authorize(ctx context.Context, op auth.Op) error {
 	return s.parent.authorize(ctx, s.namespace, op)
 }
 
@@ -401,7 +401,7 @@ func (s *ScopedNamespace) Authorize(ctx context.Context, op auth.Op) error {
 // Spec does not authorize: the namespace's compiled authorizer still
 // runs on downstream [AddFile] / [ReadFile] / [ListFiles] / etc., so
 // the dispatch primitive does not become an auth bypass.
-func (s *ScopedNamespace) Spec(ctx context.Context) (*nsmeta.Spec, error) {
+func (s *NamespaceView) Spec(ctx context.Context) (*nsmeta.Spec, error) {
 	cp, err := s.parent.specFor(ctx, s.namespace)
 	if err != nil {
 		return nil, err
@@ -413,18 +413,18 @@ func (s *ScopedNamespace) Spec(ctx context.Context) (*nsmeta.Spec, error) {
 // f.OwningRepo with the namespace, forwards to the inner registry,
 // and (best-effort) records the owning-repo in the namespace's
 // package index.
-func (s *ScopedNamespace) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+func (s *NamespaceView) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
 	if f == nil {
 		return nil, errors.New("RepoFile must not be nil")
 	}
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return nil, err
 	}
-	scoped, err := s.parent.scopedFile(s.namespace, f)
+	backendFile, err := s.parent.backendFile(s.namespace, f)
 	if err != nil {
 		return nil, err
 	}
-	desc, err := s.parent.inner.AddFile(ctx, scoped, body)
+	desc, err := s.parent.inner.AddFile(ctx, backendFile, body)
 	if err != nil {
 		return nil, err
 	}
@@ -437,18 +437,18 @@ func (s *ScopedNamespace) AddFile(ctx context.Context, f *oci.RepoFile, body io.
 // publish APIs must continue to call AddFile so namespace write policy
 // gates real artifact writes, while pull-through proxy cache misses can
 // populate OCI storage for readers without granting them publish rights.
-func (s *ScopedNamespace) AddCachedFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+func (s *NamespaceView) AddCachedFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
 	if f == nil {
 		return nil, errors.New("RepoFile must not be nil")
 	}
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	scoped, err := s.parent.scopedFile(s.namespace, f)
+	backendFile, err := s.parent.backendFile(s.namespace, f)
 	if err != nil {
 		return nil, err
 	}
-	desc, err := s.parent.inner.AddFile(ctx, scoped, body)
+	desc, err := s.parent.inner.AddFile(ctx, backendFile, body)
 	if err != nil {
 		return nil, err
 	}
@@ -458,62 +458,62 @@ func (s *ScopedNamespace) AddCachedFile(ctx context.Context, f *oci.RepoFile, bo
 
 // ReadFile authorizes the bound namespace for read and forwards to
 // the inner registry with OwningRepo prefixed.
-func (s *ScopedNamespace) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
+func (s *NamespaceView) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
 	if f == nil {
 		return nil, nil, errors.New("RepoFile must not be nil")
 	}
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, nil, err
 	}
-	scoped, err := s.parent.scopedFile(s.namespace, f)
+	backendFile, err := s.parent.backendFile(s.namespace, f)
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.parent.inner.ReadFile(ctx, scoped)
+	return s.parent.inner.ReadFile(ctx, backendFile)
 }
 
 // BlobRedirectURL authorizes the bound namespace for read and
 // forwards to the inner registry with OwningRepo prefixed. Returns
 // ("", nil) when the backend serves blobs inline, mirroring
-// [oci.Store].
-func (s *ScopedNamespace) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
+// [oci.Registry].
+func (s *NamespaceView) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
 	if f == nil {
 		return "", errors.New("RepoFile must not be nil")
 	}
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return "", err
 	}
-	scoped, err := s.parent.scopedFile(s.namespace, f)
+	backendFile, err := s.parent.backendFile(s.namespace, f)
 	if err != nil {
 		return "", err
 	}
-	return s.parent.inner.BlobRedirectURL(ctx, scoped)
+	return s.parent.inner.BlobRedirectURL(ctx, backendFile)
 }
 
 // ListTags authorizes the bound namespace for read and returns the
 // canonical tags for repo within the namespace.
-func (s *ScopedNamespace) ListTags(ctx context.Context, repo string) ([]string, error) {
+func (s *NamespaceView) ListTags(ctx context.Context, repo string) ([]string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	backendRepo, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return nil, err
 	}
-	return s.parent.inner.ListTags(ctx, scoped)
+	return s.parent.inner.ListTags(ctx, backendRepo)
 }
 
 // ResolveTag authorizes the bound namespace for read and returns the
 // canonical version tag identified by tag within repo.
-func (s *ScopedNamespace) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+func (s *NamespaceView) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return "", err
 	}
-	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	backendRepo, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return "", err
 	}
-	return s.parent.inner.ResolveTag(ctx, scoped, tag)
+	return s.parent.inner.ResolveTag(ctx, backendRepo, tag)
 }
 
 // ListFiles authorizes the bound namespace for read and returns
@@ -523,15 +523,15 @@ func (s *ScopedNamespace) ResolveTag(ctx context.Context, repo, tag string) (str
 // the raw backend prefix leak through. Each returned *RepoFile is
 // freshly allocated by the wrapper so a future inner-side cache of
 // descriptors stays safe.
-func (s *ScopedNamespace) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
+func (s *NamespaceView) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	backendRepo, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return nil, err
 	}
-	files, err := s.parent.inner.ListFiles(ctx, scoped)
+	files, err := s.parent.inner.ListFiles(ctx, backendRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +562,7 @@ func (r *Store) ListPackages(ctx context.Context, namespace string) ([]string, e
 
 // ListPackages authorizes the bound namespace for read and returns
 // package-index entries for that namespace.
-func (s *ScopedNamespace) ListPackages(ctx context.Context) ([]string, error) {
+func (s *NamespaceView) ListPackages(ctx context.Context) ([]string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
@@ -575,18 +575,18 @@ func (r *Store) listPackages(ctx context.Context, namespace string) ([]string, e
 
 // AppendRefs authorizes the bound namespace for write and forwards
 // to the inner registry with repo prefixed.
-func (s *ScopedNamespace) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+func (s *NamespaceView) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
 	if canonicalTag == "" {
 		return errors.New("canonicalTag must not be empty")
 	}
-	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	backendRepo, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return err
 	}
-	return s.parent.inner.AppendRefs(ctx, scoped, canonicalTag, refs...)
+	return s.parent.inner.AppendRefs(ctx, backendRepo, canonicalTag, refs...)
 }
 
 // DeleteRepoFiles authorizes the bound namespace for write and
@@ -595,15 +595,15 @@ func (s *ScopedNamespace) AppendRefs(ctx context.Context, repo string, canonical
 // both the in-process indexed marker AND the backend index tag — so
 // [ListPackages] no longer reports the now-empty repo. Index cleanup
 // failures are logged at WARN and do not fail the call.
-func (s *ScopedNamespace) DeleteRepoFiles(ctx context.Context, repo string) error {
+func (s *NamespaceView) DeleteRepoFiles(ctx context.Context, repo string) error {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
-	scoped, err := s.parent.resolveRepo(s.namespace, repo)
+	backendRepo, err := s.parent.resolveRepo(s.namespace, repo)
 	if err != nil {
 		return err
 	}
-	if err := s.parent.inner.DeleteRepoFiles(ctx, scoped); err != nil {
+	if err := s.parent.inner.DeleteRepoFiles(ctx, backendRepo); err != nil {
 		return err
 	}
 	s.parent.indexed.Remove(indexedKey(s.namespace, repo))
@@ -624,17 +624,17 @@ func (s *ScopedNamespace) DeleteRepoFiles(ctx context.Context, repo string) erro
 	return nil
 }
 
-// scopedFile returns a copy of f with OwningRepo rewritten to the
+// backendFile returns a copy of f with OwningRepo rewritten to the
 // namespace-prefixed backend form. Returns [namespace.ErrInvalidOwningRepo]
 // when the input would escape the namespace.
-func (r *Store) scopedFile(namespace string, f *oci.RepoFile) (*oci.RepoFile, error) {
-	scoped := *f
+func (r *Store) backendFile(namespace string, f *oci.RepoFile) (*oci.RepoFile, error) {
+	copyF := *f
 	resolved, err := r.resolveRepo(namespace, f.OwningRepo)
 	if err != nil {
 		return nil, err
 	}
-	scoped.OwningRepo = resolved
-	return &scoped, nil
+	copyF.OwningRepo = resolved
+	return &copyF, nil
 }
 
 // recordPackage best-effort marks owningRepo as present in the
@@ -683,28 +683,28 @@ func (r *Store) recordPackage(ctx context.Context, namespace, owningRepo string)
 
 // Mark records key in the index.
 func (i *NamespaceIndex) Mark(ctx context.Context, key string) error {
-	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpWrite); err != nil {
+	if err := i.view.parent.authorize(ctx, i.view.namespace, auth.OpWrite); err != nil {
 		return err
 	}
-	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+	if err := i.view.parent.validatePublicIndexName(i.name); err != nil {
 		return err
 	}
-	return i.scoped.parent.markIndex(ctx, i.scoped.namespace, i.name, key)
+	return i.view.parent.markIndex(ctx, i.view.namespace, i.name, key)
 }
 
 // Unmark removes key from the index. Missing keys are a no-op.
 func (i *NamespaceIndex) Unmark(ctx context.Context, key string) error {
-	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpWrite); err != nil {
+	if err := i.view.parent.authorize(ctx, i.view.namespace, auth.OpWrite); err != nil {
 		return err
 	}
-	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+	if err := i.view.parent.validatePublicIndexName(i.name); err != nil {
 		return err
 	}
 	encoded, err := oci.EncodeTag(key)
 	if err != nil {
 		return err
 	}
-	if err := i.scoped.parent.inner.DeleteTagFiles(ctx, path.Join(i.scoped.namespace, i.name), encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
+	if err := i.view.parent.inner.DeleteTagFiles(ctx, path.Join(i.view.namespace, i.name), encoded); err != nil && !errors.Is(err, errdef.ErrNotFound) {
 		return err
 	}
 	return nil
@@ -712,17 +712,17 @@ func (i *NamespaceIndex) Unmark(ctx context.Context, key string) error {
 
 // Has reports whether key is present in the index.
 func (i *NamespaceIndex) Has(ctx context.Context, key string) (bool, error) {
-	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpRead); err != nil {
+	if err := i.view.parent.authorize(ctx, i.view.namespace, auth.OpRead); err != nil {
 		return false, err
 	}
-	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+	if err := i.view.parent.validatePublicIndexName(i.name); err != nil {
 		return false, err
 	}
 	encoded, err := oci.EncodeTag(key)
 	if err != nil {
 		return false, err
 	}
-	tags, err := i.scoped.parent.inner.ListTags(ctx, path.Join(i.scoped.namespace, i.name))
+	tags, err := i.view.parent.inner.ListTags(ctx, path.Join(i.view.namespace, i.name))
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return false, nil
@@ -739,13 +739,13 @@ func (i *NamespaceIndex) Has(ctx context.Context, key string) (bool, error) {
 
 // List returns all decoded keys in the index.
 func (i *NamespaceIndex) List(ctx context.Context) ([]string, error) {
-	if err := i.scoped.parent.authorize(ctx, i.scoped.namespace, auth.OpRead); err != nil {
+	if err := i.view.parent.authorize(ctx, i.view.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
-	if err := i.scoped.parent.validatePublicIndexName(i.name); err != nil {
+	if err := i.view.parent.validatePublicIndexName(i.name); err != nil {
 		return nil, err
 	}
-	return i.scoped.parent.listIndex(ctx, i.scoped.namespace, i.name)
+	return i.view.parent.listIndex(ctx, i.view.namespace, i.name)
 }
 
 func (r *Store) markIndex(ctx context.Context, namespace, indexName, key string) error {

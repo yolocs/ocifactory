@@ -196,9 +196,9 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 // NewHandler creates a new Handler.
 //
 // artifacts is the data-plane wrapper that hands out per-request
-// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every routed
+// [*artifact.NamespaceView] views via [artifact.Store.View]. Every routed
 // handler func resolves the namespace from the request URL
-// (`/{namespace}/...`) and obtains a scoped view at the top — call
+// (`/{namespace}/...`) and obtains a view view at the top — call
 // sites otherwise stay identical to the pre-namespace code.
 func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
@@ -227,7 +227,7 @@ func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 //
 // Every route lives under a `/{namespace}` subrouter so the handler
 // resolves the namespace from the URL on each request and routes the
-// backend op through the namespace-scoped artifact view. The leading
+// backend op through the namespace-view artifact view. The leading
 // segment is rejected by [namespace.ValidateName] at namespace-Put
 // time, not here — a request to an unregistered namespace produces a
 // 404 from the wrapper.
@@ -266,12 +266,12 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*artifact.ScopedNamespace] for
+// namespaceViewFor returns the per-request [*artifact.NamespaceView] for
 // the namespace in req's URL. The view is cheap to construct (a small
 // struct, no I/O) so handlers obtain it per call rather than caching
 // across requests.
-func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
-	return h.artifacts.For(mux.Vars(req)["namespace"])
+func (h *Handler) namespaceViewFor(req *http.Request) *artifact.NamespaceView {
+	return h.artifacts.View(mux.Vars(req)["namespace"])
 }
 
 func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
@@ -282,16 +282,16 @@ func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, e
 // package the registry knows about. The namespace index carries one
 // tag per already-normalized package name.
 func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
-	scoped := h.scopedFor(req)
-	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	view := h.namespaceViewFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, view)
 	if !ok {
 		return
 	}
 	if isProxy {
-		h.handleSimpleIndexProxy(w, req, scoped, spec)
+		h.handleSimpleIndexProxy(w, req, view, spec)
 		return
 	}
-	tags, err := scoped.Index(packageIndexName).List(req.Context())
+	tags, err := view.Index(packageIndexName).List(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
 			return
@@ -336,13 +336,13 @@ func (h *Handler) handleSimpleIndex(w http.ResponseWriter, req *http.Request) {
 func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
-	scoped := h.scopedFor(req)
+	view := h.namespaceViewFor(req)
 
 	// Upload onto a proxy namespace is not meaningful — proxy
 	// caches fill on read, not via twine. Reject early with 405 so
 	// clients fail fast instead of confusing the multipart walker
 	// with an authentication or storage failure.
-	if _, isProxy, ok := h.dispatchProxy(w, req, scoped); !ok {
+	if _, isProxy, ok := h.dispatchProxy(w, req, view); !ok {
 		return
 	} else if isProxy {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -476,7 +476,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 	// same call /simple/ already makes on the read side), so we
 	// trade an extra round-trip per upload for a clean immutable
 	// AddFile contract.
-	if err := h.ensureIndexSentinel(ctx, scoped, normalizedName); err != nil {
+	if err := h.ensureIndexSentinel(ctx, view, normalizedName); err != nil {
 		logger.DebugContext(ctx, "failed to ensure index sentinel", "error", err)
 		if handler.WriteNamespaceError(w, err) {
 			return
@@ -512,14 +512,14 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 		_ = p.Close()
 	}
 
-	h.indexCache.invalidate(scoped.Namespace() + "/" + normalizedName)
+	h.indexCache.invalidate(view.Namespace() + "/" + normalizedName)
 	w.WriteHeader(http.StatusCreated)
 }
 
 // ensureIndexSentinel marks the normalized package name in the
 // per-format namespace index.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *artifact.ScopedNamespace, normalizedName string) error {
-	return scoped.Index(packageIndexName).Mark(ctx, normalizedName)
+func (h *Handler) ensureIndexSentinel(ctx context.Context, view *artifact.NamespaceView, normalizedName string) error {
+	return view.Index(packageIndexName).Mark(ctx, normalizedName)
 }
 
 // errFieldTooLarge is returned by readTextPart when a non-file form
@@ -609,13 +609,13 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 		MediaType:  detectMediaType(filename),
 	}
 
-	scoped := h.scopedFor(req)
-	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	view := h.namespaceViewFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, view)
 	if !ok {
 		return
 	}
 	if isProxy {
-		h.handleFileGetProxy(w, req, scoped, spec, f)
+		h.handleFileGetProxy(w, req, view, spec, f)
 		return
 	}
 	artifactNS, err := h.artifactNamespaceFor(req)
@@ -646,13 +646,13 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	}
 	pkg = normalize(pkg)
 
-	scoped := h.scopedFor(req)
-	spec, isProxy, ok := h.dispatchProxy(w, req, scoped)
+	view := h.namespaceViewFor(req)
+	spec, isProxy, ok := h.dispatchProxy(w, req, view)
 	if !ok {
 		return
 	}
 	if isProxy {
-		h.handlePackageIndexProxy(w, req, scoped, spec, pkg)
+		h.handlePackageIndexProxy(w, req, view, spec, pkg)
 		return
 	}
 
@@ -714,8 +714,8 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 // resolvePackageFiles enumerates a package's files. The returned slice
 // is what goes into the simple-index cache; both HTML and JSON
 // renderers pivot off it.
-func (h *Handler) resolvePackageFiles(ctx context.Context, scoped handler.Registry, pkg string) ([]cachedFile, error) {
-	rawFiles, err := scoped.ListFiles(ctx, packageOwningRepo(pkg))
+func (h *Handler) resolvePackageFiles(ctx context.Context, view handler.Registry, pkg string) ([]cachedFile, error) {
+	rawFiles, err := view.ListFiles(ctx, packageOwningRepo(pkg))
 	if err != nil {
 		return nil, err
 	}
@@ -760,14 +760,14 @@ func renderedFileURL(req *http.Request, ns, pkg string, f cachedFile) string {
 	return u.String()
 }
 
-func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped handler.Registry, f *oci.RepoFile) {
+func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, view handler.Registry, f *oci.RepoFile) {
 	logger := logging.FromContext(req.Context())
 
 	// HEAD wants headers only — never redirect. The redirect path is
 	// only worth taking when the response would otherwise transfer
 	// bytes; HEAD has no egress to save.
 	if req.Method != http.MethodHead {
-		if redirectURL, err := scoped.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
+		if redirectURL, err := view.BlobRedirectURL(req.Context(), f); err == nil && redirectURL != "" {
 			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
 			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
 			return
@@ -780,7 +780,7 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped han
 		}
 	}
 
-	desc, r, err := scoped.ReadFile(req.Context(), f)
+	desc, r, err := view.ReadFile(req.Context(), f)
 	if err != nil {
 		logger.DebugContext(req.Context(), "failed to read file", "error", err)
 		if handler.WriteNamespaceError(w, err) {

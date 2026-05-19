@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Refactor handler-facing OCI access behind a namespace-scoped artifact API centered on package, version, tag, and file nouns.
+**Goal:** Refactor handler-facing OCI access behind a namespaced artifact API centered on package, version, tag, and file nouns.
 
-**Architecture:** Keep `pkg/oci` as the low-level OCI storage codec and add a higher-level data-plane API in `pkg/artifact`. The implementation wraps the existing `artifact.ScopedNamespace` behavior first, then handlers migrate from raw `oci.RepoFile` and repo strings to `artifact.Namespace`, `artifact.Package`, and `artifact.FileHandle` without changing the on-OCI layout.
+**Architecture:** Keep `pkg/oci` as the low-level OCI storage codec and add a higher-level data-plane API in `pkg/artifact`. The implementation wraps the existing `artifact.NamespaceView` behavior first, then handlers migrate from raw `oci.RepoFile` and repo strings to `artifact.Namespace`, `artifact.Package`, and `artifact.FileHandle` without changing the on-OCI layout.
 
 **Tech Stack:** Go, gorilla/mux handlers, existing `pkg/oci` registry, existing `pkg/namespace` authz and policy cache, `go-cmp` for tests.
 
@@ -30,10 +30,10 @@ Expected: FAIL because `pkg/artifact` production code does not exist yet.
 
 Create `pkg/artifact/artifact.go` and `pkg/artifact/namespace.go`. The adapter should:
 - expose `NewStore(inner artifact.Backend, namespaces artifact.NamespaceStore) *Store`;
-- validate namespace existence with `Spec(ctx)` before returning a scoped namespace;
+- validate namespace existence with `Spec(ctx)` before returning a namespaced view;
 - expose `Namespace.Package(name)` as a cheap value object;
 - construct `oci.RepoFile` only inside `pkg/artifact`;
-- keep package names namespace-relative and pass them to `artifact.ScopedNamespace`;
+- keep package names namespace-relative and pass them to `artifact.NamespaceView`;
 - implement `FileHandle.DownloadURL` through `BlobRedirectURL`;
 - implement `FileHandle.Open` through `ReadFile`.
 
@@ -79,7 +79,7 @@ Change hosted path to:
 - get `artifact.Namespace` from the request namespace;
 - use `ns.Package(packageOwningRepo(pkg))`;
 - use `pkg.PutFile`, `pkg.GetFile`, and `pkg.ListFiles`;
-- keep `scoped.Index(packageIndexName)` as the transitional index path until index/cache files are moved fully behind package/version/file storage.
+- keep `view.Index(packageIndexName)` as the transitional index path until index/cache files are moved fully behind package/version/file storage.
 
 - [x] **Step 3: Run Python tests**
 
@@ -139,7 +139,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Remove obsolete handler registry dependency where possible**
 
-Keep low-level `artifact.ScopedNamespace` methods until all proxy/fetcher paths are migrated. Do not delete `oci.RepoFile`; it remains the low-level storage representation.
+Keep low-level `artifact.NamespaceView` methods until all proxy/fetcher paths are migrated. Do not delete `oci.RepoFile`; it remains the low-level storage representation.
 
 - [ ] **Step 2: Run full short verification**
 
@@ -167,6 +167,6 @@ Expected: commit created on `artifact-store-api`.
 
 ## Self-Review
 
-- Spec coverage: The plan introduces a namespace-scoped data-plane API, keeps namespace metadata separate, keeps OCI as the backing implementation, and migrates handlers incrementally.
+- Spec coverage: The plan introduces a namespaced data-plane API, keeps namespace metadata separate, keeps OCI as the backing implementation, and migrates handlers incrementally.
 - Scope check: The full migration spans all handlers and proxies. The first PR can stop after the core abstraction and one handler migration if review size grows too large.
 - Risk: Existing OCI layout and handler behavior must remain compatible; `pkg/oci` remains the low-level storage representation.

@@ -102,7 +102,7 @@ client ──► handler/<format> ──► artifact.Store ──► pkg/oci.Reg
 One Go binary. One process. Storage offloaded entirely to your OCI registry.
 Each artifact format gets its own `pkg/handler/<format>` package implementing
 the relevant protocol; every request resolves its `{namespace}` URL segment
-into a per-namespace `ScopedNamespace` view that authorizes the operation
+into a per-namespace `NamespaceView` that authorizes the operation
 against the namespace's policy and prefixes OCI repos with the namespace.
 
 For the on-OCI shape — version anchors, file manifests, alias manifests, and

@@ -21,11 +21,11 @@ import (
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// Compile-time assertion: *ScopedNamespace satisfies handler.Registry
+// Compile-time assertion: *NamespaceView satisfies handler.Registry
 // so existing python/maven handlers can swap a *pkg/oci.Registry for
-// a *ScopedNamespace without any signature changes. Lives in the
+// a *NamespaceView without any signature changes. Lives in the
 // _test package to avoid pkg/namespace importing pkg/handler.
-var _ handler.Registry = (*artifact.ScopedNamespace)(nil)
+var _ handler.Registry = (*artifact.NamespaceView)(nil)
 
 const (
 	googleIss   = "https://accounts.google.com"
@@ -88,20 +88,20 @@ func newRepoFile(repo, tag, name string) *oci.RepoFile {
 	}
 }
 
-func TestScopedNamespace_AddRead_HappyPath(t *testing.T) {
+func TestNamespaceView_AddRead_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if scoped.Namespace() != "alpha" {
-		t.Errorf("Namespace() = %q, want %q", scoped.Namespace(), "alpha")
+	if view.Namespace() != "alpha" {
+		t.Errorf("Namespace() = %q, want %q", view.Namespace(), "alpha")
 	}
 
 	body := strings.NewReader(defaultBody)
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), body); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), body); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestScopedNamespace_AddRead_HappyPath(t *testing.T) {
 			repoFoo, slicesSortedKeys(fake.Files))
 	}
 
-	_, rc, err := scoped.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+	_, rc, err := view.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -124,12 +124,12 @@ func TestScopedNamespace_AddRead_HappyPath(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_NamespaceIsolation pins the load-bearing
-// security guarantee: the beta scoped view cannot read a file
-// written through the alpha scoped view, AND alpha can still read
+// TestNamespaceView_NamespaceIsolation pins the load-bearing
+// security guarantee: the beta view view cannot read a file
+// written through the alpha view view, AND alpha can still read
 // its own file (so a regression that 5xx'd on every read wouldn't
 // pass for the wrong reason).
-func TestScopedNamespace_NamespaceIsolation(t *testing.T) {
+func TestNamespaceView_NamespaceIsolation(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -137,20 +137,20 @@ func TestScopedNamespace_NamespaceIsolation(t *testing.T) {
 	putNamespace(t, store, "beta", allowAllSpec())
 	ctx := aliceCtx(t)
 
-	if _, err := reg.For("alpha").AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := reg.View("alpha").AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile alpha: %v", err)
 	}
 
 	// Alpha must still see its own file (rules out a generic-error
 	// regression).
-	if _, rc, err := reg.For("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); err != nil {
+	if _, rc, err := reg.View("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); err != nil {
 		t.Errorf("ReadFile alpha (own file): %v, want success", err)
 	} else {
 		rc.Close()
 	}
 
 	// Beta must not — and the failure mode must be ErrNotFound.
-	_, _, err := reg.For("beta").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+	_, _, err := reg.View("beta").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 	if err == nil {
 		t.Fatal("ReadFile beta = nil, want not-found error (namespaces must isolate)")
 	}
@@ -159,10 +159,10 @@ func TestScopedNamespace_NamespaceIsolation(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_NamespaceEscape is the explicit anti-vuln
-// test: the alpha scoped view cannot reach beta by passing
+// TestNamespaceView_NamespaceEscape is the explicit anti-vuln
+// test: the alpha view view cannot reach beta by passing
 // OwningRepo="../beta/foo" etc.
-func TestScopedNamespace_NamespaceEscape(t *testing.T) {
+func TestNamespaceView_NamespaceEscape(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -192,7 +192,7 @@ func TestScopedNamespace_NamespaceEscape(t *testing.T) {
 	for _, esc := range escapes {
 		t.Run("escape="+esc, func(t *testing.T) {
 			t.Parallel()
-			_, _, err := reg.For("alpha").ReadFile(ctx, newRepoFile(esc, "1.0.0", "secret.txt"))
+			_, _, err := reg.View("alpha").ReadFile(ctx, newRepoFile(esc, "1.0.0", "secret.txt"))
 			if err == nil {
 				t.Fatalf("ReadFile owningRepo=%q = nil, want ErrInvalidOwningRepo (namespace escape!)", esc)
 			}
@@ -203,18 +203,18 @@ func TestScopedNamespace_NamespaceEscape(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_RejectsReservedIndexSuffix proves the wrapper
+// TestNamespaceView_RejectsReservedIndexSuffix proves the wrapper
 // refuses to route a user-supplied owning-repo into the per-namespace
 // package-index repo. Without this check a maven-style handler that
 // builds OwningRepo from URL path segments could plant tags in the
 // wrapper's own sentinel repo.
-func TestScopedNamespace_RejectsReservedIndexSuffix(t *testing.T) {
+func TestNamespaceView_RejectsReservedIndexSuffix(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	tests := []struct {
 		name       string
@@ -226,7 +226,7 @@ func TestScopedNamespace_RejectsReservedIndexSuffix(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := scoped.AddFile(ctx, newRepoFile(tc.owningRepo, "1.0.0", "f.txt"), strings.NewReader(defaultBody))
+			_, err := view.AddFile(ctx, newRepoFile(tc.owningRepo, "1.0.0", "f.txt"), strings.NewReader(defaultBody))
 			if err == nil {
 				t.Fatalf("AddFile owningRepo=%q = nil, want ErrInvalidOwningRepo", tc.owningRepo)
 			}
@@ -237,12 +237,12 @@ func TestScopedNamespace_RejectsReservedIndexSuffix(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_NamespaceNotFound(t *testing.T) {
+func TestNamespaceView_NamespaceNotFound(t *testing.T) {
 	t.Parallel()
 
 	_, reg, _ := setup(t)
 	ctx := aliceCtx(t)
-	scoped := reg.For("ghost")
+	view := reg.View("ghost")
 
 	tests := []struct {
 		name string
@@ -251,55 +251,55 @@ func TestScopedNamespace_NamespaceNotFound(t *testing.T) {
 		{
 			name: "AddFile",
 			call: func() error {
-				_, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody))
+				_, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody))
 				return err
 			},
 		},
 		{
 			name: "ReadFile",
 			call: func() error {
-				_, _, err := scoped.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+				_, _, err := view.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 				return err
 			},
 		},
 		{
 			name: "BlobRedirectURL",
 			call: func() error {
-				_, err := scoped.BlobRedirectURL(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+				_, err := view.BlobRedirectURL(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 				return err
 			},
 		},
 		{
 			name: "ListTags",
 			call: func() error {
-				_, err := scoped.ListTags(ctx, repoFoo)
+				_, err := view.ListTags(ctx, repoFoo)
 				return err
 			},
 		},
 		{
 			name: "ListFiles",
 			call: func() error {
-				_, err := scoped.ListFiles(ctx, repoFoo)
+				_, err := view.ListFiles(ctx, repoFoo)
 				return err
 			},
 		},
 		{
 			name: "ListPackages",
 			call: func() error {
-				_, err := scoped.ListPackages(ctx)
+				_, err := view.ListPackages(ctx)
 				return err
 			},
 		},
 		{
 			name: "AppendRefs",
 			call: func() error {
-				return scoped.AppendRefs(ctx, repoFoo, "1.0.0", "latest")
+				return view.AppendRefs(ctx, repoFoo, "1.0.0", "latest")
 			},
 		},
 		{
 			name: "DeleteRepoFiles",
 			call: func() error {
-				return scoped.DeleteRepoFiles(ctx, repoFoo)
+				return view.DeleteRepoFiles(ctx, repoFoo)
 			},
 		},
 	}
@@ -318,26 +318,26 @@ func TestScopedNamespace_NamespaceNotFound(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_NilFile(t *testing.T) {
+func TestNamespaceView_NilFile(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, nil, strings.NewReader("")); err == nil {
+	if _, err := view.AddFile(ctx, nil, strings.NewReader("")); err == nil {
 		t.Error("AddFile(nil) = nil, want error")
 	}
-	if _, _, err := scoped.ReadFile(ctx, nil); err == nil {
+	if _, _, err := view.ReadFile(ctx, nil); err == nil {
 		t.Error("ReadFile(nil) = nil, want error")
 	}
-	if _, err := scoped.BlobRedirectURL(ctx, nil); err == nil {
+	if _, err := view.BlobRedirectURL(ctx, nil); err == nil {
 		t.Error("BlobRedirectURL(nil) = nil, want error")
 	}
 }
 
-func TestScopedNamespace_Authz(t *testing.T) {
+func TestNamespaceView_Authz(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -418,14 +418,14 @@ func TestScopedNamespace_Authz(t *testing.T) {
 			}
 
 			ctx := auth.WithAuthContext(t.Context(), tc.ac)
-			scoped := reg.For("alpha")
+			view := reg.View("alpha")
 
 			var got error
 			switch tc.op {
 			case auth.OpWrite:
-				_, got = scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody))
+				_, got = view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"), strings.NewReader(defaultBody))
 			case auth.OpRead:
-				_, _, got = scoped.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+				_, _, got = view.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 			}
 
 			if tc.wantAllow {
@@ -458,13 +458,13 @@ func seedDirect(t *testing.T, fake *oci.FakeRegistry, ns string) {
 	}
 }
 
-func TestScopedNamespace_NoAuthContextDenied(t *testing.T) {
+func TestNamespaceView_NoAuthContextDenied(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 
-	_, _, err := reg.For("alpha").ReadFile(t.Context(), newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+	_, _, err := reg.View("alpha").ReadFile(t.Context(), newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 	if err == nil {
 		t.Fatal("ReadFile with no AuthContext = nil, want error wrapping auth.ErrUnauthorized")
 	}
@@ -473,9 +473,9 @@ func TestScopedNamespace_NoAuthContextDenied(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_NoAuthContextDeniedAtWrapper proves the wrapper
+// TestNamespaceView_NoAuthContextDeniedAtWrapper proves the wrapper
 // itself denies nil even when the AuthzFactory would have allowed.
-func TestScopedNamespace_NoAuthContextDeniedAtWrapper(t *testing.T) {
+func TestNamespaceView_NoAuthContextDeniedAtWrapper(t *testing.T) {
 	t.Parallel()
 
 	fake := oci.NewFakeRegistry()
@@ -486,17 +486,17 @@ func TestScopedNamespace_NoAuthContextDeniedAtWrapper(t *testing.T) {
 	)
 	putNamespace(t, store, "alpha", allowAllSpec())
 
-	_, _, err := reg.For("alpha").ReadFile(t.Context(), newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+	_, _, err := reg.View("alpha").ReadFile(t.Context(), newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 	if !errors.Is(err, auth.ErrUnauthorized) {
 		t.Errorf("ReadFile (AllowAll factory + nil ctx) err = %v, want errors.Is(auth.ErrUnauthorized)", err)
 	}
 }
 
-// TestScopedNamespace_PackageIndex_PopulatedExactlyOnce uses a
+// TestNamespaceView_PackageIndex_PopulatedExactlyOnce uses a
 // counting backend to prove the wrapper makes exactly one
 // index-repo AddFile call across N data writes to the same
 // (ns, owning-repo).
-func TestScopedNamespace_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
+func TestNamespaceView_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
 	t.Parallel()
 
 	counted := newCountingBackend()
@@ -504,11 +504,11 @@ func TestScopedNamespace_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
 	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	for i := 0; i < 5; i++ {
 		tag := fmt.Sprintf("1.0.%d", i)
-		if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		if _, err := view.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
 			t.Fatalf("AddFile %s: %v", tag, err)
 		}
 	}
@@ -518,21 +518,21 @@ func TestScopedNamespace_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_PackageIndex_MultipleRepos(t *testing.T) {
+func TestNamespaceView_PackageIndex_MultipleRepos(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	for _, repo := range []string{repoFoo, repoBar, "tools/cli"} {
-		if _, err := scoped.AddFile(ctx, newRepoFile(repo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		if _, err := view.AddFile(ctx, newRepoFile(repo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 			t.Fatalf("AddFile %s: %v", repo, err)
 		}
 	}
 
-	got, err := scoped.ListPackages(ctx)
+	got, err := view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages: %v", err)
 	}
@@ -543,10 +543,10 @@ func TestScopedNamespace_PackageIndex_MultipleRepos(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile is
+// TestNamespaceView_PackageIndex_ConcurrentExactlyOneAddFile is
 // the concurrency stress: N goroutines hammering the same
 // (ns, owning-repo) must result in exactly ONE index-repo AddFile.
-func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) {
+func TestNamespaceView_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) {
 	t.Parallel()
 
 	counted := newCountingBackend()
@@ -554,7 +554,7 @@ func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) 
 	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -564,7 +564,7 @@ func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) 
 		go func(i int) {
 			defer wg.Done()
 			tag := fmt.Sprintf("v%d", i)
-			if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
+			if _, err := view.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
 				errs <- err
 			}
 		}(i)
@@ -578,7 +578,7 @@ func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) 
 	if got := counted.indexAddCount("alpha"); got != 1 {
 		t.Errorf("index AddFile count = %d across %d concurrent writes, want 1", got, n)
 	}
-	pkgs, err := scoped.ListPackages(ctx)
+	pkgs, err := view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) 
 	}
 }
 
-func TestScopedNamespace_PackageIndex_Isolated(t *testing.T) {
+func TestNamespaceView_PackageIndex_Isolated(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -595,11 +595,11 @@ func TestScopedNamespace_PackageIndex_Isolated(t *testing.T) {
 	putNamespace(t, store, "beta", allowAllSpec())
 	ctx := aliceCtx(t)
 
-	if _, err := reg.For("alpha").AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := reg.View("alpha").AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile alpha: %v", err)
 	}
 
-	betaPkgs, err := reg.For("beta").ListPackages(ctx)
+	betaPkgs, err := reg.View("beta").ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages beta: %v", err)
 	}
@@ -608,13 +608,13 @@ func TestScopedNamespace_PackageIndex_Isolated(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_Index_RoundTrip(t *testing.T) {
+func TestNamespaceView_Index_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	idx := reg.For("alpha").Index("python-packages")
+	idx := reg.View("alpha").Index("python-packages")
 
 	keys := []string{"requests", "foo_bar", "@scope/pkg"}
 	for _, key := range keys {
@@ -659,7 +659,7 @@ func TestScopedNamespace_Index_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_Index_RejectsInvalidName(t *testing.T) {
+func TestNamespaceView_Index_RejectsInvalidName(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -669,7 +669,7 @@ func TestScopedNamespace_Index_RejectsInvalidName(t *testing.T) {
 	for _, name := range []string{"", "packages/foo", "../x", "ocifactory-packages", "prod-", "prod..east"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			err := reg.For("alpha").Index(name).Mark(ctx, "key")
+			err := reg.View("alpha").Index(name).Mark(ctx, "key")
 			if err == nil {
 				t.Fatalf("Index(%q).Mark = nil, want error", name)
 			}
@@ -680,16 +680,16 @@ func TestScopedNamespace_Index_RejectsInvalidName(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_TagEncoding_RoundTrip pins the encoding
+// TestNamespaceView_TagEncoding_RoundTrip pins the encoding
 // properties: collision-free between names that differ only in '/'
 // vs '_'.
-func TestScopedNamespace_TagEncoding_RoundTrip(t *testing.T) {
+func TestNamespaceView_TagEncoding_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	repos := []string{
 		"packages/requests",
@@ -700,12 +700,12 @@ func TestScopedNamespace_TagEncoding_RoundTrip(t *testing.T) {
 		"x.y.z",
 	}
 	for _, r := range repos {
-		if _, err := scoped.AddFile(ctx, newRepoFile(r, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		if _, err := view.AddFile(ctx, newRepoFile(r, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 			t.Fatalf("AddFile %s: %v", r, err)
 		}
 	}
 
-	got, err := scoped.ListPackages(ctx)
+	got, err := view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages: %v", err)
 	}
@@ -717,14 +717,14 @@ func TestScopedNamespace_TagEncoding_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
+func TestNamespaceView_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
 
-	got, err := reg.For("alpha").ListPackages(ctx)
+	got, err := reg.View("alpha").ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages: %v", err)
 	}
@@ -733,21 +733,21 @@ func TestScopedNamespace_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_ListTags_AndListFiles(t *testing.T) {
+func TestNamespaceView_ListTags_AndListFiles(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	for _, tag := range []string{"1.0.0", "2.0.0"} {
-		if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
+		if _, err := view.AddFile(ctx, newRepoFile(repoFoo, tag, "f.txt"), strings.NewReader(defaultBody)); err != nil {
 			t.Fatalf("AddFile %s: %v", tag, err)
 		}
 	}
 
-	tags, err := scoped.ListTags(ctx, repoFoo)
+	tags, err := view.ListTags(ctx, repoFoo)
 	if err != nil {
 		t.Fatalf("ListTags: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestScopedNamespace_ListTags_AndListFiles(t *testing.T) {
 		t.Errorf("ListTags mismatch (-want +got):\n%s", diff)
 	}
 
-	files, err := scoped.ListFiles(ctx, repoFoo)
+	files, err := view.ListFiles(ctx, repoFoo)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -770,19 +770,19 @@ func TestScopedNamespace_ListTags_AndListFiles(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_ListFiles_MultiSegmentRepo(t *testing.T) {
+func TestNamespaceView_ListFiles_MultiSegmentRepo(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
 	repo := "com/example/foo-bar"
-	if _, err := scoped.AddFile(ctx, newRepoFile(repo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
-	files, err := scoped.ListFiles(ctx, repo)
+	files, err := view.ListFiles(ctx, repo)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -791,9 +791,9 @@ func TestScopedNamespace_ListFiles_MultiSegmentRepo(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace pins that
+// TestNamespaceView_ListFiles_PrefixOfAnotherNamespace pins that
 // "alpha" doesn't accidentally strip from "alpha-foo" repos.
-func TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
+func TestNamespaceView_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -809,7 +809,7 @@ func TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	files, err := reg.For("alpha").ListFiles(ctx, repoFoo)
+	files, err := reg.View("alpha").ListFiles(ctx, repoFoo)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -818,18 +818,18 @@ func TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_AppendRefs_Forwards(t *testing.T) {
+func TestNamespaceView_AppendRefs_Forwards(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
-	if err := scoped.AppendRefs(ctx, repoFoo, "1.0.0", "latest"); err != nil {
+	if err := view.AppendRefs(ctx, repoFoo, "1.0.0", "latest"); err != nil {
 		t.Fatalf("AppendRefs: %v", err)
 	}
 	if got, ok := fake.Aliases["alpha/"+repoFoo+"/latest"]; !ok || got != "1.0.0" {
@@ -837,18 +837,18 @@ func TestScopedNamespace_AppendRefs_Forwards(t *testing.T) {
 	}
 }
 
-func TestScopedNamespace_ResolveTag(t *testing.T) {
+func TestNamespaceView_ResolveTag(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
-	if err := scoped.AppendRefs(ctx, repoFoo, "1.0.0", "latest"); err != nil {
+	if err := view.AppendRefs(ctx, repoFoo, "1.0.0", "latest"); err != nil {
 		t.Fatalf("AppendRefs: %v", err)
 	}
 
@@ -864,7 +864,7 @@ func TestScopedNamespace_ResolveTag(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := scoped.ResolveTag(ctx, repoFoo, tc.tag)
+			got, err := view.ResolveTag(ctx, repoFoo, tc.tag)
 			if err != nil {
 				t.Fatalf("ResolveTag: %v", err)
 			}
@@ -875,21 +875,21 @@ func TestScopedNamespace_ResolveTag(t *testing.T) {
 	}
 }
 
-// TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex verifies
+// TestNamespaceView_DeleteRepoFiles_SweepsBackendIndex verifies
 // BOTH the in-process indexed marker AND the backend
 // ocifactory-packages tag are cleared.
-func TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
+func TestNamespaceView_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
-	pkgs, err := scoped.ListPackages(ctx)
+	pkgs, err := view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages pre: %v", err)
 	}
@@ -897,7 +897,7 @@ func TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 		t.Fatalf("ListPackages pre = %v, want to contain %q", pkgs, repoFoo)
 	}
 
-	if err := scoped.DeleteRepoFiles(ctx, repoFoo); err != nil {
+	if err := view.DeleteRepoFiles(ctx, repoFoo); err != nil {
 		t.Fatalf("DeleteRepoFiles: %v", err)
 	}
 	for k := range fake.Files {
@@ -905,7 +905,7 @@ func TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 			t.Errorf("file %q remained after DeleteRepoFiles", k)
 		}
 	}
-	pkgs, err = scoped.ListPackages(ctx)
+	pkgs, err = view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages post: %v", err)
 	}
@@ -913,10 +913,10 @@ func TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 		t.Errorf("ListPackages post = %v, want NOT to contain %q (backend index must be swept)", pkgs, repoFoo)
 	}
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "2.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "2.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile after delete: %v", err)
 	}
-	pkgs, err = scoped.ListPackages(ctx)
+	pkgs, err = view.ListPackages(ctx)
 	if err != nil {
 		t.Fatalf("ListPackages re-add: %v", err)
 	}
@@ -938,9 +938,9 @@ func TestRegistry_PolicyCache_HotPathSkipsStore(t *testing.T) {
 
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
 	priming := counted.specReads("alpha")
@@ -950,7 +950,7 @@ func TestRegistry_PolicyCache_HotPathSkipsStore(t *testing.T) {
 
 	const iters = 50
 	for i := 0; i < iters; i++ {
-		_, _, err := scoped.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
+		_, _, err := view.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
 		if err != nil {
 			t.Fatalf("ReadFile %d: %v", i, err)
 		}
@@ -970,16 +970,16 @@ func TestRegistry_PolicyCache_TTLZero_DisablesCache(t *testing.T) {
 
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
-	scoped := reg.For("alpha")
+	view := reg.View("alpha")
 
-	if _, err := scoped.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
+	if _, err := view.AddFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"), strings.NewReader(defaultBody)); err != nil {
 		t.Fatalf("AddFile: %v", err)
 	}
 
 	before := counted.specReads("alpha")
 	const iters = 5
 	for i := 0; i < iters; i++ {
-		_, _, err := scoped.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
+		_, _, err := view.ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
 		if err != nil {
 			t.Fatalf("ReadFile: %v", err)
 		}
@@ -1001,7 +1001,7 @@ func TestRegistry_PolicyCache_NegativeCaching(t *testing.T) {
 
 	const iters = 10
 	for i := 0; i < iters; i++ {
-		_, _, err := reg.For("ghost").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
+		_, _, err := reg.View("ghost").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt"))
 		if !errors.Is(err, namespace.ErrNotFound) {
 			t.Fatalf("ReadFile(ghost) %d err = %v, want errors.Is(ErrNotFound)", i, err)
 		}
@@ -1011,7 +1011,7 @@ func TestRegistry_PolicyCache_NegativeCaching(t *testing.T) {
 	}
 
 	reg.InvalidatePolicy("ghost")
-	if _, _, err := reg.For("ghost").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt")); !errors.Is(err, namespace.ErrNotFound) {
+	if _, _, err := reg.View("ghost").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "f.txt")); !errors.Is(err, namespace.ErrNotFound) {
 		t.Fatalf("post-invalidate ReadFile = %v, want errors.Is(ErrNotFound)", err)
 	}
 	if got := counted.specReads("ghost"); got != 2 {
@@ -1034,12 +1034,12 @@ func TestRegistry_StorePut_InvalidatesCache(t *testing.T) {
 		Readers: []namespace.SubjectMatcher{{Email: otherEmail}},
 	}})
 	seedDirect(t, counted.FakeRegistry, "alpha")
-	if _, _, err := reg.For("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); !errors.Is(err, auth.ErrUnauthorized) {
+	if _, _, err := reg.View("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); !errors.Is(err, auth.ErrUnauthorized) {
 		t.Fatalf("pre-update ReadFile = %v, want errors.Is(auth.ErrUnauthorized)", err)
 	}
 
 	putNamespace(t, store, "alpha", allowAllSpec())
-	if _, _, err := reg.For("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); err != nil {
+	if _, _, err := reg.View("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt")); err != nil {
 		t.Errorf("post-update ReadFile = %v, want success (Store.Put must invalidate cache)", err)
 	}
 }
@@ -1069,7 +1069,7 @@ func TestRegistry_PolicyCache_Singleflight(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			_, _, _ = reg.For("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
+			_, _, _ = reg.View("alpha").ReadFile(ctx, newRepoFile(repoFoo, "1.0.0", "foo.txt"))
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
