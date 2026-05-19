@@ -1,4 +1,4 @@
-package namespace
+package artifact
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/logging"
+	nsmeta "github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
@@ -67,10 +68,10 @@ var packageIndexSentinelBody = []byte("present\n")
 // AuthzFactory builds an [auth.Authorizer] from a namespace [Policy].
 // Operators wire in alternative implementations (OPA, Casbin, Cedar,
 // ...) by passing one to [WithAuthzFactory]; the default is
-// [NewPolicyAuthorizer].
-type AuthzFactory func(Policy) (auth.Authorizer, error)
+// [namespace.NewPolicyAuthorizer].
+type AuthzFactory func(nsmeta.Policy) (auth.Authorizer, error)
 
-// RegistryBackend is the subset of *pkg/oci.Registry the wrapper
+// Backend is the subset of *pkg/oci.Registry the wrapper
 // needs. Pinned as an interface so tests can substitute the in-memory
 // [oci.FakeRegistry]; production passes *oci.Registry directly.
 //
@@ -79,7 +80,7 @@ type AuthzFactory func(Policy) (auth.Authorizer, error)
 // metadata-store [Backend] avoids two parallel interfaces and lets
 // future yank semantics (single-version delete) plug in without
 // reshaping the surface.
-type RegistryBackend interface {
+type Backend interface {
 	AddFile(ctx context.Context, f *oci.RepoFile, ro io.Reader) (*oci.FileDescriptor, error)
 	ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error)
 	BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error)
@@ -91,25 +92,34 @@ type RegistryBackend interface {
 	DeleteTagFiles(ctx context.Context, repo string, tag string) error
 }
 
-// Registry is the data-plane wrapper that holds the cross-namespace
+// NamespaceStore is the control-plane namespace metadata surface the
+// artifact data-plane needs for existence checks, policy compilation, and
+// cache invalidation. The concrete OCI implementation is
+// [namespace.Store], but artifact storage depends only on this interface.
+type NamespaceStore interface {
+	Get(ctx context.Context, name string) (*nsmeta.Namespace, error)
+	SetMutationHook(func(name string))
+}
+
+// Store is the data-plane wrapper that holds the cross-namespace
 // state — the authorizer cache, the package-index dedupe set, the
 // pluggable authz factory — and hands out per-namespace
-// [ScopedRegistry] views via [Registry.For].
+// [ScopedNamespace] views via [Store.For].
 //
-// Handlers don't use *Registry directly; they hold a
-// *ScopedRegistry obtained per request:
+// Handlers don't use *Store directly; they hold a
+// *ScopedNamespace obtained per request:
 //
 //	ns := mux.Vars(req)["namespace"]
 //	scoped := r.For(ns)
 //	desc, err := scoped.AddFile(ctx, f, body)
 //
-// *ScopedRegistry implements the existing [pkg/handler.Registry]
+// *ScopedNamespace implements the existing [pkg/handler.Registry]
 // interface, so handlers can swap a *pkg/oci.Registry for a
-// *ScopedRegistry without changing any call site — namespace-aware
+// *ScopedNamespace without changing any call site — namespace-aware
 // authz and OwningRepo prefixing happen transparently.
-type Registry struct {
-	inner       RegistryBackend
-	store       *Store
+type Store struct {
+	inner       Backend
+	namespaces  NamespaceStore
 	cache       *policyCache
 	indexed     *expirable.LRU[string, struct{}]
 	indexSuffix string
@@ -132,43 +142,43 @@ type Registry struct {
 	indexLocks sync.Map
 }
 
-// RegistryOption customises a [Registry].
-type RegistryOption func(*Registry)
+// StoreOption customises a [Store].
+type StoreOption func(*Store)
 
 // WithPackageIndexSuffix overrides the default
 // ("ocifactory-packages"). Operators set this when their backend
 // already has a per-namespace "ocifactory-packages" repo they want to
 // keep — extremely unlikely, but cheap to make configurable.
-func WithPackageIndexSuffix(s string) RegistryOption {
-	return func(r *Registry) { r.indexSuffix = s }
+func WithPackageIndexSuffix(s string) StoreOption {
+	return func(r *Store) { r.indexSuffix = s }
 }
 
 // WithAuthzFactory overrides the authorizer constructor.
-// Defaults to [NewPolicyAuthorizer].
-func WithAuthzFactory(f AuthzFactory) RegistryOption {
-	return func(r *Registry) { r.factory = f }
+// Defaults to [namespace.NewPolicyAuthorizer].
+func WithAuthzFactory(f AuthzFactory) StoreOption {
+	return func(r *Store) { r.factory = f }
 }
 
 // WithPolicyCacheTTL overrides [DefaultPolicyCacheTTL]. A value of
 // zero or negative disables caching — every request pays for a
 // Store.Get + authorizer compile. Operators set ttl=0 in tests that
 // want every Put to take effect immediately without sleeping.
-func WithPolicyCacheTTL(ttl time.Duration) RegistryOption {
-	return func(r *Registry) { r.cacheTTL = ttl }
+func WithPolicyCacheTTL(ttl time.Duration) StoreOption {
+	return func(r *Store) { r.cacheTTL = ttl }
 }
 
-// NewRegistry wraps inner in a namespace [Registry] backed by store
+// NewStore wraps inner in a namespace [Store] backed by store
 // for namespace metadata. The wrapper installs a mutation hook on
 // store so admin-side Put / Delete calls invalidate the cached
-// authorizer — failing to use NewRegistry (e.g. constructing the
+// authorizer — failing to use NewStore (e.g. constructing the
 // fields by hand in a test) means admin mutations only take effect
 // after the cache TTL expires.
-func NewRegistry(inner RegistryBackend, store *Store, opts ...RegistryOption) *Registry {
-	r := &Registry{
+func NewStore(inner Backend, namespaces NamespaceStore, opts ...StoreOption) *Store {
+	r := &Store{
 		inner:       inner,
-		store:       store,
+		namespaces:  namespaces,
 		indexSuffix: defaultPackageIndexSuffix,
-		factory:     NewPolicyAuthorizer,
+		factory:     nsmeta.NewPolicyAuthorizer,
 		cacheTTL:    DefaultPolicyCacheTTL,
 	}
 	for _, o := range opts {
@@ -182,18 +192,28 @@ func NewRegistry(inner RegistryBackend, store *Store, opts ...RegistryOption) *R
 	// expirable.NewLRU means "10-year TTL" (effectively no expiry),
 	// which is what we want; bounded size is the only ceiling.
 	r.indexed = expirable.NewLRU[string, struct{}](packageIndexedReposCacheSize, nil, 0)
-	store.SetMutationHook(r.InvalidatePolicy)
+	namespaces.SetMutationHook(r.InvalidatePolicy)
 	return r
 }
 
-// For returns a [ScopedRegistry] bound to namespace. The returned
+// Namespace returns a handler-facing namespace after validating that the
+// namespace metadata exists.
+func (r *Store) Namespace(ctx context.Context, name string) (Namespace, error) {
+	scoped := r.For(name)
+	if _, err := scoped.Spec(ctx); err != nil {
+		return nil, err
+	}
+	return artifactNamespace{scoped: scoped}, nil
+}
+
+// For returns a [ScopedNamespace] bound to namespace. The returned
 // view is cheap to construct (a small struct, no I/O) so handlers
 // should call it per request rather than caching it. The bound
 // namespace is enforced on every method invocation — there is no
 // way to issue a cross-namespace operation through a single
-// ScopedRegistry.
-func (r *Registry) For(namespace string) *ScopedRegistry {
-	return &ScopedRegistry{parent: r, namespace: namespace}
+// ScopedNamespace.
+func (r *Store) For(namespace string) *ScopedNamespace {
+	return &ScopedNamespace{parent: r, namespace: namespace}
 }
 
 // InvalidatePolicy drops the cached authorizer for name so the next
@@ -201,14 +221,14 @@ func (r *Registry) For(namespace string) *ScopedRegistry {
 // automatically after a successful Put or Delete; admin-side code
 // that bypasses the Store can call it directly. A name that wasn't
 // cached is a no-op.
-func (r *Registry) InvalidatePolicy(name string) { r.cache.invalidate(name) }
+func (r *Store) InvalidatePolicy(name string) { r.cache.invalidate(name) }
 
 // authorize loads (cached or freshly compiled) the namespace's
 // authorizer and runs op against the [auth.AuthContext] in ctx.
 // Returns:
 //
 //   - nil on allow.
-//   - an error wrapping [ErrNotFound] when the namespace is unknown
+//   - an error wrapping [namespace.ErrNotFound] when the namespace is unknown
 //     (and caches the negative result).
 //   - an error wrapping [auth.ErrUnauthorized] on policy deny or on
 //     a missing AuthContext.
@@ -218,7 +238,7 @@ func (r *Registry) InvalidatePolicy(name string) { r.cache.invalidate(name) }
 // authorizer, because the wrapper is the trust boundary: a
 // third-party [AuthzFactory] that forgets to deny nil would
 // otherwise turn into an auth bypass.
-func (r *Registry) authorize(ctx context.Context, namespace string, op auth.Op) error {
+func (r *Store) authorize(ctx context.Context, namespace string, op auth.Op) error {
 	az, err := r.authorizerFor(ctx, namespace)
 	if err != nil {
 		return err
@@ -231,20 +251,20 @@ func (r *Registry) authorize(ctx context.Context, namespace string, op auth.Op) 
 }
 
 // specFor is the cache-aware single-namespace lookup that
-// [Registry.authorizerFor] and [ScopedRegistry.Spec] funnel through.
+// [Store.authorizerFor] and [ScopedNamespace.Spec] funnel through.
 // On a hit it returns the cached entry without any I/O; on a miss it
 // resolves through the shared singleflight so concurrent callers
 // observe one [Store.Get] + authorizer compile.
 //
 // A namespace that doesn't exist returns an error wrapping
-// [ErrNotFound] with notFound=true on the cached entry — callers that
+// [namespace.ErrNotFound] with notFound=true on the cached entry — callers that
 // only need the spec must inspect the notFound flag rather than the
 // returned error so they can produce the expected 404 mapping without
 // re-running the load.
-func (r *Registry) specFor(ctx context.Context, namespace string) (cachedPolicy, error) {
+func (r *Store) specFor(ctx context.Context, namespace string) (cachedPolicy, error) {
 	if v, ok := r.cache.get(namespace); ok {
 		if v.notFound {
-			return v, fmt.Errorf("%w: %s", ErrNotFound, namespace)
+			return v, fmt.Errorf("%w: %s", nsmeta.ErrNotFound, namespace)
 		}
 		return v, nil
 	}
@@ -252,9 +272,9 @@ func (r *Registry) specFor(ctx context.Context, namespace string) (cachedPolicy,
 		if v, ok := r.cache.get(namespace); ok {
 			return v, nil
 		}
-		ns, err := r.store.Get(ctx, namespace)
+		ns, err := r.namespaces.Get(ctx, namespace)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			if errors.Is(err, nsmeta.ErrNotFound) {
 				neg := cachedPolicy{notFound: true}
 				r.cache.put(namespace, neg)
 				return neg, err
@@ -275,12 +295,12 @@ func (r *Registry) specFor(ctx context.Context, namespace string) (cachedPolicy,
 	}
 	cp := v.(cachedPolicy)
 	if cp.notFound {
-		return cp, fmt.Errorf("%w: %s", ErrNotFound, namespace)
+		return cp, fmt.Errorf("%w: %s", nsmeta.ErrNotFound, namespace)
 	}
 	return cp, nil
 }
 
-func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Authorizer, error) {
+func (r *Store) authorizerFor(ctx context.Context, namespace string) (auth.Authorizer, error) {
 	cp, err := r.specFor(ctx, namespace)
 	if err != nil {
 		return nil, err
@@ -294,7 +314,7 @@ func (r *Registry) authorizerFor(ctx context.Context, namespace string) (auth.Au
 // or is absolute is rejected as malformed — without this check
 // path.Join("alpha", "../beta/foo") collapses to "beta/foo" and
 // silently lands traffic in another namespace.
-func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
+func (r *Store) resolveRepo(namespace, owningRepo string) (string, error) {
 	if owningRepo == "" {
 		// An empty owning repo is a meaningful root for some
 		// operations (e.g. an admin "list everything in this
@@ -303,14 +323,14 @@ func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
 		return namespace, nil
 	}
 	if path.IsAbs(owningRepo) {
-		return "", fmt.Errorf("%w: owning repo %q is absolute", ErrInvalidOwningRepo, owningRepo)
+		return "", fmt.Errorf("%w: owning repo %q is absolute", nsmeta.ErrInvalidOwningRepo, owningRepo)
 	}
 	cleaned := path.Clean(owningRepo)
 	if cleaned != owningRepo {
-		return "", fmt.Errorf("%w: owning repo %q is not in canonical form (clean: %q)", ErrInvalidOwningRepo, owningRepo, cleaned)
+		return "", fmt.Errorf("%w: owning repo %q is not in canonical form (clean: %q)", nsmeta.ErrInvalidOwningRepo, owningRepo, cleaned)
 	}
 	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") || strings.HasSuffix(cleaned, "/..") {
-		return "", fmt.Errorf("%w: owning repo %q escapes namespace", ErrInvalidOwningRepo, owningRepo)
+		return "", fmt.Errorf("%w: owning repo %q escapes namespace", nsmeta.ErrInvalidOwningRepo, owningRepo)
 	}
 	// The first path segment of the namespace package index repo is
 	// reserved: a write that landed there would mix user artifacts in
@@ -318,52 +338,47 @@ func (r *Registry) resolveRepo(namespace, owningRepo string) (string, error) {
 	// can otherwise reach it, so the check lives at the resolver — the
 	// chokepoint every per-format handler funnels through.
 	if cleaned == r.indexSuffix || strings.HasPrefix(cleaned, r.indexSuffix+"/") {
-		return "", fmt.Errorf("%w: owning repo %q uses reserved prefix %q", ErrInvalidOwningRepo, owningRepo, r.indexSuffix)
+		return "", fmt.Errorf("%w: owning repo %q uses reserved prefix %q", nsmeta.ErrInvalidOwningRepo, owningRepo, r.indexSuffix)
 	}
 	return path.Join(namespace, cleaned), nil
 }
 
-// ErrInvalidOwningRepo is returned when an owning-repo string is
-// malformed or attempts to escape the namespace it was scoped to.
-// Handlers should map this to 400.
-var ErrInvalidOwningRepo = errors.New("invalid owning repo")
-
-func (r *Registry) packageIndexRepo(namespace string) string {
+func (r *Store) packageIndexRepo(namespace string) string {
 	return path.Join(namespace, r.indexSuffix)
 }
 
 // NamespaceIndex is a tag-backed sibling repository inside one
 // namespace. Tags are encoded keys; callers see only decoded keys.
 type NamespaceIndex struct {
-	scoped *ScopedRegistry
+	scoped *ScopedNamespace
 	name   string
 }
 
-// ScopedRegistry is a per-namespace view of a [Registry]. Every
+// ScopedNamespace is a per-namespace view of a [Store]. Every
 // method authorizes the bound namespace, prefixes OwningRepo (or the
 // raw repo string for ListTags/ListFiles/etc.) with it, and forwards
 // to the underlying OCI backend.
 //
 // The struct is intentionally cheap to construct — it carries a
 // pointer to the parent and a string. Handlers obtain one per
-// request via [Registry.For] and discard it when the request
+// request via [Store.For] and discard it when the request
 // finishes.
 //
-// *ScopedRegistry implements the existing [pkg/handler.Registry]
+// *ScopedNamespace implements the existing [pkg/handler.Registry]
 // interface so handler code that previously held a *pkg/oci.Registry
-// can swap to a *ScopedRegistry with no signature changes.
-type ScopedRegistry struct {
-	parent    *Registry
+// can swap to a *ScopedNamespace with no signature changes.
+type ScopedNamespace struct {
+	parent    *Store
 	namespace string
 }
 
 // Namespace returns the bound namespace name.
-func (s *ScopedRegistry) Namespace() string { return s.namespace }
+func (s *ScopedNamespace) Namespace() string { return s.namespace }
 
 // Index returns a handle to a named namespace-local sentinel index.
 // The index name is a single repo segment such as "python-packages";
 // the backing repo lives beside package repos at "<namespace>/<name>".
-func (s *ScopedRegistry) Index(name string) *NamespaceIndex {
+func (s *ScopedNamespace) Index(name string) *NamespaceIndex {
 	return &NamespaceIndex{scoped: s, name: name}
 }
 
@@ -371,22 +386,22 @@ func (s *ScopedRegistry) Index(name string) *NamespaceIndex {
 // subject may perform op in the bound namespace. Format handlers use
 // this for protocol paths that don't naturally map to a concrete OCI
 // read/write operation before returning data.
-func (s *ScopedRegistry) Authorize(ctx context.Context, op auth.Op) error {
+func (s *ScopedNamespace) Authorize(ctx context.Context, op auth.Op) error {
 	return s.parent.authorize(ctx, s.namespace, op)
 }
 
-// Spec returns the namespace's current [Spec], used by per-format
+// Spec returns the namespace's current [namespace.Spec], used by per-format
 // handlers to dispatch on [Spec.Mode] / read [Spec.Proxy] before
 // committing to a code path.
 //
 // The returned pointer references the cached entry; callers must not
 // mutate the value. An unknown namespace returns an error wrapping
-// [ErrNotFound] so [handler.WriteNamespaceError] maps it to 404.
+// [namespace.ErrNotFound] so [handler.WriteNamespaceError] maps it to 404.
 //
 // Spec does not authorize: the namespace's compiled authorizer still
 // runs on downstream [AddFile] / [ReadFile] / [ListFiles] / etc., so
 // the dispatch primitive does not become an auth bypass.
-func (s *ScopedRegistry) Spec(ctx context.Context) (*Spec, error) {
+func (s *ScopedNamespace) Spec(ctx context.Context) (*nsmeta.Spec, error) {
 	cp, err := s.parent.specFor(ctx, s.namespace)
 	if err != nil {
 		return nil, err
@@ -398,7 +413,7 @@ func (s *ScopedRegistry) Spec(ctx context.Context) (*Spec, error) {
 // f.OwningRepo with the namespace, forwards to the inner registry,
 // and (best-effort) records the owning-repo in the namespace's
 // package index.
-func (s *ScopedRegistry) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+func (s *ScopedNamespace) AddFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
 	if f == nil {
 		return nil, errors.New("RepoFile must not be nil")
 	}
@@ -422,7 +437,7 @@ func (s *ScopedRegistry) AddFile(ctx context.Context, f *oci.RepoFile, body io.R
 // publish APIs must continue to call AddFile so namespace write policy
 // gates real artifact writes, while pull-through proxy cache misses can
 // populate OCI storage for readers without granting them publish rights.
-func (s *ScopedRegistry) AddCachedFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
+func (s *ScopedNamespace) AddCachedFile(ctx context.Context, f *oci.RepoFile, body io.Reader) (*oci.FileDescriptor, error) {
 	if f == nil {
 		return nil, errors.New("RepoFile must not be nil")
 	}
@@ -443,7 +458,7 @@ func (s *ScopedRegistry) AddCachedFile(ctx context.Context, f *oci.RepoFile, bod
 
 // ReadFile authorizes the bound namespace for read and forwards to
 // the inner registry with OwningRepo prefixed.
-func (s *ScopedRegistry) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
+func (s *ScopedNamespace) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.FileDescriptor, io.ReadCloser, error) {
 	if f == nil {
 		return nil, nil, errors.New("RepoFile must not be nil")
 	}
@@ -460,8 +475,8 @@ func (s *ScopedRegistry) ReadFile(ctx context.Context, f *oci.RepoFile) (*oci.Fi
 // BlobRedirectURL authorizes the bound namespace for read and
 // forwards to the inner registry with OwningRepo prefixed. Returns
 // ("", nil) when the backend serves blobs inline, mirroring
-// [oci.Registry].
-func (s *ScopedRegistry) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
+// [oci.Store].
+func (s *ScopedNamespace) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (string, error) {
 	if f == nil {
 		return "", errors.New("RepoFile must not be nil")
 	}
@@ -477,7 +492,7 @@ func (s *ScopedRegistry) BlobRedirectURL(ctx context.Context, f *oci.RepoFile) (
 
 // ListTags authorizes the bound namespace for read and returns the
 // canonical tags for repo within the namespace.
-func (s *ScopedRegistry) ListTags(ctx context.Context, repo string) ([]string, error) {
+func (s *ScopedNamespace) ListTags(ctx context.Context, repo string) ([]string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
@@ -490,7 +505,7 @@ func (s *ScopedRegistry) ListTags(ctx context.Context, repo string) ([]string, e
 
 // ResolveTag authorizes the bound namespace for read and returns the
 // canonical version tag identified by tag within repo.
-func (s *ScopedRegistry) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
+func (s *ScopedNamespace) ResolveTag(ctx context.Context, repo, tag string) (string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return "", err
 	}
@@ -508,7 +523,7 @@ func (s *ScopedRegistry) ResolveTag(ctx context.Context, repo, tag string) (stri
 // the raw backend prefix leak through. Each returned *RepoFile is
 // freshly allocated by the wrapper so a future inner-side cache of
 // descriptors stays safe.
-func (s *ScopedRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
+func (s *ScopedNamespace) ListFiles(ctx context.Context, repo string) ([]*oci.RepoFile, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
@@ -538,8 +553,8 @@ func (s *ScopedRegistry) ListFiles(ctx context.Context, repo string) ([]*oci.Rep
 //
 // An absent index repo is reported as an empty list — a namespace
 // that has never been written to legitimately has no packages.
-func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string, error) {
-	if err := ValidateName(namespace); err != nil {
+func (r *Store) ListPackages(ctx context.Context, namespace string) ([]string, error) {
+	if err := nsmeta.ValidateName(namespace); err != nil {
 		return nil, err
 	}
 	return r.listPackages(ctx, namespace)
@@ -547,20 +562,20 @@ func (r *Registry) ListPackages(ctx context.Context, namespace string) ([]string
 
 // ListPackages authorizes the bound namespace for read and returns
 // package-index entries for that namespace.
-func (s *ScopedRegistry) ListPackages(ctx context.Context) ([]string, error) {
+func (s *ScopedNamespace) ListPackages(ctx context.Context) ([]string, error) {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpRead); err != nil {
 		return nil, err
 	}
 	return s.parent.listPackages(ctx, s.namespace)
 }
 
-func (r *Registry) listPackages(ctx context.Context, namespace string) ([]string, error) {
+func (r *Store) listPackages(ctx context.Context, namespace string) ([]string, error) {
 	return r.listIndex(ctx, namespace, r.indexSuffix)
 }
 
 // AppendRefs authorizes the bound namespace for write and forwards
 // to the inner registry with repo prefixed.
-func (s *ScopedRegistry) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
+func (s *ScopedNamespace) AppendRefs(ctx context.Context, repo string, canonicalTag string, refs ...string) error {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
@@ -580,7 +595,7 @@ func (s *ScopedRegistry) AppendRefs(ctx context.Context, repo string, canonicalT
 // both the in-process indexed marker AND the backend index tag — so
 // [ListPackages] no longer reports the now-empty repo. Index cleanup
 // failures are logged at WARN and do not fail the call.
-func (s *ScopedRegistry) DeleteRepoFiles(ctx context.Context, repo string) error {
+func (s *ScopedNamespace) DeleteRepoFiles(ctx context.Context, repo string) error {
 	if err := s.parent.authorize(ctx, s.namespace, auth.OpWrite); err != nil {
 		return err
 	}
@@ -610,9 +625,9 @@ func (s *ScopedRegistry) DeleteRepoFiles(ctx context.Context, repo string) error
 }
 
 // scopedFile returns a copy of f with OwningRepo rewritten to the
-// namespace-prefixed backend form. Returns [ErrInvalidOwningRepo]
+// namespace-prefixed backend form. Returns [namespace.ErrInvalidOwningRepo]
 // when the input would escape the namespace.
-func (r *Registry) scopedFile(namespace string, f *oci.RepoFile) (*oci.RepoFile, error) {
+func (r *Store) scopedFile(namespace string, f *oci.RepoFile) (*oci.RepoFile, error) {
 	scoped := *f
 	resolved, err := r.resolveRepo(namespace, f.OwningRepo)
 	if err != nil {
@@ -635,7 +650,7 @@ func (r *Registry) scopedFile(namespace string, f *oci.RepoFile) (*oci.RepoFile,
 // *sync.Mutex would let an arriving third goroutine LoadOrStore a
 // fresh mutex for the same key, "guarding" with two unrelated
 // mutexes. The map is bounded by the indexed-LRU's eviction.
-func (r *Registry) recordPackage(ctx context.Context, namespace, owningRepo string) {
+func (r *Store) recordPackage(ctx context.Context, namespace, owningRepo string) {
 	if owningRepo == "" {
 		return
 	}
@@ -733,7 +748,7 @@ func (i *NamespaceIndex) List(ctx context.Context) ([]string, error) {
 	return i.scoped.parent.listIndex(ctx, i.scoped.namespace, i.name)
 }
 
-func (r *Registry) markIndex(ctx context.Context, namespace, indexName, key string) error {
+func (r *Store) markIndex(ctx context.Context, namespace, indexName, key string) error {
 	encoded, err := oci.EncodeTag(key)
 	if err != nil {
 		return err
@@ -751,7 +766,7 @@ func (r *Registry) markIndex(ctx context.Context, namespace, indexName, key stri
 	return nil
 }
 
-func (r *Registry) listIndex(ctx context.Context, namespace, indexName string) ([]string, error) {
+func (r *Store) listIndex(ctx context.Context, namespace, indexName string) ([]string, error) {
 	tags, err := r.inner.ListTags(ctx, path.Join(namespace, indexName))
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
@@ -773,18 +788,18 @@ func (r *Registry) listIndex(ctx context.Context, namespace, indexName string) (
 	return out, nil
 }
 
-func (r *Registry) validatePublicIndexName(name string) error {
+func (r *Store) validatePublicIndexName(name string) error {
 	if name == "" {
-		return fmt.Errorf("%w: index name must not be empty", ErrInvalidOwningRepo)
+		return fmt.Errorf("%w: index name must not be empty", nsmeta.ErrInvalidOwningRepo)
 	}
 	if name == r.indexSuffix {
-		return fmt.Errorf("%w: index name %q is reserved", ErrInvalidOwningRepo, name)
+		return fmt.Errorf("%w: index name %q is reserved", nsmeta.ErrInvalidOwningRepo, name)
 	}
 	if path.Clean(name) != name || strings.ContainsRune(name, '/') || name == "." || name == ".." {
-		return fmt.Errorf("%w: index name %q is not a single canonical segment", ErrInvalidOwningRepo, name)
+		return fmt.Errorf("%w: index name %q is not a single canonical segment", nsmeta.ErrInvalidOwningRepo, name)
 	}
 	if err := oci.ValidateRepoPrefix(name); err != nil {
-		return fmt.Errorf("%w: index name %q is invalid: %v", ErrInvalidOwningRepo, name, err)
+		return fmt.Errorf("%w: index name %q is invalid: %v", nsmeta.ErrInvalidOwningRepo, name, err)
 	}
 	return nil
 }

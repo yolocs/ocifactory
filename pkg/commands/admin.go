@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	adminhandler "github.com/yolocs/ocifactory/pkg/handler/admin"
@@ -151,11 +152,11 @@ func runAdminServe(ctx context.Context, cfg *adminServeConfig) error {
 	}
 	store := namespace.NewStore(reg, namespace.WithPrefix(cfg.NamespacePrefix))
 	// The admin service does not authorize data-plane requests, but
-	// namespace.Registry already owns the package-index decoding logic
+	// artifact.Store owns the package-index decoding logic
 	// needed for soft-delete emptiness checks. Keep it here only as a
 	// control-plane PackageLister.
-	nsReg := namespace.NewRegistry(reg, store)
-	ah, err := adminhandler.NewHandler(store, nsReg)
+	artifacts := artifact.NewStore(reg, store)
+	ah, err := adminhandler.NewHandler(store, artifacts)
 	if err != nil {
 		return fmt.Errorf("failed to create admin handler: %w", err)
 	}

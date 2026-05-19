@@ -1,4 +1,4 @@
-package namespace_test
+package artifact_test
 
 import (
 	"context"
@@ -14,17 +14,18 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"oras.land/oras-go/v2/errdef"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// Compile-time assertion: *ScopedRegistry satisfies handler.Registry
+// Compile-time assertion: *ScopedNamespace satisfies handler.Registry
 // so existing python/maven handlers can swap a *pkg/oci.Registry for
-// a *ScopedRegistry without any signature changes. Lives in the
+// a *ScopedNamespace without any signature changes. Lives in the
 // _test package to avoid pkg/namespace importing pkg/handler.
-var _ handler.Registry = (*namespace.ScopedRegistry)(nil)
+var _ handler.Registry = (*artifact.ScopedNamespace)(nil)
 
 const (
 	googleIss   = "https://accounts.google.com"
@@ -57,15 +58,15 @@ func aliceCtx(t *testing.T) context.Context {
 	})
 }
 
-func setup(t *testing.T, opts ...namespace.RegistryOption) (*oci.FakeRegistry, *namespace.Registry, *namespace.Store) {
+func setup(t *testing.T, opts ...artifact.StoreOption) (*oci.FakeRegistry, *artifact.Store, *namespace.Store) {
 	t.Helper()
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
 	// Disable the policy cache by default in tests so a Put then call
 	// in the same test sees the new spec without sleeping. The cache
 	// itself is exercised explicitly in TestRegistry_PolicyCache_*.
-	allOpts := append([]namespace.RegistryOption{namespace.WithPolicyCacheTTL(0)}, opts...)
-	reg := namespace.NewRegistry(fake, store, allOpts...)
+	allOpts := append([]artifact.StoreOption{artifact.WithPolicyCacheTTL(0)}, opts...)
+	reg := artifact.NewStore(fake, store, allOpts...)
 	return fake, reg, store
 }
 
@@ -87,7 +88,7 @@ func newRepoFile(repo, tag, name string) *oci.RepoFile {
 	}
 }
 
-func TestScopedRegistry_AddRead_HappyPath(t *testing.T) {
+func TestScopedNamespace_AddRead_HappyPath(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -123,12 +124,12 @@ func TestScopedRegistry_AddRead_HappyPath(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_NamespaceIsolation pins the load-bearing
+// TestScopedNamespace_NamespaceIsolation pins the load-bearing
 // security guarantee: the beta scoped view cannot read a file
 // written through the alpha scoped view, AND alpha can still read
 // its own file (so a regression that 5xx'd on every read wouldn't
 // pass for the wrong reason).
-func TestScopedRegistry_NamespaceIsolation(t *testing.T) {
+func TestScopedNamespace_NamespaceIsolation(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -158,10 +159,10 @@ func TestScopedRegistry_NamespaceIsolation(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_NamespaceEscape is the explicit anti-vuln
+// TestScopedNamespace_NamespaceEscape is the explicit anti-vuln
 // test: the alpha scoped view cannot reach beta by passing
 // OwningRepo="../beta/foo" etc.
-func TestScopedRegistry_NamespaceEscape(t *testing.T) {
+func TestScopedNamespace_NamespaceEscape(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -202,12 +203,12 @@ func TestScopedRegistry_NamespaceEscape(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_RejectsReservedIndexSuffix proves the wrapper
+// TestScopedNamespace_RejectsReservedIndexSuffix proves the wrapper
 // refuses to route a user-supplied owning-repo into the per-namespace
 // package-index repo. Without this check a maven-style handler that
 // builds OwningRepo from URL path segments could plant tags in the
 // wrapper's own sentinel repo.
-func TestScopedRegistry_RejectsReservedIndexSuffix(t *testing.T) {
+func TestScopedNamespace_RejectsReservedIndexSuffix(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -236,7 +237,7 @@ func TestScopedRegistry_RejectsReservedIndexSuffix(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_NamespaceNotFound(t *testing.T) {
+func TestScopedNamespace_NamespaceNotFound(t *testing.T) {
 	t.Parallel()
 
 	_, reg, _ := setup(t)
@@ -317,7 +318,7 @@ func TestScopedRegistry_NamespaceNotFound(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_NilFile(t *testing.T) {
+func TestScopedNamespace_NilFile(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -336,7 +337,7 @@ func TestScopedRegistry_NilFile(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_Authz(t *testing.T) {
+func TestScopedNamespace_Authz(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -457,7 +458,7 @@ func seedDirect(t *testing.T, fake *oci.FakeRegistry, ns string) {
 	}
 }
 
-func TestScopedRegistry_NoAuthContextDenied(t *testing.T) {
+func TestScopedNamespace_NoAuthContextDenied(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -472,16 +473,16 @@ func TestScopedRegistry_NoAuthContextDenied(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_NoAuthContextDeniedAtWrapper proves the wrapper
+// TestScopedNamespace_NoAuthContextDeniedAtWrapper proves the wrapper
 // itself denies nil even when the AuthzFactory would have allowed.
-func TestScopedRegistry_NoAuthContextDeniedAtWrapper(t *testing.T) {
+func TestScopedNamespace_NoAuthContextDeniedAtWrapper(t *testing.T) {
 	t.Parallel()
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store,
-		namespace.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) { return auth.AllowAll, nil }),
-		namespace.WithPolicyCacheTTL(0),
+	reg := artifact.NewStore(fake, store,
+		artifact.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) { return auth.AllowAll, nil }),
+		artifact.WithPolicyCacheTTL(0),
 	)
 	putNamespace(t, store, "alpha", allowAllSpec())
 
@@ -491,16 +492,16 @@ func TestScopedRegistry_NoAuthContextDeniedAtWrapper(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_PackageIndex_PopulatedExactlyOnce uses a
+// TestScopedNamespace_PackageIndex_PopulatedExactlyOnce uses a
 // counting backend to prove the wrapper makes exactly one
 // index-repo AddFile call across N data writes to the same
 // (ns, owning-repo).
-func TestScopedRegistry_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
+func TestScopedNamespace_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
 	t.Parallel()
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
 	scoped := reg.For("alpha")
@@ -517,7 +518,7 @@ func TestScopedRegistry_PackageIndex_PopulatedExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_PackageIndex_MultipleRepos(t *testing.T) {
+func TestScopedNamespace_PackageIndex_MultipleRepos(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -542,15 +543,15 @@ func TestScopedRegistry_PackageIndex_MultipleRepos(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_PackageIndex_ConcurrentExactlyOneAddFile is
+// TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile is
 // the concurrency stress: N goroutines hammering the same
 // (ns, owning-repo) must result in exactly ONE index-repo AddFile.
-func TestScopedRegistry_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) {
+func TestScopedNamespace_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) {
 	t.Parallel()
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
 	scoped := reg.For("alpha")
@@ -586,7 +587,7 @@ func TestScopedRegistry_PackageIndex_ConcurrentExactlyOneAddFile(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_PackageIndex_Isolated(t *testing.T) {
+func TestScopedNamespace_PackageIndex_Isolated(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -607,7 +608,7 @@ func TestScopedRegistry_PackageIndex_Isolated(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_Index_RoundTrip(t *testing.T) {
+func TestScopedNamespace_Index_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -658,7 +659,7 @@ func TestScopedRegistry_Index_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_Index_RejectsInvalidName(t *testing.T) {
+func TestScopedNamespace_Index_RejectsInvalidName(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -679,10 +680,10 @@ func TestScopedRegistry_Index_RejectsInvalidName(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_TagEncoding_RoundTrip pins the encoding
+// TestScopedNamespace_TagEncoding_RoundTrip pins the encoding
 // properties: collision-free between names that differ only in '/'
 // vs '_'.
-func TestScopedRegistry_TagEncoding_RoundTrip(t *testing.T) {
+func TestScopedNamespace_TagEncoding_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -716,7 +717,7 @@ func TestScopedRegistry_TagEncoding_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
+func TestScopedNamespace_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -732,7 +733,7 @@ func TestScopedRegistry_ListPackages_EmptyOnUntouchedNamespace(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_ListTags_AndListFiles(t *testing.T) {
+func TestScopedNamespace_ListTags_AndListFiles(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -769,7 +770,7 @@ func TestScopedRegistry_ListTags_AndListFiles(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_ListFiles_MultiSegmentRepo(t *testing.T) {
+func TestScopedNamespace_ListFiles_MultiSegmentRepo(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -790,9 +791,9 @@ func TestScopedRegistry_ListFiles_MultiSegmentRepo(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_ListFiles_PrefixOfAnotherNamespace pins that
+// TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace pins that
 // "alpha" doesn't accidentally strip from "alpha-foo" repos.
-func TestScopedRegistry_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
+func TestScopedNamespace_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -817,7 +818,7 @@ func TestScopedRegistry_ListFiles_PrefixOfAnotherNamespace(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_AppendRefs_Forwards(t *testing.T) {
+func TestScopedNamespace_AppendRefs_Forwards(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -836,7 +837,7 @@ func TestScopedRegistry_AppendRefs_Forwards(t *testing.T) {
 	}
 }
 
-func TestScopedRegistry_ResolveTag(t *testing.T) {
+func TestScopedNamespace_ResolveTag(t *testing.T) {
 	t.Parallel()
 
 	_, reg, store := setup(t)
@@ -874,10 +875,10 @@ func TestScopedRegistry_ResolveTag(t *testing.T) {
 	}
 }
 
-// TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex verifies
+// TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex verifies
 // BOTH the in-process indexed marker AND the backend
 // ocifactory-packages tag are cleared.
-func TestScopedRegistry_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
+func TestScopedNamespace_DeleteRepoFiles_SweepsBackendIndex(t *testing.T) {
 	t.Parallel()
 
 	fake, reg, store := setup(t)
@@ -933,7 +934,7 @@ func TestRegistry_PolicyCache_HotPathSkipsStore(t *testing.T) {
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(time.Hour))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(time.Hour))
 
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
@@ -965,7 +966,7 @@ func TestRegistry_PolicyCache_TTLZero_DisablesCache(t *testing.T) {
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(0))
 
 	putNamespace(t, store, "alpha", allowAllSpec())
 	ctx := aliceCtx(t)
@@ -995,7 +996,7 @@ func TestRegistry_PolicyCache_NegativeCaching(t *testing.T) {
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(time.Hour))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(time.Hour))
 	ctx := aliceCtx(t)
 
 	const iters = 10
@@ -1026,7 +1027,7 @@ func TestRegistry_StorePut_InvalidatesCache(t *testing.T) {
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(time.Hour))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(time.Hour))
 	ctx := aliceCtx(t)
 
 	putNamespace(t, store, "alpha", namespace.Spec{Policy: namespace.Policy{
@@ -1050,7 +1051,7 @@ func TestRegistry_PolicyCache_Singleflight(t *testing.T) {
 
 	counted := newCountingBackend()
 	store := namespace.NewStore(counted)
-	reg := namespace.NewRegistry(counted, store, namespace.WithPolicyCacheTTL(time.Hour))
+	reg := artifact.NewStore(counted, store, artifact.WithPolicyCacheTTL(time.Hour))
 	putNamespace(t, store, "alpha", allowAllSpec())
 	seedDirect(t, counted.FakeRegistry, "alpha")
 	counted.resetSpecReads("alpha")

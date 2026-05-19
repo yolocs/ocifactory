@@ -3,6 +3,7 @@ package python
 import (
 	"testing"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 )
@@ -27,15 +28,15 @@ func allowAllPolicy() namespace.Policy {
 }
 
 // newTestHandler builds a python [*Handler] wired to a
-// [*namespace.Registry] backed by inner. A "test-ns" namespace with an
+// [*artifact.Store] backed by inner. A "test-ns" namespace with an
 // allow-all policy is registered; the auth middleware installs the
 // [auth.AlwaysAnonymous] AuthContext on every request so the wrapper
 // has a subject to authorize. Tests that need a different namespace /
 // policy / authenticator construct the plumbing inline.
-func newTestHandler(t *testing.T, inner namespace.RegistryBackend, opts ...Option) (*Handler, *namespace.Store) {
+func newTestHandler(t *testing.T, inner artifact.Backend, opts ...Option) (*Handler, *namespace.Store) {
 	t.Helper()
 	store := namespace.NewStore(inner)
-	reg := namespace.NewRegistry(inner, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(inner, store, artifact.WithPolicyCacheTTL(0))
 	if err := store.Put(t.Context(), &namespace.Namespace{Name: testNS, Spec: namespace.Spec{Policy: allowAllPolicy()}}); err != nil {
 		t.Fatalf("Put namespace: %v", err)
 	}

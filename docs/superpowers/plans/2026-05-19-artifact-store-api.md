@@ -4,7 +4,7 @@
 
 **Goal:** Refactor handler-facing OCI access behind a namespace-scoped artifact API centered on package, version, tag, and file nouns.
 
-**Architecture:** Keep `pkg/oci` as the low-level OCI storage codec and add a higher-level data-plane API in `pkg/artifact`. The implementation wraps the existing `namespace.ScopedRegistry` behavior first, then handlers migrate from raw `oci.RepoFile` and repo strings to `artifact.Namespace`, `artifact.Package`, and `artifact.FileHandle` without changing the on-OCI layout.
+**Architecture:** Keep `pkg/oci` as the low-level OCI storage codec and add a higher-level data-plane API in `pkg/artifact`. The implementation wraps the existing `artifact.ScopedNamespace` behavior first, then handlers migrate from raw `oci.RepoFile` and repo strings to `artifact.Namespace`, `artifact.Package`, and `artifact.FileHandle` without changing the on-OCI layout.
 
 **Tech Stack:** Go, gorilla/mux handlers, existing `pkg/oci` registry, existing `pkg/namespace` authz and policy cache, `go-cmp` for tests.
 
@@ -29,11 +29,11 @@ Expected: FAIL because `pkg/artifact` production code does not exist yet.
 - [x] **Step 3: Implement API and namespace-registry adapter**
 
 Create `pkg/artifact/artifact.go` and `pkg/artifact/namespace.go`. The adapter should:
-- expose `NewStore(registry *namespace.Registry) *Store`;
+- expose `NewStore(inner artifact.Backend, namespaces artifact.NamespaceStore) *Store`;
 - validate namespace existence with `Spec(ctx)` before returning a scoped namespace;
 - expose `Namespace.Package(name)` as a cheap value object;
 - construct `oci.RepoFile` only inside `pkg/artifact`;
-- keep package names namespace-relative and pass them to `namespace.ScopedRegistry`;
+- keep package names namespace-relative and pass them to `artifact.ScopedNamespace`;
 - implement `FileHandle.DownloadURL` through `BlobRedirectURL`;
 - implement `FileHandle.Open` through `ReadFile`.
 
@@ -139,7 +139,7 @@ Expected: PASS.
 
 - [ ] **Step 1: Remove obsolete handler registry dependency where possible**
 
-Keep low-level `namespace.ScopedRegistry` methods until all proxy/fetcher paths are migrated. Do not delete `oci.RepoFile`; it remains the low-level storage representation.
+Keep low-level `artifact.ScopedNamespace` methods until all proxy/fetcher paths are migrated. Do not delete `oci.RepoFile`; it remains the low-level storage representation.
 
 - [ ] **Step 2: Run full short verification**
 

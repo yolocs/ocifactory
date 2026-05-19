@@ -22,6 +22,11 @@ const CurrentSchemaVersion = 1
 // operator-facing message clear.
 var ErrUnsupportedSchemaVersion = errors.New("unsupported namespace schema_version")
 
+// ErrInvalidOwningRepo is returned when an artifact owning-repo string is
+// malformed or attempts to escape the namespace it was scoped to. Handlers
+// should map this to 400.
+var ErrInvalidOwningRepo = errors.New("invalid owning repo")
+
 // Namespace is a namespace and its spec. Name is the identifier as
 // it appears in URLs; validation rules live on [ValidateName].
 type Namespace struct {

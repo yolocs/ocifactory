@@ -3,6 +3,7 @@ package maven
 import (
 	"testing"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 )
@@ -24,14 +25,14 @@ func allowAllPolicy() namespace.Policy {
 }
 
 // newTestHandler builds a maven [*Handler] wired to a
-// [*namespace.Registry] backed by inner. The "test-ns" namespace
+// [*artifact.Store] backed by inner. The "test-ns" namespace
 // receives an allow-all policy and the auth middleware installs the
 // [auth.AlwaysAnonymous] AuthContext on every request so the wrapper
 // has a subject to authorize.
-func newTestHandler(t *testing.T, inner namespace.RegistryBackend, opts ...Option) (*Handler, *namespace.Store) {
+func newTestHandler(t *testing.T, inner artifact.Backend, opts ...Option) (*Handler, *namespace.Store) {
 	t.Helper()
 	store := namespace.NewStore(inner)
-	reg := namespace.NewRegistry(inner, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(inner, store, artifact.WithPolicyCacheTTL(0))
 	if err := store.Put(t.Context(), &namespace.Namespace{Name: testNS, Spec: namespace.Spec{Policy: allowAllPolicy()}}); err != nil {
 		t.Fatalf("Put namespace: %v", err)
 	}

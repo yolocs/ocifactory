@@ -144,7 +144,7 @@ under `--backend-registry` plus any configured `--repo-prefix`:
 | `<namespace>/python-packages` | `<pkg>` per package | A single sentinel layer (`name=present`, body=`"present\n"`). The body is unused; this is the package list for this namespace. |
 
 A third per-namespace repo, `<namespace>/ocifactory-packages`, is
-maintained by the data-plane namespace wrapper itself — its tags
+maintained by the artifact data-plane wrapper itself — its tags
 enumerate every OwningRepo the wrapper has recorded a write for, and
 it backs the admin service's "namespace is empty" check on soft
 delete. Operators don't write to it directly.
@@ -205,7 +205,7 @@ covers `/simple/...` listings and `/packages/.../<file>` blob fetches;
 granularity today: every reader in a namespace can read every package
 in it, every writer can write to any package in it. Out-of-tree
 authorizers (OPA / Cedar / Casbin) plug in via
-`namespace.WithAuthzFactory` if you need finer control.
+`artifact.WithAuthzFactory` if you need finer control.
 
 See [`docs/auth.md`](../auth.md#namespace-authorization) for the
 policy model and matcher reference.

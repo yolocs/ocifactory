@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler/admin"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -243,8 +244,8 @@ func TestHandler_NamespaceCRUD(t *testing.T) {
 			t.Parallel()
 			reg := oci.NewFakeRegistry()
 			store := namespace.NewStore(reg)
-			nsReg := namespace.NewRegistry(reg, store)
-			h, err := admin.NewHandler(store, nsReg)
+			artifacts := artifact.NewStore(reg, store)
+			h, err := admin.NewHandler(store, artifacts)
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
 			}
@@ -294,8 +295,8 @@ func TestHandler_PutStampsSchemaVersionOnDisk(t *testing.T) {
 
 	reg := oci.NewFakeRegistry()
 	store := namespace.NewStore(reg)
-	nsReg := namespace.NewRegistry(reg, store)
-	h, err := admin.NewHandler(store, nsReg)
+	artifacts := artifact.NewStore(reg, store)
+	h, err := admin.NewHandler(store, artifacts)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -330,7 +331,7 @@ func TestNewHandler_RequiresDependencies(t *testing.T) {
 
 	reg := oci.NewFakeRegistry()
 	store := namespace.NewStore(reg)
-	nsReg := namespace.NewRegistry(reg, store)
+	artifacts := artifact.NewStore(reg, store)
 
 	tests := []struct {
 		name      string
@@ -338,7 +339,7 @@ func TestNewHandler_RequiresDependencies(t *testing.T) {
 		packages  admin.PackageLister
 		wantError string
 	}{
-		{name: "missing store", packages: nsReg, wantError: "store is required"},
+		{name: "missing store", packages: artifacts, wantError: "store is required"},
 		{name: "missing package lister", store: store, wantError: "package lister is required"},
 	}
 

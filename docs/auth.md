@@ -41,7 +41,7 @@ router, so:
   sub-router that doesn't `Use(authMW)`.
 
 Authorization runs one layer deeper, inside the
-`namespace.ScopedRegistry` wrapper: every `AddFile` / `ReadFile` /
+`artifact.ScopedNamespace` wrapper: every `AddFile` / `ReadFile` /
 `ListTags` / `ListFiles` call routes through the namespace's
 compiled `Policy` before reaching the OCI backend, so even a
 handler bug that skipped its own pre-check would not let a request
@@ -107,7 +107,7 @@ Granularity is per-namespace, not per-package. A caller matched by
 any reader matcher can read every package in the namespace; a caller
 matched by any writer matcher can write to any. Per-coordinate
 granularity is intentionally deferred — operators who need it plug
-in their own `Authorizer` via `namespace.WithAuthzFactory` (OPA,
+in their own `Authorizer` via `artifact.WithAuthzFactory` (OPA,
 Cedar, Casbin) and consume the same `AuthContext`.
 
 ### Policy shape
@@ -184,17 +184,18 @@ match on environment, ref, or workflow file precisely.
 
 ### Plugging in an alternative authorizer
 
-`namespace.AuthzFactory` is `func(Policy) (auth.Authorizer, error)`.
+`artifact.AuthzFactory` is `func(namespace.Policy) (auth.Authorizer, error)`.
 A custom main can replace the built-in factory:
 
 ```go
 import (
+    "github.com/yolocs/ocifactory/pkg/artifact"
     "github.com/yolocs/ocifactory/pkg/auth"
     "github.com/yolocs/ocifactory/pkg/namespace"
 )
 
-reg := namespace.NewRegistry(ociReg, store,
-    namespace.WithAuthzFactory(func(p namespace.Policy) (auth.Authorizer, error) {
+reg := artifact.NewStore(ociReg, store,
+    artifact.WithAuthzFactory(func(p namespace.Policy) (auth.Authorizer, error) {
         // compile p (or fetch a richer policy keyed by namespace name) into
         // an authorizer that consumes auth.AuthContext.
         return myOPAAuthorizer(p)
@@ -449,7 +450,7 @@ OCI backend, no real artifacts. See `pkg/handler/echo`.
 - **Per-coordinate authorization** — every reader in a namespace
   can read every package in it, every writer can write to any.
   Operators who need finer control plug in their own `Authorizer`
-  via `namespace.WithAuthzFactory` (OPA, Cedar, Casbin).
+  via `artifact.WithAuthzFactory` (OPA, Cedar, Casbin).
 - **Scoped-token issuance.** A planned `POST /admin/v1/tokens`
   endpoint would take a verified OIDC token and mint a shorter-lived
   ocifactory-audience token bound to a namespace and op; the wire

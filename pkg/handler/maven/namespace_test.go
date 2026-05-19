@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -22,7 +23,7 @@ func TestNamespace_UnknownNamespace404(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	authMW := auth.Middleware(auth.AlwaysAnonymous)
 	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
 	if err != nil {
@@ -60,7 +61,7 @@ func TestNamespace_InvalidNamespaceName400(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	authMW := auth.Middleware(auth.AlwaysAnonymous)
 	h, err := NewHandler(reg, WithAuthMiddleware(authMW))
 	if err != nil {
@@ -94,13 +95,13 @@ func TestNamespace_AuthzErrorFailsClosed(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store,
-		namespace.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) {
+	reg := artifact.NewStore(fake, store,
+		artifact.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) {
 			return auth.AuthorizerFunc(func(_ context.Context, _ *auth.AuthContext, _ auth.Op) error {
 				return errors.New("transient backend lookup failure")
 			}), nil
 		}),
-		namespace.WithPolicyCacheTTL(0),
+		artifact.WithPolicyCacheTTL(0),
 	)
 	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
 
@@ -134,7 +135,7 @@ func TestNamespace_NotInReadersForbidden(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, testNS, namespace.Spec{Policy: namespace.Policy{
 		Readers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
 		Writers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
@@ -161,7 +162,7 @@ func TestNamespace_NotInWritersForbidden(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, testNS, namespace.Spec{Policy: namespace.Policy{
 		Readers: []namespace.SubjectMatcher{{Issuer: "anonymous"}},
 		Writers: []namespace.SubjectMatcher{{Issuer: "https://accounts.google.com"}},
@@ -188,7 +189,7 @@ func TestNamespace_CrossNamespaceIsolation_Artifact(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", namespace.Spec{Policy: allowAllPolicy()})
 	putNamespace(t, store, "beta", namespace.Spec{Policy: allowAllPolicy()})
 
@@ -233,7 +234,7 @@ func TestNamespace_CrossNamespaceIsolation_Checksum(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, "alpha", namespace.Spec{Policy: allowAllPolicy()})
 	putNamespace(t, store, "beta", namespace.Spec{Policy: allowAllPolicy()})
 
@@ -277,7 +278,7 @@ func TestNamespace_ReservedIndexNameIsPackageScoped(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
 
 	authMW := auth.Middleware(auth.AlwaysAnonymous)
@@ -306,9 +307,9 @@ func TestNamespace_NoAuthForbiddenAtWrapper(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store,
-		namespace.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) { return auth.AllowAll, nil }),
-		namespace.WithPolicyCacheTTL(0),
+	reg := artifact.NewStore(fake, store,
+		artifact.WithAuthzFactory(func(_ namespace.Policy) (auth.Authorizer, error) { return auth.AllowAll, nil }),
+		artifact.WithPolicyCacheTTL(0),
 	)
 	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
 

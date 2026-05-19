@@ -25,7 +25,6 @@ import (
 	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
-	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"oras.land/oras-go/v2/errdef"
@@ -84,7 +83,6 @@ const (
 // Handler is the npm format handler. Build one with [NewHandler] and
 // register its mux via [Handler.Mux].
 type Handler struct {
-	registry       *namespace.Registry
 	artifacts      *artifact.Store
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
@@ -133,13 +131,13 @@ func WithMaxUploadBytes(n int64) Option {
 
 // NewHandler constructs a new npm format handler.
 //
-// registry is the data-plane wrapper that hands out per-request
-// [*namespace.ScopedRegistry] views via [namespace.Registry.For]. Every
+// artifacts is the data-plane wrapper that hands out per-request
+// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every
 // routed handler resolves the namespace from the request URL
 // (`/{namespace}/...`) and obtains a scoped view at the top.
-func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
-	if registry == nil {
-		return nil, errors.New("registry must not be nil")
+func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
+	if artifacts == nil {
+		return nil, errors.New("artifact store must not be nil")
 	}
 	cfg := handlerConfig{
 		maxUploadBytes: DefaultMaxUploadBytes,
@@ -148,8 +146,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 		opt(&cfg)
 	}
 	h := &Handler{
-		registry:       registry,
-		artifacts:      artifact.NewStore(registry),
+		artifacts:      artifacts,
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
 	}
@@ -160,7 +157,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 // Mux returns the npm handler's router. Every npm route lives under
 // `/{namespace}/...` so the handler resolves the namespace from the
 // URL on each request and routes through the namespace-scoped
-// registry view.
+// artifact view.
 func (h *Handler) Mux() http.Handler {
 	router := mux.NewRouter()
 	router.Use(mux.MiddlewareFunc(handler.RouteNameOpMiddleware))
@@ -207,10 +204,10 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*namespace.ScopedRegistry] for
+// scopedFor returns the per-request [*artifact.ScopedNamespace] for
 // the namespace in req's URL. Cheap to construct; called per request.
-func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
-	return h.registry.For(mux.Vars(req)["namespace"])
+func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
+	return h.artifacts.For(mux.Vars(req)["namespace"])
 }
 
 func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
@@ -907,7 +904,7 @@ func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleDistTagDelete drops a dist-tag alias. v1 returns 501 with a
-// JSON body — the namespace wrapper does not yet expose a single-tag
+// JSON body — the artifact data-plane wrapper does not yet expose a single-tag
 // delete from the data plane, and adding one purely for dist-tag
 // removal is more surface than the v1 issue justifies. Operators
 // re-point unwanted dist-tags to a known version instead.
@@ -924,7 +921,7 @@ func (h *Handler) handleDistTagDelete(w http.ResponseWriter, req *http.Request) 
 
 // ensureIndexSentinel marks the package name in the per-format
 // namespace index.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *namespace.ScopedRegistry, npmName string) error {
+func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *artifact.ScopedNamespace, npmName string) error {
 	return scoped.Index(packageIndexName).Mark(ctx, npmName)
 }
 

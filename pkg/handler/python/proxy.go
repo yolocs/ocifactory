@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"golang.org/x/sync/singleflight"
 	"oras.land/oras-go/v2/errdef"
 
@@ -182,7 +183,7 @@ func (p *proxyState) fetcherFor(upstream string) (ProxyFetcher, error) {
 // namespace and whether the request should be served via the proxy
 // path. When the namespace is unknown or malformed, it writes the
 // matching error response and returns ok=false so the caller stops.
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry) (*namespace.Spec, bool, bool) {
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
 	spec, err := scoped.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -209,7 +210,7 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 //
 // Concurrent first-misses for the same (ns, pkg, version, filename)
 // collapse onto one upstream fetch via the file-singleflight group.
-func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
@@ -493,7 +494,7 @@ type fileFlightResult struct {
 // "peer wrote the file, re-serve from cache" and "peer failed, do
 // our own fetch". Returns (true, nil) on hit, (false, nil) on miss,
 // non-nil error on backend trouble.
-func (h *Handler) peekRegistry(ctx context.Context, scoped *namespace.ScopedRegistry, f *oci.RepoFile) (bool, error) {
+func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
 	desc, rc, err := scoped.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
@@ -510,7 +511,7 @@ func (h *Handler) peekRegistry(ctx context.Context, scoped *namespace.ScopedRegi
 // flow. Returns true on success (response written), false on miss so
 // the caller continues with the proxy fetch. Errors other than
 // not-found are written as the appropriate HTTP status and return true.
-func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, f *oci.RepoFile) bool {
+func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
@@ -570,18 +571,18 @@ func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request,
 //
 // Concurrent refreshes for the same (namespace, pkg) collapse onto
 // one upstream fetch via the index-singleflight group.
-func (h *Handler) handlePackageIndexProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
+func (h *Handler) handlePackageIndexProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
 	h.serveProxyIndex(w, req, scoped, spec, pkg)
 }
 
 // handleSimpleIndexProxy serves /{ns}/simple/ in proxy mode. Same
 // flow as the per-package path with cache key pkg="" and synthesis
 // fallback through the per-format namespace index.
-func (h *Handler) handleSimpleIndexProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec) {
+func (h *Handler) handleSimpleIndexProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec) {
 	h.serveProxyIndex(w, req, scoped, spec, "")
 }
 
-func (h *Handler) serveProxyIndex(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
+func (h *Handler) serveProxyIndex(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	ns := scoped.Namespace()
@@ -705,7 +706,7 @@ type indexFlightResult struct {
 // (namespace, package) either — 503, since serving a literal empty
 // index would have pip conclude the package was unyanked, which is
 // worse than a clear "we're degraded" signal.
-func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, pkg string, upstreamErr error) {
+func (h *Handler) synthesizeIndex(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, pkg string, upstreamErr error) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	ns := scoped.Namespace()

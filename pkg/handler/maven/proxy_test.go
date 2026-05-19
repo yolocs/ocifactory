@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -94,7 +95,7 @@ func newProxyTestHandler(t *testing.T, fetcher ProxyFetcher, spec namespace.Spec
 	t.Helper()
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 
 	if spec.Mode == "" {
 		spec.Mode = namespace.ModeProxy

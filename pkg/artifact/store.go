@@ -7,42 +7,19 @@ import (
 	"io"
 	"sort"
 
-	"github.com/yolocs/ocifactory/pkg/namespace"
+	nsmeta "github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 )
 
-// Store adapts the namespace registry into the artifact noun API.
-type Store struct {
-	registry *namespace.Registry
-}
-
-// NewStore returns an artifact store backed by registry.
-func NewStore(registry *namespace.Registry) *Store {
-	return &Store{registry: registry}
-}
-
-// Namespace returns a namespace-scoped artifact view after validating
-// that the namespace metadata exists.
-func (s *Store) Namespace(ctx context.Context, name string) (Namespace, error) {
-	if s == nil || s.registry == nil {
-		return nil, errors.New("artifact store registry must not be nil")
-	}
-	scoped := s.registry.For(name)
-	if _, err := scoped.Spec(ctx); err != nil {
-		return nil, err
-	}
-	return artifactNamespace{scoped: scoped}, nil
-}
-
 type artifactNamespace struct {
-	scoped *namespace.ScopedRegistry
+	scoped *ScopedNamespace
 }
 
 func (n artifactNamespace) Name() string {
 	return n.scoped.Namespace()
 }
 
-func (n artifactNamespace) Spec(ctx context.Context) (*namespace.Spec, error) {
+func (n artifactNamespace) Spec(ctx context.Context) (*nsmeta.Spec, error) {
 	return n.scoped.Spec(ctx)
 }
 
@@ -55,7 +32,7 @@ func (n artifactNamespace) ListPackages(ctx context.Context) ([]string, error) {
 }
 
 type artifactPackage struct {
-	scoped *namespace.ScopedRegistry
+	scoped *ScopedNamespace
 	name   string
 }
 
@@ -221,7 +198,7 @@ func (p artifactPackage) repoFile(version, tag, name string) (*oci.RepoFile, err
 }
 
 type fileHandle struct {
-	scoped *namespace.ScopedRegistry
+	scoped *ScopedNamespace
 	file   *oci.RepoFile
 	info   FileInfo
 }

@@ -8,7 +8,7 @@ link here from their "How it's stored" sections.
 The implementation lives in [`pkg/oci/registry.go`](../../pkg/oci/registry.go);
 the deterministic file-tag helper lives in
 [`pkg/oci/filetag.go`](../../pkg/oci/filetag.go). The data-plane
-namespace wrapper that prefixes every backend repo with `<namespace>/`
+artifact data-plane wrapper that prefixes every backend repo with `<namespace>/`
 before reaching `pkg/oci` lives in
 [`pkg/namespace/registry.go`](../../pkg/namespace/registry.go); this
 doc shows the shape `pkg/oci` ends up writing, so every repo path
@@ -128,7 +128,7 @@ requests-2.31.0-cp311-cp311-manylinux_2_17_x86_64.whl
 `twine` issues **three independent POSTs** to ocifactory's
 `/{namespace}/` endpoint — one per file. They may arrive in any order
 and may overlap if `twine` is parallelised across CI workers. The
-namespace wrapper resolves each request to the `myteam` namespace's
+artifact data-plane wrapper resolves each request to the `myteam` namespace's
 authorizer, prefixes the python handler's `packages/requests`
 owning-repo with the namespace segment, and forwards to `pkg/oci`.
 
@@ -197,7 +197,7 @@ PUT /com/example/foo/maven-metadata.xml.sha1
 
 Each PUT lands as one `AddFile` call against the
 `<namespace>/com/example/foo` OCI repo (the maven handler addresses
-the repo as `com/example/foo`; the namespace wrapper prefixes it
+the repo as `com/example/foo`; the artifact data-plane wrapper prefixes it
 before forwarding). The first one (jar, say) walks the same five
 steps as the python sdist above: probe, push blob, ensure `1.0.0`
 version manifest, push file manifest with `subject = versionDesc`,

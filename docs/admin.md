@@ -167,7 +167,7 @@ a hosted namespace.
 
 Policy changes via this API take effect on the very next data-plane
 request. The admin `Store` fires a mutation hook on `Put` / `Delete`
-that the data plane's `namespace.Registry` consumes to invalidate its
+that the data plane's `artifact.Store` consumes to invalidate its
 cached authorizer for the affected namespace. Without that hook,
 changes would only land after the cache TTL (`DefaultPolicyCacheTTL = 60s`)
 expired.

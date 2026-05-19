@@ -136,7 +136,7 @@ versus `OpWrite`). The namespace's `Policy` (readers / writers
 [`docs/auth.md#namespace-authorization`](../auth.md#namespace-authorization).
 Note any granularity beyond per-namespace (almost certainly: none
 in v1; per-package authz is operator-pluggable via
-`namespace.WithAuthzFactory`).
+`artifact.WithAuthzFactory`).
 
 ## Operator knobs
 

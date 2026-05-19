@@ -183,7 +183,7 @@ Package storage and the npm package-list index live per namespace under
 | `<namespace>/npm-packages` | `<encoded-name>` per package | A single sentinel layer (`name=present`, body=`"present\n"`). The namespace index primitive decodes tags before returning package names. |
 
 A fourth per-namespace repo, `<namespace>/ocifactory-packages`, is
-maintained by the namespace wrapper itself — its tags enumerate every
+maintained by the artifact data-plane wrapper itself — its tags enumerate every
 owning-repo the wrapper has recorded a write for. It backs the admin
 service's "namespace is empty" check on soft delete; operators don't
 write to it directly.
@@ -265,7 +265,7 @@ covers packument GETs, tarball downloads, and dist-tag listings;
 granularity today: every reader in a namespace can read every package
 in it, every writer can publish any package in it. Out-of-tree
 authorizers (OPA / Cedar / Casbin) plug in via
-`namespace.WithAuthzFactory` if you need finer control.
+`artifact.WithAuthzFactory` if you need finer control.
 
 See [`docs/auth.md`](../auth.md#namespace-authorization) for the
 policy model and matcher reference.

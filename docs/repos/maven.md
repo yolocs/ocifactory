@@ -331,7 +331,7 @@ segment):
 | `/{ns}/maven2/archetype-catalog.xml` | `<ns>/archetype` | `latest` | `archetype-catalog.xml` |
 
 `{groupId}` keeps its slash form (`com/example/foo`), matching the URL.
-The namespace wrapper adds the `<ns>/` prefix transparently; the maven
+The artifact data-plane wrapper adds the `<ns>/` prefix transparently; the maven
 handler's storage codec addresses package repos as
 `packages/{groupId}/{artifactId}` and the wrapper turns them into
 `<ns>/packages/{groupId}/{artifactId}` before they hit the OCI backend.
@@ -339,7 +339,7 @@ If `--repo-prefix` is configured, that prefix sits before `<ns>` in the
 backend repository path.
 
 A fourth per-namespace repo, `<ns>/ocifactory-packages`, is maintained
-by the namespace wrapper itself — its tags enumerate every owning-repo
+by the artifact data-plane wrapper itself — its tags enumerate every owning-repo
 the wrapper has written to. It backs the admin service's "namespace is
 empty" check on soft delete; operators don't write to it directly.
 
@@ -404,7 +404,7 @@ covers blob fetches and metadata reads, `OpWrite` covers every PUT/POST.
 There is no per-coordinate granularity today: every reader in a
 namespace can read every coordinate in it, every writer can write to
 any. Out-of-tree authorizers (OPA / Cedar / Casbin) plug in via
-`namespace.WithAuthzFactory` if you need finer control.
+`artifact.WithAuthzFactory` if you need finer control.
 
 See [`docs/auth.md`](../auth.md#namespace-authorization) for the
 policy model and matcher reference.

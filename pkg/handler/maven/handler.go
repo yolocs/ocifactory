@@ -10,9 +10,9 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
-	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"oras.land/oras-go/v2/errdef"
@@ -55,7 +55,7 @@ var (
 )
 
 type Handler struct {
-	registry       *namespace.Registry
+	artifacts      *artifact.Store
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
 	proxy          *proxyState
@@ -91,11 +91,11 @@ func WithMaxUploadBytes(n int64) Option {
 
 // NewHandler creates a new Handler.
 //
-// registry is the data-plane wrapper that hands out per-request
-// [*namespace.ScopedRegistry] views via [registry.For]. Every routed
+// artifacts is the data-plane wrapper that hands out per-request
+// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every routed
 // handler func resolves the namespace from the request URL
 // (`/{namespace}/maven2/...`) and obtains a scoped view at the top.
-func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
+func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		maxUploadBytes: DefaultMaxUploadBytes,
 	}
@@ -103,7 +103,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 		opt(&cfg)
 	}
 	h := &Handler{
-		registry:       registry,
+		artifacts:      artifacts,
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
 	}
@@ -159,10 +159,10 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*namespace.ScopedRegistry] for
+// scopedFor returns the per-request [*artifact.ScopedNamespace] for
 // the namespace in req's URL. Cheap to construct; called per request.
-func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
-	return h.registry.For(mux.Vars(req)["namespace"])
+func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
+	return h.artifacts.For(mux.Vars(req)["namespace"])
 }
 
 // handleArchetypeCatalog handles requests for archetype-catalog.xml.
@@ -436,7 +436,7 @@ func (h *Handler) handlePut(w http.ResponseWriter, req *http.Request, scoped han
 // req.ContentLength via f.Size so AddFile keeps its streaming fast path.
 // For checksum filenames it buffers the (always tiny) body, validates it
 // against the previously-uploaded companion artifact (looked up through
-// the per-request scoped registry view), and returns a reader over the
+// the per-request scoped artifact view), and returns a reader over the
 // buffered bytes so AddFile still sees an io.Reader.
 func (h *Handler) maybeVerifyChecksum(req *http.Request, scoped handler.Registry, f *oci.RepoFile) (io.Reader, error) {
 	if ext, _, _ := checksumExt(f.Name); ext == "" {

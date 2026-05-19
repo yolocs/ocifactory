@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"oras.land/oras-go/v2/errdef"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
@@ -161,7 +162,7 @@ func WithProxyL1IndexCacheTTL(d time.Duration) Option {
 	return func(c *handlerConfig) { c.proxyL1IndexCacheTTL = d }
 }
 
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry) (*namespace.Spec, bool, bool) {
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
 	spec, err := scoped.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -174,7 +175,7 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 	return spec, isProxy, true
 }
 
-func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
+func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
 	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -205,7 +206,7 @@ func (h *Handler) handlePackumentProxy(w http.ResponseWriter, req *http.Request,
 	h.synthesizePackument(w, req, scoped, pkg, err)
 }
 
-func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) {
+func (h *Handler) handleDistTagListProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) {
 	ctx := req.Context()
 	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -250,7 +251,7 @@ type proxyPackumentResult struct {
 	contentType string
 }
 
-func (h *Handler) loadPackumentProxy(ctx context.Context, scoped *namespace.ScopedRegistry, spec *namespace.Spec, pkg string) (proxyPackumentResult, error) {
+func (h *Handler) loadPackumentProxy(ctx context.Context, scoped *artifact.ScopedNamespace, spec *namespace.Spec, pkg string) (proxyPackumentResult, error) {
 	logger := logging.FromContext(ctx)
 	ns := scoped.Namespace()
 	cacheKey := ns + "|" + pkg
@@ -333,7 +334,7 @@ type indexFlightResult struct {
 	contentType string
 }
 
-func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, _ *namespace.ScopedRegistry, pkg string, upstreamErr error) {
+func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, _ *artifact.ScopedNamespace, pkg string, upstreamErr error) {
 	ctx := req.Context()
 	artifactNS, nsErr := h.artifactNamespaceFor(req)
 	if nsErr != nil {
@@ -358,7 +359,7 @@ func (h *Handler) synthesizePackument(w http.ResponseWriter, req *http.Request, 
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleTarballGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
@@ -550,7 +551,7 @@ type fileFlightResult struct {
 	filterName string
 }
 
-func (h *Handler) peekTarball(ctx context.Context, scoped *namespace.ScopedRegistry, f *oci.RepoFile) (bool, error) {
+func (h *Handler) peekTarball(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
 	_, rc, err := scoped.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
@@ -562,7 +563,7 @@ func (h *Handler) peekTarball(ctx context.Context, scoped *namespace.ScopedRegis
 	return true, nil
 }
 
-func (h *Handler) tryServeTarballFromRegistry(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, f *oci.RepoFile) bool {
+func (h *Handler) tryServeTarballFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 	if req.Method != http.MethodHead {

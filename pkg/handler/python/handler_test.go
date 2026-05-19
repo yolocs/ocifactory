@@ -475,7 +475,7 @@ func TestPackageIndexCache(t *testing.T) {
 			t.Fatalf("seed upload: status=%d", code)
 		}
 		// Reset the counters after seeding so the assertion measures
-		// the simple-index path only — the upload + namespace wrapper
+		// the simple-index path only — the upload + artifact data-plane wrapper
 		// each touch ListFiles/ListTags for their own bookkeeping.
 		listFilesAfterSeed := reg.listFiles.Load()
 

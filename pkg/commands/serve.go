@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/auth/backend"
 	"github.com/yolocs/ocifactory/pkg/auth/chain"
@@ -399,9 +400,9 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		artifacts := artifact.NewStore(r, namespace.NewStore(storeReg))
 		negCache := indexcache.NewNegativeCache()
-		mh, err := maven.NewHandler(nsReg,
+		mh, err := maven.NewHandler(artifacts,
 			maven.WithAuthMiddleware(authMW),
 			maven.WithMaxUploadBytes(cfg.MavenMaxUploadBytes),
 			maven.WithProxyNegativeCache(negCache),
@@ -422,7 +423,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		artifacts := artifact.NewStore(r, namespace.NewStore(storeReg))
 		idxCache, err := indexcache.NewCache(cfg.RegistryURL,
 			indexcache.WithBackendAuth(bp),
 			indexcache.WithRepoPrefix(cfg.RepoPrefix),
@@ -431,7 +432,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create proxy index cache: %w", err)
 		}
 		negCache := indexcache.NewNegativeCache()
-		nh, err := npm.NewHandler(nsReg,
+		nh, err := npm.NewHandler(artifacts,
 			npm.WithMaxUploadBytes(cfg.NPMMaxUploadBytes),
 			npm.WithAuthMiddleware(authMW),
 			npm.WithProxyIndexCache(idxCache),
@@ -453,7 +454,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to create namespace registry: %w", err)
 		}
-		nsReg := namespace.NewRegistry(r, namespace.NewStore(storeReg))
+		artifacts := artifact.NewStore(r, namespace.NewStore(storeReg))
 		// Proxy plumbing: shared across every namespace served by
 		// this process. Hosted-only deployments still construct
 		// these (cheap — no I/O on construction); a proxy namespace
@@ -467,7 +468,7 @@ func runServe(ctx context.Context, cfg *serveConfig) error {
 			return fmt.Errorf("failed to create proxy index cache: %w", err)
 		}
 		negCache := indexcache.NewNegativeCache()
-		ph, err := python.NewHandler(nsReg,
+		ph, err := python.NewHandler(artifacts,
 			python.WithSimpleIndexCacheTTL(cfg.SimpleIndexCacheTTL),
 			python.WithMaxUploadBytes(cfg.PythonMaxUploadBytes),
 			python.WithAuthMiddleware(authMW),

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 )
@@ -23,7 +24,7 @@ const testNS = "test-ns"
 
 // allowAllPolicy admits the anonymous-issuer AuthContext produced by
 // [auth.AlwaysAnonymous] (the authenticator newTestHandler wires up
-// by default so the namespace wrapper has a verified subject to
+// by default so the artifact data-plane wrapper has a verified subject to
 // authorize). Tests exercising specific policy behaviours pass a
 // custom spec to [putNamespace].
 func allowAllPolicy() namespace.Policy {
@@ -34,14 +35,14 @@ func allowAllPolicy() namespace.Policy {
 }
 
 // newTestHandler builds an npm [*Handler] wired to a
-// [*namespace.Registry] backed by inner. A "test-ns" namespace with
+// [*artifact.Store] backed by inner. A "test-ns" namespace with
 // an allow-all policy is registered; the auth middleware installs
 // the [auth.AlwaysAnonymous] AuthContext on every request so the
 // wrapper has a subject to authorize.
-func newTestHandler(t *testing.T, inner namespace.RegistryBackend, opts ...Option) (*Handler, *namespace.Store) {
+func newTestHandler(t *testing.T, inner artifact.Backend, opts ...Option) (*Handler, *namespace.Store) {
 	t.Helper()
 	store := namespace.NewStore(inner)
-	reg := namespace.NewRegistry(inner, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(inner, store, artifact.WithPolicyCacheTTL(0))
 	if err := store.Put(t.Context(), &namespace.Namespace{Name: testNS, Spec: namespace.Spec{Policy: allowAllPolicy()}}); err != nil {
 		t.Fatalf("Put namespace: %v", err)
 	}

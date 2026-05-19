@@ -1,4 +1,4 @@
-package namespace
+package artifact
 
 import (
 	"time"
@@ -6,6 +6,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 
 	"github.com/yolocs/ocifactory/pkg/auth"
+	nsmeta "github.com/yolocs/ocifactory/pkg/namespace"
 )
 
 // cachedPolicy is the value stored per namespace name in the policy
@@ -13,7 +14,7 @@ import (
 // burst of requests against a missing namespace doesn't repeatedly
 // hit the metadata backend.
 //
-// spec is the raw [Spec] body the authorizer was compiled from. It is
+// spec is the raw [namespace.Spec] body the authorizer was compiled from. It is
 // held alongside the authorizer so format handlers can dispatch on
 // [Spec.Mode] / read [Spec.Proxy] without paying a second
 // [Store.Get]; spec and authorizer always reflect the same point-in-time
@@ -21,7 +22,7 @@ import (
 // the pointer for free read access and must not mutate it.
 type cachedPolicy struct {
 	authorizer auth.Authorizer
-	spec       *Spec
+	spec       *nsmeta.Spec
 	notFound   bool
 }
 

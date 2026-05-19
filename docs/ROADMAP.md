@@ -69,7 +69,7 @@ scoped-token issuance.
   — a matcher-based authorizer compiled from each namespace's `Policy`
   block (`readers` / `writers` `SubjectMatcher` lists). Out-of-tree
   authorizers (OPA / Cedar / Casbin) plug in via
-  `namespace.WithAuthzFactory`.
+  `artifact.WithAuthzFactory`.
 - [x] **Pluggable backend credential `Provider`.** In-tree adapters:
   `anonymous`, `gcpadc` (ADC), `staticenv` (env vars, re-read every
   call), `dockerconfig` (honours credential helpers). See
@@ -93,7 +93,7 @@ scoped-token issuance.
   the interface.
 - [ ] **Documented "how to plug in your own authorizer" recipe.**
   Today it's "implement `auth.Authorizer`, pass it via
-  `namespace.WithAuthzFactory`"; the surface is small enough that a
+  `artifact.WithAuthzFactory`"; the surface is small enough that a
   recipe in [`auth.md`](auth.md) is sufficient.
 
 ## Phase 4 — Pull-through proxy / cache

@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/singleflight"
 	"oras.land/oras-go/v2/errdef"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
@@ -86,7 +87,7 @@ func (p *proxyState) fetcherFor(upstream string) (ProxyFetcher, error) {
 	return actual.(ProxyFetcher), nil
 }
 
-func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry) (*namespace.Spec, bool, bool) {
+func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace) (*namespace.Spec, bool, bool) {
 	spec, err := scoped.Spec(req.Context())
 	if err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -99,7 +100,7 @@ func (h *Handler) dispatchProxy(w http.ResponseWriter, req *http.Request, scoped
 	return spec, isProxy, true
 }
 
-func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, repoPath string) {
+func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, repoPath string) {
 	ctx := req.Context()
 	if err := scoped.Authorize(ctx, auth.OpRead); err != nil {
 		if handler.WriteNamespaceError(w, err) {
@@ -131,7 +132,7 @@ func (h *Handler) handleMetadataProxy(w http.ResponseWriter, req *http.Request, 
 	writeProxyBytes(w, req, resp.Body, resp.ContentType)
 }
 
-func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile, repoPath string) {
+func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile, repoPath string) {
 	ctx := req.Context()
 
 	if h.tryServeFromRegistry(w, req, scoped, f) {
@@ -201,7 +202,7 @@ func (h *Handler) handleMetadataSidecarProxy(w http.ResponseWriter, req *http.Re
 	handler.WriteError(ctx, w, http.StatusBadGateway, nil, "proxy fill reported success but cache miss on re-read")
 }
 
-func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, spec *namespace.Spec, f *oci.RepoFile) {
+func (h *Handler) handleFileGetProxy(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, spec *namespace.Spec, f *oci.RepoFile) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 
@@ -428,7 +429,7 @@ func (h *Handler) writeProxyFileError(w http.ResponseWriter, req *http.Request, 
 	}
 }
 
-func (h *Handler) peekRegistry(ctx context.Context, scoped *namespace.ScopedRegistry, f *oci.RepoFile) (bool, error) {
+func (h *Handler) peekRegistry(ctx context.Context, scoped *artifact.ScopedNamespace, f *oci.RepoFile) (bool, error) {
 	_, rc, err := scoped.ReadFile(ctx, f)
 	if err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
@@ -440,7 +441,7 @@ func (h *Handler) peekRegistry(ctx context.Context, scoped *namespace.ScopedRegi
 	return true, nil
 }
 
-func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *namespace.ScopedRegistry, f *oci.RepoFile) bool {
+func (h *Handler) tryServeFromRegistry(w http.ResponseWriter, req *http.Request, scoped *artifact.ScopedNamespace, f *oci.RepoFile) bool {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
 

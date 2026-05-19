@@ -19,7 +19,6 @@ import (
 	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
-	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
 	"github.com/yolocs/ocifactory/pkg/proxy/indexcache"
 	"github.com/yolocs/ocifactory/pkg/renderer"
@@ -95,7 +94,6 @@ var (
 )
 
 type Handler struct {
-	registry       *namespace.Registry
 	artifacts      *artifact.Store
 	renderer       *renderer.Renderer
 	indexCache     *simpleIndexCache
@@ -197,12 +195,12 @@ func WithAuthMiddleware(mw func(http.Handler) http.Handler) Option {
 
 // NewHandler creates a new Handler.
 //
-// registry is the data-plane wrapper that hands out per-request
-// [*namespace.ScopedRegistry] views via [registry.For]. Every routed
+// artifacts is the data-plane wrapper that hands out per-request
+// [*artifact.ScopedNamespace] views via [artifact.Store.For]. Every routed
 // handler func resolves the namespace from the request URL
 // (`/{namespace}/...`) and obtains a scoped view at the top — call
 // sites otherwise stay identical to the pre-namespace code.
-func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) {
+func NewHandler(artifacts *artifact.Store, opts ...Option) (*Handler, error) {
 	cfg := handlerConfig{
 		simpleIndexCacheTTL: DefaultSimpleIndexCacheTTL,
 		maxUploadBytes:      DefaultMaxUploadBytes,
@@ -215,8 +213,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 		return nil, fmt.Errorf("failed to create renderer: %w", err)
 	}
 	h := &Handler{
-		registry:       registry,
-		artifacts:      artifact.NewStore(registry),
+		artifacts:      artifacts,
 		renderer:       r,
 		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
 		authMW:         cfg.authMW,
@@ -230,7 +227,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 //
 // Every route lives under a `/{namespace}` subrouter so the handler
 // resolves the namespace from the URL on each request and routes the
-// backend op through the namespace-scoped registry view. The leading
+// backend op through the namespace-scoped artifact view. The leading
 // segment is rejected by [namespace.ValidateName] at namespace-Put
 // time, not here — a request to an unregistered namespace produces a
 // 404 from the wrapper.
@@ -269,12 +266,12 @@ func (h *Handler) Mux() http.Handler {
 	return router
 }
 
-// scopedFor returns the per-request [*namespace.ScopedRegistry] for
+// scopedFor returns the per-request [*artifact.ScopedNamespace] for
 // the namespace in req's URL. The view is cheap to construct (a small
 // struct, no I/O) so handlers obtain it per call rather than caching
 // across requests.
-func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
-	return h.registry.For(mux.Vars(req)["namespace"])
+func (h *Handler) scopedFor(req *http.Request) *artifact.ScopedNamespace {
+	return h.artifacts.For(mux.Vars(req)["namespace"])
 }
 
 func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
@@ -521,7 +518,7 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 
 // ensureIndexSentinel marks the normalized package name in the
 // per-format namespace index.
-func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *namespace.ScopedRegistry, normalizedName string) error {
+func (h *Handler) ensureIndexSentinel(ctx context.Context, scoped *artifact.ScopedNamespace, normalizedName string) error {
 	return scoped.Index(packageIndexName).Mark(ctx, normalizedName)
 }
 

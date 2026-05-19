@@ -165,7 +165,7 @@ func setupStore(t *testing.T) (*oci.FakeRegistry, *Store) {
 
 	fake := oci.NewFakeRegistry()
 	nsStore := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, nsStore, namespace.WithPolicyCacheTTL(0))
+	store := NewStore(fake, nsStore, WithPolicyCacheTTL(0))
 	if err := nsStore.Put(t.Context(), &namespace.Namespace{
 		Name: testNS,
 		Spec: namespace.Spec{
@@ -177,7 +177,7 @@ func setupStore(t *testing.T) (*oci.FakeRegistry, *Store) {
 	}); err != nil {
 		t.Fatalf("Put namespace: %v", err)
 	}
-	return fake, NewStore(reg)
+	return fake, store
 }
 
 func authedContext(t *testing.T) context.Context {

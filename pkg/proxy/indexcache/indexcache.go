@@ -81,7 +81,7 @@ const (
 // the package name. The `ocifactory-` prefix matches the in-tree
 // convention for registry-internal repos (compare
 // [pkg/namespace.indexRepoSegment] = "ocifactory-namespaces" and
-// [pkg/namespace.Registry] / "ocifactory-packages"), keeping cache
+// [pkg/artifact.Store] / "ocifactory-packages"), keeping cache
 // repos visually distinct from real `<namespace>/packages/...`
 // storage when an operator lists the OCI registry. The literal here
 // is a single OCI distribution name component followed by

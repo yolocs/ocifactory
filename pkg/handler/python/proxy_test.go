@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -128,7 +129,7 @@ func newProxyTestHandler(t *testing.T, fetcher ProxyFetcher, extraSpec namespace
 	t.Helper()
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 
 	if extraSpec.Mode == "" {
 		extraSpec.Mode = namespace.ModeProxy
@@ -176,7 +177,7 @@ func TestProxy_AuthGating(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	if err := store.Put(t.Context(), &namespace.Namespace{
 		Name: testNS,
 		Spec: namespace.Spec{
@@ -244,12 +245,10 @@ func TestProxy_FileCacheHit_NoUpstream(t *testing.T) {
 		Name:       "requests-2.31.0-py3-none-any.whl",
 		MediaType:  "application/x-wheel+zip",
 	}
-	scoped := namespace.NewRegistry(backing, namespace.NewStore(backing), namespace.WithPolicyCacheTTL(0))
-	_ = scoped
 	// Use a direct AddFile against the fake; bypasses authz which
 	// is fine because the fake registry doesn't authorize on its
-	// own — namespace.Registry does. We address the fake at the
-	// post-prefix path the namespace wrapper would have produced.
+	// own — artifact.Store does. We address the fake at the
+	// post-prefix path the artifact data-plane wrapper would have produced.
 	if _, err := backing.AddFile(t.Context(), &oci.RepoFile{
 		OwningRepo: testNS + "/packages/requests",
 		OwningTag:  rf.OwningTag,
@@ -888,7 +887,7 @@ func TestProxy_FileAddFileFailureAfterTeeDoesNotCorruptBody(t *testing.T) {
 	}
 	fake.files[fileURL] = []byte(bodyBytes)
 
-	// Build a namespace.Registry wrapping a backend whose AddFile
+	// Build an artifact.Store wrapping a backend whose AddFile
 	// reads the full body (so the tee writes through) and then errors.
 	backing := oci.NewFakeRegistry()
 	wrapped := &addFileFailingBackend{
@@ -897,7 +896,7 @@ func TestProxy_FileAddFileFailureAfterTeeDoesNotCorruptBody(t *testing.T) {
 		failRepoSuffix: "/packages/x",
 	}
 	store := namespace.NewStore(wrapped)
-	reg := namespace.NewRegistry(wrapped, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(wrapped, store, artifact.WithPolicyCacheTTL(0))
 	if err := store.Put(t.Context(), &namespace.Namespace{Name: testNS, Spec: namespace.Spec{
 		Mode:   namespace.ModeProxy,
 		Proxy:  namespace.Proxy{Upstream: "https://pypi.org"},

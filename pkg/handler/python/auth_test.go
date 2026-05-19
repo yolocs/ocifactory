@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/auth"
 	"github.com/yolocs/ocifactory/pkg/namespace"
 	"github.com/yolocs/ocifactory/pkg/oci"
@@ -12,7 +13,7 @@ import (
 
 // TestMux_AuthGating wires a python handler with an auth middleware
 // that always 401s and confirms every namespaced route hits the gate
-// (i.e. the handler itself is NOT reached, and the namespace wrapper
+// (i.e. the handler itself is NOT reached, and the artifact data-plane wrapper
 // has no chance to deny first).
 func TestMux_AuthGating(t *testing.T) {
 	t.Parallel()
@@ -25,7 +26,7 @@ func TestMux_AuthGating(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	// A namespace registration is not even required — the denyAll
 	// middleware short-circuits before the wrapper sees the request.
 	h, err := NewHandler(reg, WithAuthMiddleware(denyAll))
@@ -60,7 +61,7 @@ func TestMux_AuthGating(t *testing.T) {
 // TestMux_NoAuthMiddleware confirms that omitting WithAuthMiddleware
 // leaves the chain ungated at the middleware layer — production
 // wiring (cmd/ocifactory serve) always supplies one. With no
-// AuthContext on the request the namespace wrapper denies the call
+// AuthContext on the request the artifact data-plane wrapper denies the call
 // at 403, which is what the test asserts here: the failure mode is
 // "no auth context" (403), NOT "auth middleware rejected" (401). The
 // AGENTS.md rule for adding new format handlers reminds authors to
@@ -70,7 +71,7 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
 
 	h, err := NewHandler(reg)
@@ -82,7 +83,7 @@ func TestMux_NoAuthMiddleware(t *testing.T) {
 	w := httptest.NewRecorder()
 	h.Mux().ServeHTTP(w, r)
 	if got := w.Code; got == http.StatusUnauthorized {
-		t.Errorf("status = 401 with no middleware configured; the namespace wrapper, not the middleware, should deny")
+		t.Errorf("status = 401 with no middleware configured; the artifact data-plane wrapper, not the middleware, should deny")
 	}
 	if got, want := w.Code, http.StatusForbidden; got != want {
 		t.Errorf("status = %d, want %d (no AuthContext → wrapper denies)", got, want)
@@ -101,7 +102,7 @@ func TestMux_AuthChainsBeforeHandler(t *testing.T) {
 
 	fake := oci.NewFakeRegistry()
 	store := namespace.NewStore(fake)
-	reg := namespace.NewRegistry(fake, store, namespace.WithPolicyCacheTTL(0))
+	reg := artifact.NewStore(fake, store, artifact.WithPolicyCacheTTL(0))
 	putNamespace(t, store, testNS, namespace.Spec{Policy: allowAllPolicy()})
 
 	h, err := NewHandler(reg, WithAuthMiddleware(installer))
