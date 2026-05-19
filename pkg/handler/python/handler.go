@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
@@ -95,6 +96,7 @@ var (
 
 type Handler struct {
 	registry       *namespace.Registry
+	artifacts      *artifact.Store
 	renderer       *renderer.Renderer
 	indexCache     *simpleIndexCache
 	authMW         func(http.Handler) http.Handler
@@ -214,6 +216,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	}
 	h := &Handler{
 		registry:       registry,
+		artifacts:      artifact.NewStore(registry),
 		renderer:       r,
 		indexCache:     newSimpleIndexCache(cfg.simpleIndexCacheTTL),
 		authMW:         cfg.authMW,
@@ -272,6 +275,10 @@ func (h *Handler) Mux() http.Handler {
 // across requests.
 func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
 	return h.registry.For(mux.Vars(req)["namespace"])
+}
+
+func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
+	return h.artifacts.Namespace(req.Context(), mux.Vars(req)["namespace"])
 }
 
 // handleSimpleIndex renders the root simple index — the list of every
@@ -442,13 +449,19 @@ func (h *Handler) handleFilePut(w http.ResponseWriter, req *http.Request) {
 
 	normalizedName := normalize(pkgName)
 
-	wheelRF := &oci.RepoFile{
-		OwningRepo: packageOwningRepo(normalizedName),
-		OwningTag:  versionNum,
-		Name:       contentName,
-		MediaType:  detectMediaType(contentName),
+	artifactNS, err := h.artifactNamespaceFor(req)
+	if err != nil {
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		handler.WriteError(ctx, w, http.StatusInternalServerError, err, "internal error")
+		return
 	}
-	if !h.streamAddFile(ctx, scoped, w, wheelRF, contentPart) {
+	wheel := artifact.FilePut{
+		Name:      contentName,
+		MediaType: detectMediaType(contentName),
+	}
+	if !h.streamPutFile(ctx, artifactNS.Package(packageOwningRepo(normalizedName)), versionNum, w, wheel, contentPart) {
 		return
 	}
 
@@ -544,7 +557,7 @@ func writeMultipartReadError(w http.ResponseWriter, err error, logger *slog.Logg
 	}
 }
 
-// streamAddFile wraps registry.AddFile with the standard error → HTTP
+// streamPutFile wraps package.PutFile with the standard error → HTTP
 // translation used by the upload path. It returns true on success and
 // writes the appropriate error response (and returns false) on
 // failure. Callers are expected to short-circuit subsequent steps on
@@ -553,9 +566,9 @@ func writeMultipartReadError(w http.ResponseWriter, err error, logger *slog.Logg
 // MaxBytesError is detected inline so a request body that overflows
 // h.maxUploadBytes mid-stream (e.g. while AddFile is reading the wheel
 // body) returns 413 instead of a generic 500.
-func (h *Handler) streamAddFile(ctx context.Context, scoped handler.Registry, w http.ResponseWriter, f *oci.RepoFile, content io.Reader) bool {
+func (h *Handler) streamPutFile(ctx context.Context, pkg artifact.Package, version string, w http.ResponseWriter, file artifact.FilePut, content io.Reader) bool {
 	logger := logging.FromContext(ctx)
-	desc, err := scoped.AddFile(ctx, f, content)
+	desc, err := pkg.PutFile(ctx, version, file, content)
 	if err != nil {
 		logger.DebugContext(ctx, "failed to add file", "error", err)
 		if handler.WriteNamespaceError(w, err) {
@@ -608,7 +621,23 @@ func (h *Handler) handleFileGet(w http.ResponseWriter, req *http.Request) {
 		h.handleFileGetProxy(w, req, scoped, spec, f)
 		return
 	}
-	h.handleGet(w, req, scoped, f)
+	artifactNS, err := h.artifactNamespaceFor(req)
+	if err != nil {
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+		return
+	}
+	handle, err := artifactNS.Package(packageOwningRepo(pkg)).GetFile(req.Context(), version, filename)
+	if err != nil {
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	h.handleArtifactGet(w, req, handle, detectMediaType(filename))
 }
 
 func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
@@ -638,7 +667,15 @@ func (h *Handler) handlePackageIndex(w http.ResponseWriter, req *http.Request) {
 	files, ok := h.indexCache.get(cacheKey)
 	if !ok {
 		var err error
-		files, err = h.resolvePackageFiles(req.Context(), scoped, pkg)
+		artifactNS, nsErr := h.artifactNamespaceFor(req)
+		if nsErr != nil {
+			if handler.WriteNamespaceError(w, nsErr) {
+				return
+			}
+			handler.WriteError(req.Context(), w, http.StatusInternalServerError, nsErr, "internal error")
+			return
+		}
+		files, err = h.resolveArtifactPackageFiles(req.Context(), artifactNS.Package(packageOwningRepo(pkg)))
 		if err != nil {
 			if handler.WriteNamespaceError(w, err) {
 				return
@@ -691,6 +728,23 @@ func (h *Handler) resolvePackageFiles(ctx context.Context, scoped handler.Regist
 		entries = append(entries, cachedFile{
 			Filename:  f.Name,
 			OwningTag: f.OwningTag,
+			Sha256:    strings.TrimPrefix(f.Digest, "sha256:"),
+		})
+	}
+	return entries, nil
+}
+
+func (h *Handler) resolveArtifactPackageFiles(ctx context.Context, pkg artifact.Package) ([]cachedFile, error) {
+	rawFiles, err := pkg.ListFiles(ctx, artifact.ListFilesOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]cachedFile, 0, len(rawFiles))
+	for _, f := range rawFiles {
+		entries = append(entries, cachedFile{
+			Filename:  f.Name,
+			OwningTag: f.Version,
 			Sha256:    strings.TrimPrefix(f.Digest, "sha256:"),
 		})
 	}
@@ -756,6 +810,56 @@ func (h *Handler) handleGet(w http.ResponseWriter, req *http.Request, scoped han
 	w.Header().Set("Content-Type", f.MediaType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", desc.File.Size))
 	w.Header().Set("X-Checksum-Sha256", desc.File.Digest.String())
+	if req.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := io.Copy(w, r); err != nil {
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+		return
+	}
+}
+
+func (h *Handler) handleArtifactGet(w http.ResponseWriter, req *http.Request, file artifact.FileHandle, mediaType string) {
+	logger := logging.FromContext(req.Context())
+
+	if req.Method != http.MethodHead {
+		if redirectURL, err := file.DownloadURL(req.Context()); err == nil && redirectURL != "" {
+			logger.DebugContext(req.Context(), "redirecting blob fetch to backend", "url", redirectURL)
+			http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
+			return
+		} else if err != nil {
+			logger.DebugContext(req.Context(), "blob redirect probe failed; falling back to streaming", "error", err)
+		}
+	}
+
+	r, err := file.Open(req.Context())
+	if err != nil {
+		logger.DebugContext(req.Context(), "failed to read file", "error", err)
+		if handler.WriteNamespaceError(w, err) {
+			return
+		}
+		if errors.Is(err, errdef.ErrNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if oci.HasCode(err, http.StatusUnauthorized) {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if oci.HasCode(err, http.StatusForbidden) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		handler.WriteError(req.Context(), w, http.StatusInternalServerError, err, "internal error")
+		return
+	}
+	defer r.Close()
+
+	info := file.Info()
+	w.Header().Set("Content-Type", mediaType)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size))
+	w.Header().Set("X-Checksum-Sha256", info.Digest)
 	if req.Method == http.MethodHead {
 		return
 	}
