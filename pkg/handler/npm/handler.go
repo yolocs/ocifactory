@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/yolocs/ocifactory/pkg/artifact"
 	"github.com/yolocs/ocifactory/pkg/handler"
 	"github.com/yolocs/ocifactory/pkg/logging"
 	"github.com/yolocs/ocifactory/pkg/namespace"
@@ -84,6 +85,7 @@ const (
 // register its mux via [Handler.Mux].
 type Handler struct {
 	registry       *namespace.Registry
+	artifacts      *artifact.Store
 	authMW         func(http.Handler) http.Handler
 	maxUploadBytes int64
 	proxy          *proxyState
@@ -147,6 +149,7 @@ func NewHandler(registry *namespace.Registry, opts ...Option) (*Handler, error) 
 	}
 	h := &Handler{
 		registry:       registry,
+		artifacts:      artifact.NewStore(registry),
 		authMW:         cfg.authMW,
 		maxUploadBytes: cfg.maxUploadBytes,
 	}
@@ -208,6 +211,10 @@ func (h *Handler) Mux() http.Handler {
 // the namespace in req's URL. Cheap to construct; called per request.
 func (h *Handler) scopedFor(req *http.Request) *namespace.ScopedRegistry {
 	return h.registry.For(mux.Vars(req)["namespace"])
+}
+
+func (h *Handler) artifactNamespaceFor(req *http.Request) (artifact.Namespace, error) {
+	return h.artifacts.Namespace(req.Context(), mux.Vars(req)["namespace"])
 }
 
 // handlePing answers npm's registry-root probe. The body shape is
@@ -416,26 +423,28 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 	// remains. A partial-publish across multiple versions in this
 	// loop is unrecoverable; npm publishes are single-version in
 	// practice, so the staged map almost always has size 1.
+	artifactNS, err := h.artifactNamespaceFor(req)
+	if err != nil {
+		h.writeRegistryError(ctx, w, err, "failed to resolve namespace")
+		return
+	}
+	artifactPkg := artifactNS.Package(repo)
 	for version, s := range staged {
-		tarballRF := &oci.RepoFile{
-			OwningRepo: repo,
-			OwningTag:  version,
-			Name:       s.tarballName,
-			MediaType:  "application/octet-stream",
-			Size:       int64(len(s.tarball)),
+		tarballFile := artifact.FilePut{
+			Name:      s.tarballName,
+			MediaType: "application/octet-stream",
+			Size:      int64(len(s.tarball)),
 		}
-		if !h.addFile(ctx, scoped, w, tarballRF, bytes.NewReader(s.tarball)) {
+		if !h.addFile(ctx, artifactPkg, version, w, tarballFile, bytes.NewReader(s.tarball)) {
 			return
 		}
 
-		metaRF := &oci.RepoFile{
-			OwningRepo: repo,
-			OwningTag:  version,
-			Name:       versionMetaName,
-			MediaType:  "application/json",
-			Size:       int64(len(s.raw)),
+		metaFile := artifact.FilePut{
+			Name:      versionMetaName,
+			MediaType: "application/json",
+			Size:      int64(len(s.raw)),
 		}
-		if !h.addFile(ctx, scoped, w, metaRF, bytes.NewReader(s.raw)) {
+		if !h.addFile(ctx, artifactPkg, version, w, metaFile, bytes.NewReader(s.raw)) {
 			return
 		}
 	}
@@ -443,7 +452,7 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 	// Phase 3: dist-tag updates. Each target is already known to
 	// reference a staged (and now-written) canonical version.
 	for tag, version := range doc.DistTags {
-		if err := scoped.AppendRefs(ctx, repo, version, tag); err != nil {
+		if err := artifactPkg.Tag(ctx, tag, version); err != nil {
 			h.writeRegistryError(ctx, w, err, "failed to update dist-tag")
 			return
 		}
@@ -468,12 +477,12 @@ func (h *Handler) handlePublish(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
-// addFile wraps scoped.AddFile with the standard error → HTTP
+// addFile wraps package.PutFile with the standard error → HTTP
 // translation used by every npm publish step. Returns true on success
 // and writes the appropriate error response (and returns false) on
 // failure.
-func (h *Handler) addFile(ctx context.Context, scoped handler.Registry, w http.ResponseWriter, f *oci.RepoFile, body io.Reader) bool {
-	if _, err := scoped.AddFile(ctx, f, body); err != nil {
+func (h *Handler) addFile(ctx context.Context, pkg artifact.Package, version string, w http.ResponseWriter, file artifact.FilePut, body io.Reader) bool {
+	if _, err := pkg.PutFile(ctx, version, file, body); err != nil {
 		h.writeRegistryError(ctx, w, err, "failed to add file")
 		return false
 	}
@@ -905,8 +914,12 @@ func (h *Handler) handleDistTagPut(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	repo := packageOwningRepo(pkg)
-	if err := scoped.AppendRefs(ctx, repo, version, tag); err != nil {
+	artifactNS, err := h.artifactNamespaceFor(req)
+	if err != nil {
+		h.writeRegistryError(ctx, w, err, "failed to resolve namespace")
+		return
+	}
+	if err := artifactNS.Package(packageOwningRepo(pkg)).Tag(ctx, tag, version); err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			http.Error(w, fmt.Sprintf("version %q not found", version), http.StatusNotFound)
 			return
