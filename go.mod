@@ -17,7 +17,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.42.0
 	golang.org/x/net v0.54.0
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 	oras.land/oras-go/v2 v2.6.0
 )
 
